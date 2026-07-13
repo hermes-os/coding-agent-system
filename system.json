@@ -6,6 +6,10 @@
     "Stop",
     "PreToolUse"
   ],
+  "hookBudgetsSeconds": {
+    "Stop": 330,
+    "PreToolUse": 600
+  },
   "skills": [
     {"name": "behavior-validator", "command": false},
     {"name": "capabilities", "command": true},

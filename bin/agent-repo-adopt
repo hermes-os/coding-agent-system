@@ -15,6 +15,8 @@ import tempfile
 
 GLOBAL_POINTER = "READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing)."
 MANAGED_MARKER = "# Managed by coding-agent-system."
+GITHUB_HTTPS_RE = re.compile(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+GITHUB_SSH_RE = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/)([^/]+)/([^/]+?)(?:\.git)?/?$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,13 +47,28 @@ def first_content_line(path: Path) -> str:
     return ""
 
 
-def atomic_write(path: Path, content: str) -> None:
+def safe_workflow_parent(repo: Path, path: Path) -> Path:
+    for ancestor in (repo / ".github", repo / ".github" / "workflows"):
+        if ancestor.is_symlink():
+            raise ValueError(f"workflow ancestor must not be a symlink: {ancestor}")
+    parent = path.parent.resolve(strict=False)
+    if parent != repo and repo not in parent.parents:
+        raise ValueError(f"workflow path escapes repository: {path}")
+    return parent
+
+
+def atomic_write(repo: Path, path: Path, content: str) -> None:
+    safe_workflow_parent(repo, path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    safe_workflow_parent(repo, path)
     descriptor, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp = Path(raw_temp)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)
+        if path.is_symlink():
+            raise ValueError(f"workflow path must not be a symlink: {path}")
+        safe_workflow_parent(repo, path)
         temp.replace(path)
     finally:
         temp.unlink(missing_ok=True)
@@ -77,12 +94,47 @@ jobs:
 """
 
 
-def require_published(system_root: Path, revision: str) -> None:
-    git(system_root, "remote", "get-url", "origin")
-    git(system_root, "fetch", "--quiet", "origin")
-    containing = git(system_root, "branch", "--remotes", "--contains", revision)
+def github_repository(value: str) -> str | None:
+    match = GITHUB_HTTPS_RE.fullmatch(value) or GITHUB_SSH_RE.fullmatch(value)
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def valid_action(content: str) -> bool:
+    top_level = {
+        match.group(1)
+        for line in content.splitlines()
+        if (match := re.match(r"^([A-Za-z][A-Za-z0-9_-]*):(?:\s|$)", line))
+    }
+    return {"name", "description", "runs"} <= top_level
+
+
+def require_published(system_root: Path, repository: str, revision: str) -> None:
+    origin = git(system_root, "config", "--get", "remote.origin.url")
+    if github_repository(origin) != repository:
+        raise ValueError(f"origin does not match catalog repository {repository}")
+    git(
+        system_root,
+        "fetch",
+        "--quiet",
+        "--prune",
+        "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+    )
+    containing = git(
+        system_root,
+        "for-each-ref",
+        f"--contains={revision}",
+        "--format=%(refname)",
+        "refs/remotes/origin/",
+    )
     if not containing:
         raise ValueError(f"global system revision is not published on origin: {revision}")
+    try:
+        action = git(system_root, "show", f"{revision}:action.yml")
+    except ValueError as exc:
+        raise ValueError(f"published revision has no root action.yml: {revision}") from exc
+    if not valid_action(action):
+        raise ValueError(f"published revision has an invalid root action.yml: {revision}")
 
 
 def main() -> int:
@@ -106,7 +158,7 @@ def main() -> int:
         errors.append("--system-ref must be a full 40-character Git SHA")
     elif not args.allow_unpublished:
         try:
-            require_published(system_root, revision)
+            require_published(system_root, repository, revision)
         except ValueError as exc:
             errors.append(str(exc))
 
@@ -120,7 +172,13 @@ def main() -> int:
 
     workflow_path = repo / ".github" / "workflows" / "agent-repository-check.yml"
     expected = workflow(repository, revision)
-    if workflow_path.exists():
+    try:
+        safe_workflow_parent(repo, workflow_path)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if workflow_path.is_symlink():
+        errors.append(f"workflow path must not be a symlink: {workflow_path}")
+    elif workflow_path.exists():
         current = workflow_path.read_text(encoding="utf-8")
         if not current.startswith(MANAGED_MARKER + "\n"):
             errors.append(f"refusing to replace unmanaged workflow: {workflow_path}")
@@ -136,7 +194,11 @@ def main() -> int:
     if not args.check:
         if not claude.is_symlink():
             claude.symlink_to("AGENTS.md")
-        atomic_write(workflow_path, expected)
+        try:
+            atomic_write(repo, workflow_path, expected)
+        except ValueError as exc:
+            print(f"agent-repo-adopt: {exc}", file=sys.stderr)
+            return 1
 
     result = subprocess.run(
         [str(system_root / "bin" / "agent-repo-check"), "--repo", str(repo), "--strict"],

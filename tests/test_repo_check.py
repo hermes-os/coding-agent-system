@@ -102,6 +102,44 @@ class RepositoryCheckTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(any("canonical global pointer" in error for error in report["errors"]))
 
+    def test_rejects_managed_root_and_nested_symlink_escapes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "repo"
+            root.mkdir()
+            self.init_repo(root)
+            external_docs = base / "external-docs"
+            external_docs.mkdir()
+            (external_docs / "outside.md").write_text("outside\n", encoding="utf-8")
+            (root / "docs").symlink_to(external_docs, target_is_directory=True)
+            agents = root / ".agents"
+            agents.mkdir()
+            (agents / "skills").symlink_to(base, target_is_directory=True)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            joined = "\n".join(report["errors"])
+            self.assertIn("documentation path must not be a symlink", joined)
+            self.assertIn("repository skill path must not be a symlink", joined)
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "repo"
+            root.mkdir()
+            self.init_repo(root)
+            skill = root / ".agents" / "skills" / "fixture"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: fixture\ndescription: Fixture skill.\n---\n",
+                encoding="utf-8",
+            )
+            (skill / "references").symlink_to(base, target_is_directory=True)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(any("repository skill path" in error for error in report["errors"]))
+
 
 if __name__ == "__main__":
     unittest.main()

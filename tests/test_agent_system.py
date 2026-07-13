@@ -6,6 +6,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -51,6 +52,10 @@ class AgentSystemTests(unittest.TestCase):
             root = Path(temp)
             skill = root / ".agents" / "skills" / "fixture"
             skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: fixture\ndescription: Fixture hook.\n---\n\n# Fixture\n",
+                encoding="utf-8",
+            )
             hook = skill / "block.py"
             hook.write_text(
                 '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"decision":"block","reason":"fixture blocked"}))\n',
@@ -114,11 +119,13 @@ class AgentSystemTests(unittest.TestCase):
             claude.mkdir()
             config = codex / "config.toml"
             config.write_text(
-                'model = "future-model"\nmodel_reasoning_effort = "high"\nsecret_setting = "preserve"\n\n[features]\nmemories = true\n\n'
+                'banner = """literal config text\n[not.a.table]\n"""\n'
+                'model = "future-model"\nmodel_reasoning_effort = "high"\nsecret_setting = "preserve"\n\n[features] # keep this comment\nmemories = true\n\n'
                 '[plugins."code-review@claude-plugins-official"]\nenabled = true\n\n'
                 '[profiles.fast]\nmodel = "profile-model"\nmodel_reasoning_effort = "low"\n\n'
                 '[mcp_servers.fixture]\nmodel = "tool-model"\n\n'
-                '[projects."/workspace"]\ntrust_level = "trusted"\n',
+                '[projects."/workspace"]\ntrust_level = "trusted"\n\n'
+                '[[notices]]\nname = "preserve array table"\n',
                 encoding="utf-8",
             )
             config.chmod(0o600)
@@ -137,6 +144,46 @@ class AgentSystemTests(unittest.TestCase):
                             "useful": True,
                         },
                         "permissions": {"allow": ["Read"], "deny": []},
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "matcher": "custom",
+                                    "hooks": [{"type": "command", "command": "custom-claude-stop"}],
+                                }
+                            ],
+                            "Notification": [{"matcher": "", "hooks": []}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (codex / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "custom": "keep",
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "matcher": "custom",
+                                    "hooks": [{"type": "command", "command": "custom-codex-stop"}],
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cursor = home / ".cursor"
+            cursor.mkdir()
+            (cursor / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "custom": "keep",
+                        "hooks": {
+                            "stop": [{"command": "custom-cursor-stop", "timeout": 5}],
+                            "afterFileEdit": [{"command": "custom-after-edit"}],
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -158,12 +205,16 @@ class AgentSystemTests(unittest.TestCase):
             self.assertIn('model = "tool-model"', updated)
             self.assertIn('model_reasoning_effort = "high"', updated)
             self.assertIn('secret_setting = "preserve"', updated)
+            self.assertIn("[features] # keep this comment", updated)
+            self.assertIn("[not.a.table]", updated)
+            self.assertIn("[[notices]]", updated)
             self.assertIn('sandbox_mode = "danger-full-access"', updated)
             self.assertIn('approval_policy = "never"', updated)
             self.assertIn("memories = false", updated)
             self.assertNotIn("code-review@claude-plugins-official", updated)
             self.assertIn('[projects."/workspace"]', updated)
             self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+            self.assertEqual(tomllib.loads(updated)["notices"][0]["name"], "preserve array table")
             settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
             self.assertEqual(settings["theme"], "dark")
             self.assertNotIn("model", settings)
@@ -174,6 +225,15 @@ class AgentSystemTests(unittest.TestCase):
             self.assertEqual(settings["permissions"]["defaultMode"], "bypassPermissions")
             self.assertEqual(settings["permissions"]["allow"], ["Read"])
             self.assertTrue(settings["skipDangerousModePermissionPrompt"])
+            self.assertIn("custom-claude-stop", json.dumps(settings["hooks"]))
+            self.assertIn("Notification", settings["hooks"])
+            updated_codex_hooks = json.loads((codex / "hooks.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_codex_hooks["custom"], "keep")
+            self.assertIn("custom-codex-stop", json.dumps(updated_codex_hooks["hooks"]))
+            updated_cursor_hooks = json.loads((cursor / "hooks.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_cursor_hooks["custom"], "keep")
+            self.assertIn("custom-cursor-stop", json.dumps(updated_cursor_hooks["hooks"]))
+            self.assertIn("afterFileEdit", updated_cursor_hooks["hooks"])
             known = json.loads((plugins / "known_marketplaces.json").read_text(encoding="utf-8"))
             self.assertEqual(known, {"useful": {"source": "keep"}})
             self.assertTrue((home / ".cursor" / "rules" / "global-engineering.mdc").is_file())
@@ -262,9 +322,11 @@ class AgentSystemTests(unittest.TestCase):
             )
             cursor_hooks = json.loads((home / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
             self.assertEqual(cursor_hooks["version"], 1)
-            for name in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
-                text = (home / name).read_text(encoding="utf-8")
+            config = json.loads((home / ".agents" / "config.json").read_text(encoding="utf-8"))
+            for raw_path in config["shellRcPaths"]:
+                text = Path(raw_path).read_text(encoding="utf-8")
                 self.assertEqual(text.count("# >>> global agent invocation defaults >>>"), 1)
+            self.assertFalse((home / ".profile").exists())
             doctor = subprocess.run(
                 [str(SYSTEM_ROOT / "bin" / "agent-system-doctor"), "--home", str(home)],
                 text=True,
@@ -272,7 +334,6 @@ class AgentSystemTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(doctor.returncode, 0, doctor.stderr)
-            config = json.loads((home / ".agents" / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(Path(config["coordinationRepo"]), SYSTEM_ROOT)
             managed = json.loads(
                 (home / ".agents" / "managed-install.json").read_text(encoding="utf-8")
@@ -331,6 +392,142 @@ class AgentSystemTests(unittest.TestCase):
                     "doctor",
                 ],
             )
+
+    def test_installer_refuses_unowned_and_modified_managed_collisions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            collision = home / ".claude" / "skills" / "review"
+            collision.mkdir(parents=True)
+            marker = collision / "owned-by-user.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            first = subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(first.returncode, 0)
+            self.assertIn("unowned or modified destination", first.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+            self.assertFalse((home / ".agents" / "AGENTS.md").exists())
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            command = home / ".cursor" / "commands" / "review.md"
+            command.write_text("user replacement\n", encoding="utf-8")
+            second = subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("unowned or modified destination", second.stderr)
+            self.assertEqual(command.read_text(encoding="utf-8"), "user replacement\n")
+
+    def test_reinstall_preserves_coordination_repo_and_effective_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            profile = home / ".profile"
+            profile.write_text('export KEEP_PROFILE="yes"\n', encoding="utf-8")
+            coordination = root / "coordination"
+            subprocess.run(["git", "init", "-q", str(coordination)], check=True)
+
+            subprocess.run(
+                [
+                    "bash",
+                    str(SYSTEM_ROOT / "install.sh"),
+                    "--coordination-repo",
+                    str(coordination),
+                ],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            config = json.loads((home / ".agents" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(Path(config["coordinationRepo"]), coordination.resolve())
+            self.assertIn(str(profile.resolve()), config["shellRcPaths"])
+            self.assertIn('export KEEP_PROFILE="yes"', profile.read_text(encoding="utf-8"))
+            self.assertFalse((home / ".bash_profile").exists())
+            self.assertFalse((home / ".bash_login").exists())
+            doctor = subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-system-doctor"), "--home", str(home)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+
+    def test_installer_adopts_only_the_exact_legacy_generated_cursor_rule(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            old_system = root / "old-system"
+            home.mkdir()
+            old_system.mkdir()
+            old_policy = "# Old global policy\n"
+            (old_system / "AGENTS.md").write_text(old_policy, encoding="utf-8")
+            rule = home / ".cursor" / "rules" / "global-engineering.mdc"
+            rule.parent.mkdir(parents=True)
+            rule.write_text(
+                "---\n"
+                "description: Canonical global engineering policy\n"
+                "alwaysApply: true\n"
+                "---\n\n"
+                "Generated from the canonical agent system. Edit the source, then rerun the installer.\n\n"
+                + old_policy,
+                encoding="utf-8",
+            )
+            manifest = home / ".agents" / "managed-install.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps({"version": 1, "sourceRoot": str(old_system), "paths": {}}),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("# Global Engineering System", rule.read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            rule = home / ".cursor" / "rules" / "global-engineering.mdc"
+            rule.parent.mkdir(parents=True)
+            rule.write_text("user-owned rule\n", encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(rule.read_text(encoding="utf-8"), "user-owned rule\n")
 
     def test_installer_prunes_only_unchanged_retired_managed_paths(self):
         with tempfile.TemporaryDirectory() as temp:

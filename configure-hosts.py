@@ -12,6 +12,15 @@ import subprocess
 import sys
 import tempfile
 
+from lib.codex_config import edit_codex_config
+from lib.host_contract import (
+    cursor_rule,
+    expected_cursor_hooks,
+    expected_grouped_hooks,
+    hook_budgets,
+    is_managed_dispatch_command,
+)
+
 
 LEGACY_CODEX_PLUGINS = {
     "andrej-karpathy-skills@karpathy-skills",
@@ -90,8 +99,15 @@ def load_catalog(system_root):
     return catalog
 
 
-def resolve_coordination_repo(system_root, explicit):
-    candidate = Path(explicit).expanduser().resolve() if explicit else system_root.resolve()
+def resolve_coordination_repo(system_root, agents_home, explicit):
+    if explicit:
+        candidate = Path(explicit).expanduser().resolve()
+    else:
+        existing = read_json(agents_home / "config.json")
+        persisted = existing.get("coordinationRepo")
+        if persisted is not None and not isinstance(persisted, str):
+            raise SystemExit("Existing coordinationRepo must be a string")
+        candidate = Path(persisted).expanduser().resolve() if persisted else system_root.resolve()
     result = subprocess.run(
         ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
         text=True,
@@ -106,21 +122,33 @@ def resolve_coordination_repo(system_root, explicit):
     return root
 
 
-def configure_agent_home(agents_home, coordination_repo):
+def configure_agent_home(agents_home, coordination_repo, shell_rc_paths):
     path = agents_home / "config.json"
     config = read_json(path)
     config["coordinationRepo"] = str(coordination_repo)
+    config["shellRcPaths"] = [str(path) for path in shell_rc_paths]
     write_json(path, config)
 
 
-def managed_entries(home, agents_home, system_root, catalog):
+def managed_entries(home, agents_home, system_root, catalog, policy):
     entries = {}
 
     def symlink(path, target):
         entries[str(path)] = {"kind": "symlink", "target": str(target)}
 
     def copied(path, source):
-        entries[str(path)] = {"kind": "copy", "sha256": sha256_file(source)}
+        entries[str(path)] = {
+            "kind": "copy",
+            "source": str(source),
+            "sha256": sha256_file(source),
+        }
+
+    def generated(path, content):
+        entries[str(path)] = {
+            "kind": "generated",
+            "content": content,
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        }
 
     symlink(agents_home / "AGENTS.md", system_root / "AGENTS.md")
     symlink(agents_home / "hooks" / "dispatch.py", system_root / "hooks" / "dispatch.py")
@@ -153,19 +181,110 @@ def managed_entries(home, agents_home, system_root, catalog):
             symlink(home / ".codex" / "prompts" / f"{name}.md", skill_file)
             symlink(home / ".claude" / "commands" / f"{name}.md", skill_file)
             copied(home / ".cursor" / "commands" / f"{name}.md", skill_file)
+    generated(home / ".cursor" / "rules" / "global-engineering.mdc", cursor_rule(policy))
     return entries
 
 
 def matches_managed(path, entry):
     if entry.get("kind") == "symlink":
-        return path.is_symlink() and str(path.resolve(strict=False)) == entry.get("target")
-    if entry.get("kind") == "copy":
+        target = entry.get("target")
+        return (
+            isinstance(target, str)
+            and path.is_symlink()
+            and path.resolve(strict=False) == Path(target).resolve(strict=False)
+        )
+    if entry.get("kind") in {"copy", "generated"}:
         return path.is_file() and not path.is_symlink() and sha256_file(path) == entry.get("sha256")
     return False
 
 
 def contained_by(path, roots):
     return any(path == root or root in path.parents for root in roots)
+
+
+def managed_root(path, roots):
+    canonical = path.parent.resolve(strict=False) / path.name
+    return next(
+        (
+            root
+            for root in roots
+            if canonical == root.resolve(strict=False) or root.resolve(strict=False) in canonical.parents
+        ),
+        None,
+    )
+
+
+def legacy_generated_entry(previous, path):
+    if path.name != "global-engineering.mdc" or path.parent.name != "rules":
+        return None
+    source_root = previous.get("sourceRoot")
+    if not isinstance(source_root, str):
+        return None
+    policy = Path(source_root) / "AGENTS.md"
+    try:
+        content = cursor_rule(policy.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return {
+        "kind": "generated",
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
+
+def preflight_managed(manifest_path, desired, allowed_roots):
+    previous = read_json(manifest_path)
+    old_paths = previous.get("paths", {}) if isinstance(previous.get("paths"), dict) else {}
+    collisions = []
+    for raw_path, entry in desired.items():
+        path = Path(raw_path)
+        root = managed_root(path, allowed_roots)
+        if not path.is_absolute() or root is None:
+            collisions.append(f"destination is outside managed roots: {path}")
+            continue
+        resolved_root = root.resolve(strict=False)
+        resolved_parent = path.parent.resolve(strict=False)
+        if not contained_by(resolved_parent, (resolved_root,)):
+            collisions.append(f"destination parent escapes through a symlink: {path}")
+            continue
+        if not (path.exists() or path.is_symlink()) or matches_managed(path, entry):
+            continue
+        previous_entry = old_paths.get(raw_path) or legacy_generated_entry(previous, path)
+        if isinstance(previous_entry, dict) and matches_managed(path, previous_entry):
+            continue
+        collisions.append(f"unowned or modified destination: {path}")
+    if collisions:
+        detail = "\n".join(f"- {collision}" for collision in collisions)
+        raise SystemExit(f"Managed-path preflight failed; no managed paths changed:\n{detail}")
+
+
+def install_managed(desired):
+    installed = 0
+    for raw_path, entry in desired.items():
+        path = Path(raw_path)
+        if matches_managed(path, entry):
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if entry.get("kind") == "symlink":
+            target = entry["target"]
+            descriptor, raw_temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            os.close(descriptor)
+            temporary = Path(raw_temporary)
+            try:
+                temporary.unlink()
+                temporary.symlink_to(target)
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        elif entry.get("kind") == "copy":
+            source = Path(entry["source"])
+            atomic_write(path, source.read_text(encoding="utf-8"), mode=0o644)
+        elif entry.get("kind") == "generated":
+            atomic_write(path, entry["content"], mode=0o644)
+        else:
+            raise SystemExit(f"Unknown managed path kind for {path}")
+        installed += 1
+    if installed:
+        print(f"Installed {installed} managed path(s)")
 
 
 def prune_stale_managed(manifest_path, desired, allowed_roots):
@@ -180,8 +299,13 @@ def prune_stale_managed(manifest_path, desired, allowed_roots):
         if raw_path in desired or not isinstance(entry, dict):
             continue
         path = Path(raw_path)
-        canonical_path = path.parent.resolve(strict=False) / path.name
-        if not path.is_absolute() or not contained_by(canonical_path, allowed_roots):
+        root = managed_root(path, allowed_roots)
+        canonical_parent = path.parent.resolve(strict=False)
+        if (
+            not path.is_absolute()
+            or root is None
+            or not contained_by(canonical_parent, (root.resolve(strict=False),))
+        ):
             orphaned.append(raw_path)
             print(f"Preserved retired path outside managed roots: {path}", file=sys.stderr)
             continue
@@ -194,7 +318,56 @@ def prune_stale_managed(manifest_path, desired, allowed_roots):
     return sorted(set(orphaned))
 
 
-def configure_claude(home):
+def merge_grouped_hooks(existing, expected, label):
+    if existing is None:
+        existing = {}
+    if not isinstance(existing, dict):
+        raise SystemExit(f"{label} hooks must be an object")
+    merged = dict(existing)
+    for event, managed_groups in expected.items():
+        groups = existing.get(event, [])
+        if not isinstance(groups, list):
+            raise SystemExit(f"{label} hooks.{event} must be a list")
+        preserved = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                preserved.append(group)
+                continue
+            hooks = [
+                hook
+                for hook in group["hooks"]
+                if not (isinstance(hook, dict) and is_managed_dispatch_command(hook.get("command")))
+            ]
+            if hooks:
+                updated = dict(group)
+                updated["hooks"] = hooks
+                preserved.append(updated)
+            elif len(hooks) == len(group["hooks"]):
+                preserved.append(group)
+        merged[event] = [*preserved, *managed_groups]
+    return merged
+
+
+def merge_cursor_hooks(existing, expected):
+    if existing is None:
+        existing = {}
+    if not isinstance(existing, dict):
+        raise SystemExit("Cursor hooks must be an object")
+    merged = dict(existing)
+    for event, managed_entries_for_event in expected.items():
+        entries = existing.get(event, [])
+        if not isinstance(entries, list):
+            raise SystemExit(f"Cursor hooks.{event} must be a list")
+        preserved = [
+            entry
+            for entry in entries
+            if not (isinstance(entry, dict) and is_managed_dispatch_command(entry.get("command")))
+        ]
+        merged[event] = [*preserved, *managed_entries_for_event]
+    return merged
+
+
+def configure_claude(home, budgets):
     path = home / ".claude" / "settings.json"
     settings = read_json(path)
     env = settings.get("env")
@@ -213,32 +386,9 @@ def configure_claude(home):
         settings["permissions"] = permissions
     permissions["defaultMode"] = "bypassPermissions"
     settings["skipDangerousModePermissionPrompt"] = True
-    settings["hooks"] = {
-        "Stop": [
-            {
-                "matcher": "",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": '"$HOME/.agents/hooks/dispatch.py" --host claude Stop',
-                        "timeout": 330,
-                    }
-                ],
-            }
-        ],
-        "PreToolUse": [
-            {
-                "matcher": "Bash",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": '"$HOME/.agents/hooks/dispatch.py" --host claude PreToolUse',
-                        "timeout": 630,
-                    }
-                ],
-            }
-        ],
-    }
+    settings["hooks"] = merge_grouped_hooks(
+        settings.get("hooks"), expected_grouped_hooks("claude", budgets), "Claude"
+    )
     enabled = settings.get("enabledPlugins")
     if isinstance(enabled, dict):
         for plugin, is_enabled in list(enabled.items()):
@@ -256,134 +406,23 @@ def configure_claude(home):
         write_json(marketplace_path, known_marketplaces)
 
 
-def configure_codex_hooks(home):
-    write_json(
-        home / ".codex" / "hooks.json",
-        {
-            "hooks": {
-                "Stop": [
-                    {
-                        "matcher": "",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": '"$HOME/.agents/hooks/dispatch.py" --host codex Stop',
-                                "timeout": 330,
-                            }
-                        ],
-                    }
-                ],
-                "PreToolUse": [
-                    {
-                        "matcher": "Bash",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": '"$HOME/.agents/hooks/dispatch.py" --host codex PreToolUse',
-                                "timeout": 630,
-                            }
-                        ],
-                    }
-                ],
-            }
-        },
+def configure_codex_hooks(home, budgets):
+    path = home / ".codex" / "hooks.json"
+    document = read_json(path)
+    document["hooks"] = merge_grouped_hooks(
+        document.get("hooks"), expected_grouped_hooks("codex", budgets), "Codex"
     )
-
-
-def section_name(line):
-    match = re.match(r"^\s*\[([^]]+)]\s*$", line)
-    return match.group(1) if match else None
-
-
-def remove_sections(lines, predicate):
-    result = []
-    skip = False
-    for line in lines:
-        name = section_name(line)
-        if name is not None:
-            skip = predicate(name)
-        if not skip:
-            result.append(line)
-    return result
-
-
-def set_feature(lines, key, value):
-    start = None
-    end = len(lines)
-    for index, line in enumerate(lines):
-        name = section_name(line)
-        if name == "features":
-            start = index
-            continue
-        if start is not None and name is not None:
-            end = index
-            break
-
-    assignment = f"{key} = {value}\n"
-    if start is None:
-        if lines and lines[-1].strip():
-            lines.append("\n")
-        lines.extend(["[features]\n", assignment])
-        return lines
-
-    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
-    for index in range(start + 1, end):
-        if key_re.match(lines[index]):
-            lines[index] = assignment
-            return lines
-    lines.insert(start + 1, assignment)
-    return lines
-
-
-def set_root_value(lines, key, value):
-    end = next(
-        (index for index, line in enumerate(lines) if section_name(line) is not None),
-        len(lines),
-    )
-    assignment = f"{key} = {value}\n"
-    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
-    for index in range(end):
-        if key_re.match(lines[index]):
-            lines[index] = assignment
-            return lines
-
-    lines.insert(end, assignment)
-    return lines
-
-
-def remove_codex_model_pins(lines):
-    result = []
-    section = None
-    model_assignment = re.compile(r"^\s*model\s*=")
-    for line in lines:
-        name = section_name(line)
-        if name is not None:
-            section = name
-        if model_assignment.match(line) and (
-            section is None or section == "profiles" or section.startswith("profiles.")
-        ):
-            continue
-        result.append(line)
-    return result
+    write_json(path, document)
 
 
 def configure_codex_toml(home):
     path = home / ".codex" / "config.toml"
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
-
-    def obsolete(name):
-        if name == "marketplaces.karpathy-skills" or name == "hooks.state" or name.startswith("hooks.state."):
-            return True
-        if name.startswith('plugins."') and name.endswith('"'):
-            return name[len('plugins."') : -1] in LEGACY_CODEX_PLUGINS
-        return False
-
-    lines = remove_sections(lines, obsolete)
-    lines = remove_codex_model_pins(lines)
-    lines = set_root_value(lines, "sandbox_mode", '"danger-full-access"')
-    lines = set_root_value(lines, "approval_policy", '"never"')
-    lines = set_feature(lines, "memories", "false")
-    atomic_write(path, "".join(lines))
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    try:
+        updated = edit_codex_config(text)
+    except ValueError as exc:
+        raise SystemExit(f"Cannot safely update {path}: {exc}") from exc
+    atomic_write(path, updated)
 
 
 def configure_shell_rc(path):
@@ -397,38 +436,23 @@ def configure_shell_rc(path):
     atomic_write(path, content + SHELL_BLOCK)
 
 
-def configure_cursor(home, policy):
-    write_json(
-        home / ".cursor" / "hooks.json",
-        {
-            "version": 1,
-            "hooks": {
-                "stop": [
-                    {
-                        "command": '"$HOME/.agents/hooks/dispatch.py" --host cursor Stop',
-                        "timeout": 330,
-                    }
-                ],
-                "preToolUse": [
-                    {
-                        "matcher": "Shell",
-                        "command": '"$HOME/.agents/hooks/dispatch.py" --host cursor PreToolUse',
-                        "timeout": 630,
-                    }
-                ],
-            },
-        },
+def shell_rc_paths(home):
+    login_candidates = [home / ".bash_profile", home / ".bash_login", home / ".profile"]
+    login = next((path for path in login_candidates if path.exists()), login_candidates[0])
+    return [home / ".zshrc", home / ".bashrc", login]
+
+
+def configure_cursor(home, budgets):
+    hooks_path = home / ".cursor" / "hooks.json"
+    document = read_json(hooks_path)
+    version = document.get("version")
+    if version not in (None, 1):
+        raise SystemExit(f"Unsupported Cursor hook schema version in {hooks_path}: {version}")
+    document["version"] = 1
+    document["hooks"] = merge_cursor_hooks(
+        document.get("hooks"), expected_cursor_hooks(budgets)
     )
-    rule = (
-        "---\n"
-        "description: Canonical global engineering policy\n"
-        "alwaysApply: true\n"
-        "---\n\n"
-        "Generated from the canonical agent system. Edit the source, then rerun the installer.\n\n"
-        + policy.rstrip()
-        + "\n"
-    )
-    atomic_write(home / ".cursor" / "rules" / "global-engineering.mdc", rule)
+    write_json(hooks_path, document)
 
 
 def main():
@@ -440,27 +464,32 @@ def main():
     system_root = args.system_root.expanduser().resolve()
     agents_home = Path(os.environ.get("AGENTS_HOME", home / ".agents")).expanduser().resolve()
     catalog = load_catalog(system_root)
-    coordination_repo = resolve_coordination_repo(system_root, args.coordination_repo)
+    try:
+        budgets = hook_budgets(catalog)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid hook budget catalog: {exc}") from exc
+    coordination_repo = resolve_coordination_repo(system_root, agents_home, args.coordination_repo)
     policy = (system_root / "AGENTS.md").read_text(encoding="utf-8")
-    configure_claude(home)
-    configure_codex_hooks(home)
-    configure_codex_toml(home)
-    configure_cursor(home, policy)
-    for name in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
-        configure_shell_rc(home / name)
-    configure_agent_home(agents_home, coordination_repo)
     manifest_path = agents_home / "managed-install.json"
-    entries = managed_entries(home, agents_home, system_root, catalog)
-    allowed_roots = tuple(
-        path.resolve()
-        for path in (
-            agents_home,
-            home / ".codex",
-            home / ".claude",
-            home / ".cursor",
-            home / ".local" / "bin",
-        )
+    entries = managed_entries(home, agents_home, system_root, catalog, policy)
+    allowed_roots = (
+        agents_home,
+        home / ".codex",
+        home / ".claude",
+        home / ".cursor",
+        home / ".local" / "bin",
     )
+    preflight_managed(manifest_path, entries, allowed_roots)
+
+    configure_codex_toml(home)
+    configure_claude(home, budgets)
+    configure_codex_hooks(home, budgets)
+    configure_cursor(home, budgets)
+    selected_shell_rc_paths = shell_rc_paths(home)
+    for path in selected_shell_rc_paths:
+        configure_shell_rc(path)
+    install_managed(entries)
+    configure_agent_home(agents_home, coordination_repo, selected_shell_rc_paths)
     orphaned = prune_stale_managed(manifest_path, entries, allowed_roots)
     write_json(
         manifest_path,
@@ -468,7 +497,10 @@ def main():
             "version": 1,
             "sourceRoot": str(system_root),
             "catalogSha256": sha256_file(system_root / "system.json"),
-            "paths": entries,
+            "paths": {
+                path: {key: value for key, value in entry.items() if key != "content"}
+                for path, entry in entries.items()
+            },
             "orphanedPaths": orphaned,
         },
     )

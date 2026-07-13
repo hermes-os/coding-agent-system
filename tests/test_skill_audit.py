@@ -112,6 +112,54 @@ class SkillAuditTests(unittest.TestCase):
             report = json.loads(result.stdout)
             self.assertEqual([skill["name"] for skill in report["skills"]], ["live"])
 
+    def test_rejects_hooks_only_nested_skills_and_aggregate_timeout_overflow(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "skills"
+            hooks_only = root / "hooks-only"
+            hooks_only.mkdir(parents=True)
+            (hooks_only / "hooks.json").write_text("{}", encoding="utf-8")
+            nested = root / "group" / "nested"
+            nested.mkdir(parents=True)
+            (nested / "SKILL.md").write_text(
+                "---\nname: nested\ndescription: Nested fixture.\n---\n",
+                encoding="utf-8",
+            )
+            timed = root / "timed"
+            timed.mkdir(parents=True)
+            (timed / "SKILL.md").write_text(
+                "---\nname: timed\ndescription: Timed fixture.\n---\n",
+                encoding="utf-8",
+            )
+            for name in ("one.py", "two.py"):
+                script = timed / name
+                script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+                script.chmod(0o755)
+            (timed / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "events": {
+                            "Stop": [
+                                {"command": ["one.py"], "timeoutSeconds": 200},
+                                {"command": ["two.py"], "timeoutSeconds": 200},
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [str(AUDIT), "--root", str(root), "--check", "--json"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            report = json.loads(result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(any("adjacent SKILL.md" in error for error in report["errors"]))
+            self.assertTrue(any("direct children" in error for error in report["errors"]))
+            self.assertTrue(any("declares 400 seconds" in error for error in report["errors"]))
+
     def test_codex_visible_probe_measures_rendered_catalog(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

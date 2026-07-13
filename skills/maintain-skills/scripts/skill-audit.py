@@ -16,6 +16,12 @@ import shutil
 import subprocess
 import sys
 
+SYSTEM_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(SYSTEM_ROOT))
+
+from lib.host_contract import hook_budgets
+from lib.skill_layout import direct_skill_files
+
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MODEL_PATTERNS = {
@@ -31,7 +37,6 @@ MODEL_PATTERNS = {
     "gpt-": re.compile(r"\bgpt-[a-z0-9]"),
 }
 TEXT_SUFFIXES = {".json", ".md", ".mjs", ".py", ".sh", ".ts", ".tsx", ".yaml", ".yml"}
-MAX_HOOK_TIMEOUT_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -88,7 +93,7 @@ def cache_roots(home: Path) -> list[Path]:
     ]
 
 
-def discover(root: Path) -> list[Path]:
+def discover_cache(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
     found: list[Path] = []
@@ -218,12 +223,12 @@ def validate_hooks(skill: Skill) -> list[str]:
         errors.append(f"{manifest_path}: events must be an object")
         return errors
 
-    system_root = Path(__file__).resolve().parents[3]
     try:
-        catalog = json.loads((system_root / "system.json").read_text(encoding="utf-8"))
+        catalog = json.loads((SYSTEM_ROOT / "system.json").read_text(encoding="utf-8"))
         supported_events = set(catalog["hookEvents"])
-    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        return [*errors, f"{system_root / 'system.json'}: invalid hook catalog: {exc}"]
+        budgets = hook_budgets(catalog)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return [*errors, f"{SYSTEM_ROOT / 'system.json'}: invalid hook catalog: {exc}"]
     skill_dir = skill.real.parent.resolve()
     for event, entries in events.items():
         if not isinstance(event, str) or not isinstance(entries, list):
@@ -233,6 +238,7 @@ def validate_hooks(skill: Skill) -> list[str]:
             errors.append(f"{manifest_path}: unsupported hook event {event!r}")
         if not entries:
             errors.append(f"{manifest_path}: {event} must contain at least one hook")
+        total_timeout = 0
         for index, entry in enumerate(entries):
             command = entry.get("command") if isinstance(entry, dict) else None
             if isinstance(entry, dict):
@@ -258,11 +264,18 @@ def validate_hooks(skill: Skill) -> list[str]:
             timeout = entry.get("timeoutSeconds", 300) if isinstance(entry, dict) else 300
             if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
                 errors.append(f"{manifest_path}: {event}[{index}] timeoutSeconds must be a positive integer")
-            elif timeout > MAX_HOOK_TIMEOUT_SECONDS:
+            elif event in budgets and timeout > budgets[event]:
                 errors.append(
                     f"{manifest_path}: {event}[{index}] timeoutSeconds exceeds "
-                    f"{MAX_HOOK_TIMEOUT_SECONDS}"
+                    f"the {budgets[event]}-second event budget"
                 )
+            else:
+                total_timeout += timeout
+        if event in budgets and total_timeout > budgets[event]:
+            errors.append(
+                f"{manifest_path}: {event} declares {total_timeout} seconds across hooks, "
+                f"exceeding the {budgets[event]}-second event budget"
+            )
     return errors
 
 
@@ -389,19 +402,22 @@ def main() -> int:
     roots = list(args.root)
     if args.live:
         roots.extend(live_roots(Path.home(), Path.cwd()))
-    if args.all_caches:
-        roots.extend(cache_roots(Path.home()))
     if not roots:
         roots = [script_skill_root]
+    cache_scan_roots = cache_roots(Path.home()) if args.all_caches else []
 
     discovered: list[Path] = []
+    errors: list[str] = []
     for root in roots:
-        discovered.extend(discover(root.expanduser().resolve()))
+        found, layout_errors = direct_skill_files(root.expanduser().resolve())
+        discovered.extend(found)
+        errors.extend(layout_errors)
+    for root in cache_scan_roots:
+        discovered.extend(discover_cache(root.expanduser().resolve()))
 
     aliases = 0
     seen: set[Path] = set()
     skills: list[Skill] = []
-    errors: list[str] = []
     warnings: list[str] = []
     for path in sorted(discovered, key=str):
         try:
@@ -451,7 +467,7 @@ def main() -> int:
                 )
 
     report = {
-        "roots": [str(root.expanduser().resolve()) for root in roots],
+        "roots": [str(root.expanduser().resolve()) for root in [*roots, *cache_scan_roots]],
         "skills": [
             {"name": skill.name, "description": skill.description, "path": str(skill.source)}
             for skill in skills

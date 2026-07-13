@@ -8,9 +8,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
+import tomllib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.codex_config import model_pin_paths
+from lib.host_contract import cursor_rule, expected_cursor_hooks, expected_grouped_hooks, hook_budgets
 
 
 CLAUDE_MODEL_ENV_KEYS = {
@@ -54,82 +59,17 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def codex_model_pins(path: Path) -> list[str]:
-    if not path.is_file():
-        return []
-    section = None
-    pins: list[str] = []
-    section_re = re.compile(r"^\s*\[([^]]+)]\s*$")
-    model_re = re.compile(r"^\s*model\s*=")
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        match = section_re.match(line)
-        if match:
-            section = match.group(1)
-        if model_re.match(line) and (
-            section is None or section == "profiles" or section.startswith("profiles.")
-        ):
-            pins.append(f"{path}:{number}")
-    return pins
-
-
-def expected_claude_hooks() -> dict:
-    return {
-        "Stop": [
-            {
-                "matcher": "",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": '"$HOME/.agents/hooks/dispatch.py" --host claude Stop',
-                        "timeout": 330,
-                    }
-                ],
-            }
-        ],
-        "PreToolUse": [
-            {
-                "matcher": "Bash",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": '"$HOME/.agents/hooks/dispatch.py" --host claude PreToolUse',
-                        "timeout": 630,
-                    }
-                ],
-            }
-        ],
-    }
-
-
-def expected_codex_hooks() -> dict:
-    return {"hooks": expected_claude_hooks_for("codex")}
-
-
-def expected_claude_hooks_for(host: str) -> dict:
-    hooks = expected_claude_hooks()
-    encoded = json.dumps(hooks).replace("--host claude", f"--host {host}")
-    return json.loads(encoded)
-
-
-def expected_cursor_hooks() -> dict:
-    return {
-        "version": 1,
-        "hooks": {
-            "stop": [
-                {
-                    "command": '"$HOME/.agents/hooks/dispatch.py" --host cursor Stop',
-                    "timeout": 330,
-                }
-            ],
-            "preToolUse": [
-                {
-                    "matcher": "Shell",
-                    "command": '"$HOME/.agents/hooks/dispatch.py" --host cursor PreToolUse',
-                    "timeout": 630,
-                }
-            ],
-        },
-    }
+def contains_expected_events(actual: object, expected: dict) -> bool:
+    if not isinstance(actual, dict):
+        return False
+    for event, expected_entries in expected.items():
+        entries = actual.get(event)
+        if not isinstance(entries, list):
+            return False
+        for expected_entry in expected_entries:
+            if entries.count(expected_entry) != 1:
+                return False
+    return True
 
 
 def validate_catalog(system_root: Path, errors: list[str]) -> dict:
@@ -179,6 +119,10 @@ def validate_catalog(system_root: Path, errors: list[str]) -> dict:
     events = catalog.get("hookEvents")
     if events != ["Stop", "PreToolUse"]:
         errors.append("catalog hookEvents must be Stop and PreToolUse")
+    try:
+        hook_budgets(catalog)
+    except ValueError as exc:
+        errors.append(f"invalid catalog hook budgets: {exc}")
     return catalog
 
 
@@ -210,6 +154,10 @@ def main() -> int:
     else:
         system_root = canonical.resolve().parent
     catalog = validate_catalog(system_root, errors)
+    try:
+        budgets = hook_budgets(catalog)
+    except ValueError:
+        budgets = {"Stop": 330, "PreToolUse": 600}
     policy = system_root / str(catalog.get("policy", "AGENTS.md"))
     if not exact_symlink(canonical, policy):
         errors.append(f"bad canonical policy link: {canonical}")
@@ -268,7 +216,9 @@ def main() -> int:
 
     claude_path = home / ".claude" / "settings.json"
     claude = read_json(claude_path, errors)
-    if claude.get("hooks") != expected_claude_hooks():
+    if not contains_expected_events(
+        claude.get("hooks"), expected_grouped_hooks("claude", budgets)
+    ):
         errors.append(f"unexpected Claude hook configuration: {claude_path}")
     claude_env = claude.get("env") if isinstance(claude.get("env"), dict) else {}
     pins = sorted(CLAUDE_MODEL_ENV_KEYS & set(claude_env))
@@ -287,30 +237,58 @@ def main() -> int:
         errors.append("Claude dangerous-mode acknowledgement is not persisted")
 
     codex_hooks_path = home / ".codex" / "hooks.json"
-    if read_json(codex_hooks_path, errors) != expected_codex_hooks():
+    codex_hooks = read_json(codex_hooks_path, errors)
+    if not contains_expected_events(
+        codex_hooks.get("hooks"), expected_grouped_hooks("codex", budgets)
+    ):
         errors.append(f"unexpected Codex hook configuration: {codex_hooks_path}")
     cursor_hooks_path = home / ".cursor" / "hooks.json"
-    if read_json(cursor_hooks_path, errors) != expected_cursor_hooks():
+    cursor_hooks = read_json(cursor_hooks_path, errors)
+    if cursor_hooks.get("version") != 1 or not contains_expected_events(
+        cursor_hooks.get("hooks"), expected_cursor_hooks(budgets)
+    ):
         errors.append(f"unexpected Cursor hook configuration: {cursor_hooks_path}")
 
     codex_config = home / ".codex" / "config.toml"
-    codex_pins = codex_model_pins(codex_config)
-    if codex_pins:
-        errors.append(f"Codex model pins remain: {', '.join(codex_pins)}")
     try:
         codex_text = codex_config.read_text(encoding="utf-8")
-    except OSError:
-        codex_text = ""
-    for pattern, message in (
-        (r'^sandbox_mode\s*=\s*"danger-full-access"\s*$', "Codex danger-full-access sandbox is not the default"),
-        (r'^approval_policy\s*=\s*"never"\s*$', "Codex never-ask approval policy is not the default"),
-        (r'^memories\s*=\s*false\s*$', "Codex memories are not disabled"),
-    ):
-        if not re.search(pattern, codex_text, re.MULTILINE):
-            errors.append(message)
+        codex_values = tomllib.loads(codex_text)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        errors.append(f"invalid Codex TOML {codex_config}: {exc}")
+        codex_values = {}
+    codex_pins = model_pin_paths(codex_values)
+    if codex_pins:
+        errors.append(f"Codex model pins remain: {', '.join(codex_pins)}")
+    if codex_values.get("sandbox_mode") != "danger-full-access":
+        errors.append("Codex danger-full-access sandbox is not the default")
+    if codex_values.get("approval_policy") != "never":
+        errors.append("Codex never-ask approval policy is not the default")
+    features = codex_values.get("features")
+    if not isinstance(features, dict) or features.get("memories") is not False:
+        errors.append("Codex memories are not disabled")
 
-    for rc_name in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
-        rc_path = home / rc_name
+    config = read_json(agents / "config.json", errors)
+    shell_paths = config.get("shellRcPaths")
+    if not isinstance(shell_paths, list) or not all(isinstance(path, str) for path in shell_paths):
+        errors.append("agent shellRcPaths configuration is invalid")
+        shell_paths = []
+    resolved_shell_paths = [Path(path).expanduser().resolve(strict=False) for path in shell_paths]
+    expected_login = next(
+        (
+            path.resolve(strict=False)
+            for path in (home / ".bash_profile", home / ".bash_login", home / ".profile")
+            if path.exists()
+        ),
+        (home / ".bash_profile").resolve(strict=False),
+    )
+    expected_shell_paths = {
+        (home / ".zshrc").resolve(strict=False),
+        (home / ".bashrc").resolve(strict=False),
+        expected_login,
+    }
+    if set(resolved_shell_paths) != expected_shell_paths:
+        errors.append("configured shell startup files do not match effective shell startup paths")
+    for rc_path in resolved_shell_paths:
         try:
             count = rc_path.read_text(encoding="utf-8").count(SHELL_BLOCK_MARKER)
         except OSError:
@@ -318,23 +296,14 @@ def main() -> int:
         if count != 1:
             errors.append(f"invocation source block count is {count}: {rc_path}")
 
-    cursor_rule = home / ".cursor" / "rules" / "global-engineering.mdc"
-    expected_rule = (
-        "---\n"
-        "description: Canonical global engineering policy\n"
-        "alwaysApply: true\n"
-        "---\n\n"
-        "Generated from the canonical agent system. Edit the source, then rerun the installer.\n\n"
-        + policy.read_text(encoding="utf-8").rstrip()
-        + "\n"
-    ) if policy.is_file() else ""
+    cursor_rule_path = home / ".cursor" / "rules" / "global-engineering.mdc"
+    expected_rule = cursor_rule(policy.read_text(encoding="utf-8")) if policy.is_file() else ""
     try:
-        if cursor_rule.read_text(encoding="utf-8") != expected_rule:
-            errors.append(f"stale Cursor global rule: {cursor_rule}")
+        if cursor_rule_path.read_text(encoding="utf-8") != expected_rule:
+            errors.append(f"stale Cursor global rule: {cursor_rule_path}")
     except OSError as exc:
-        errors.append(f"missing Cursor global rule {cursor_rule}: {exc}")
+        errors.append(f"missing Cursor global rule {cursor_rule_path}: {exc}")
 
-    config = read_json(agents / "config.json", errors)
     coordination_raw = config.get("coordinationRepo")
     if not isinstance(coordination_raw, str) or not git_root(Path(coordination_raw).expanduser()):
         errors.append("agent coordination repository is not a valid Git root")

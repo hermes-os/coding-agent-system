@@ -65,6 +65,14 @@ behavior. Validation also contains hand-maintained catalogs that can drift.
   strict skill audit, repository check, syntax checks, and `git diff --check`
   pass. The desktop command runner truncates the aggregate suite at roughly 30
   seconds, so the unchanged aggregate command remains CI proof.
+- Hardened candidate proof: `./validate.sh` passed all 60 tests in 154.867
+  seconds, including managed-path collision safety, unrelated hook preservation,
+  exact-origin publication checks, TOML and shell-profile preservation, shared
+  skill layout, aggregate hook budgets, and repository symlink containment.
+- A frozen independent review found ten actionable installer and enforcement
+  defects in the first extracted candidate. Each finding is repaired with a
+  focused regression test; a fresh exact-candidate review is required before
+  publication.
 
 ## Open Questions
 

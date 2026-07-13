@@ -15,6 +15,10 @@ class DispatchTests(unittest.TestCase):
     def repo_with_blocking_hook(self, root: Path) -> None:
         skill = root / ".agents" / "skills" / "example"
         skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: example\ndescription: Example hook.\n---\n\n# Example\n",
+            encoding="utf-8",
+        )
         hook = skill / "block.py"
         hook.write_text(
             "#!/usr/bin/env python3\nimport json\nprint(json.dumps({'decision':'block','reason':'retry this'}))\n",
@@ -112,6 +116,63 @@ class DispatchTests(unittest.TestCase):
         response = json.loads(result.stdout)
         self.assertEqual(response["decision"], "block")
         self.assertIn("unknown keys", response["reason"])
+
+    def test_hooks_only_and_nested_skill_layouts_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hooks_only = root / ".agents" / "skills" / "hooks-only"
+            hooks_only.mkdir(parents=True)
+            (hooks_only / "hooks.json").write_text(
+                json.dumps({"version": 1, "events": {"Stop": [{"command": ["hook.py"]}]}}),
+                encoding="utf-8",
+            )
+            result = self.run_dispatch(root, "claude", "Stop")
+            self.assertIn("adjacent SKILL.md", json.loads(result.stdout)["reason"])
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            nested = root / ".agents" / "skills" / "group" / "nested"
+            nested.mkdir(parents=True)
+            (nested / "SKILL.md").write_text(
+                "---\nname: nested\ndescription: Nested fixture.\n---\n",
+                encoding="utf-8",
+            )
+            result = self.run_dispatch(root, "claude", "Stop")
+            self.assertIn("direct children", json.loads(result.stdout)["reason"])
+
+    def test_aggregate_event_budget_fails_before_any_hook_runs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.repo_with_blocking_hook(root)
+            first_manifest = root / ".agents" / "skills" / "example" / "hooks.json"
+            first = json.loads(first_manifest.read_text(encoding="utf-8"))
+            first["events"]["Stop"][0]["timeoutSeconds"] = 300
+            first_manifest.write_text(json.dumps(first), encoding="utf-8")
+
+            second = root / ".agents" / "skills" / "second"
+            second.mkdir(parents=True)
+            (second / "SKILL.md").write_text(
+                "---\nname: second\ndescription: Second fixture.\n---\n",
+                encoding="utf-8",
+            )
+            hook = second / "pass.py"
+            hook.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            hook.chmod(0o755)
+            (second / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "events": {
+                            "Stop": [{"command": ["pass.py"], "timeoutSeconds": 40}]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_dispatch(root, "claude", "Stop")
+            response = json.loads(result.stdout)
+            self.assertEqual(response["decision"], "block")
+            self.assertIn("declares 340 seconds", response["reason"])
 
 
 if __name__ == "__main__":

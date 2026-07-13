@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
@@ -140,6 +141,32 @@ def run_check(command: list[str], label: str) -> str | None:
     return f"{label} failed: {final}"
 
 
+def symlinks_beneath(root: Path) -> list[Path]:
+    if root.is_symlink():
+        return [root]
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in [*directories, *files]:
+            candidate = current_path / name
+            if candidate.is_symlink():
+                found.append(candidate)
+        directories[:] = [name for name in directories if not (current_path / name).is_symlink()]
+    return sorted(found)
+
+
+def symlinked_ancestor(repo: Path, path: Path) -> Path | None:
+    relative = path.relative_to(repo)
+    current = repo
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return current
+    return None
+
+
 def main() -> int:
     args = parse_args()
     repo = args.repo.expanduser().resolve()
@@ -157,6 +184,8 @@ def main() -> int:
     is_system_repo = repo == system_root
     if not agents.is_file():
         errors.append(f"missing repository guide: {agents}")
+    elif agents.is_symlink():
+        errors.append(f"repository guide must not be a symlink: {agents}")
     elif is_system_repo:
         if first_content_line(agents) != "# Global Engineering System":
             errors.append("canonical system AGENTS.md has an unexpected heading")
@@ -186,32 +215,41 @@ def main() -> int:
 
     docs = repo / "docs"
     if docs.is_dir():
-        problem = run_check(
-            [str(system_root / "bin" / "docs-list"), "--check", str(repo)],
-            "documentation metadata check",
-        )
-        if problem:
-            errors.append(problem)
+        doc_symlinks = symlinks_beneath(docs)
+        if doc_symlinks:
+            errors.extend(f"documentation path must not be a symlink: {path}" for path in doc_symlinks)
+        else:
+            problem = run_check(
+                [str(system_root / "bin" / "docs-list"), "--check", str(repo)],
+                "documentation metadata check",
+            )
+            if problem:
+                errors.append(problem)
     plan_root = docs / "plan"
-    if plan_root.is_dir():
+    if plan_root.is_dir() and not symlinks_beneath(docs):
         for plan in sorted(plan_root.glob("*.md")):
             errors.extend(check_plan(plan))
 
     skill_root = repo / ".agents" / "skills"
     if skill_root.is_dir():
-        problem = run_check(
-            [
-                str(system_root / "skills" / "maintain-skills" / "scripts" / "skill-audit.py"),
-                "--root",
-                str(skill_root),
-                "--check",
-                "--strict",
-                "--model-neutral",
-            ],
-            "repository skill audit",
-        )
-        if problem:
-            errors.append(problem)
+        ancestor = symlinked_ancestor(repo, skill_root)
+        skill_symlinks = symlinks_beneath(skill_root) if ancestor is None else [ancestor]
+        if skill_symlinks:
+            errors.extend(f"repository skill path must not be a symlink: {path}" for path in skill_symlinks)
+        else:
+            problem = run_check(
+                [
+                    str(system_root / "skills" / "maintain-skills" / "scripts" / "skill-audit.py"),
+                    "--root",
+                    str(skill_root),
+                    "--check",
+                    "--strict",
+                    "--model-neutral",
+                ],
+                "repository skill audit",
+            )
+            if problem:
+                errors.append(problem)
 
     report = {
         "repo": str(repo),
