@@ -66,6 +66,34 @@ class TrashTests(unittest.TestCase):
             contents = sorted(path.read_text(encoding="utf-8") for path in trash.glob("same*.txt"))
             self.assertEqual(contents, ["first\n", "second\n"])
 
+    def test_serializes_duplicate_names_across_processes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            first = Path(temp) / "first"
+            second = Path(temp) / "second"
+            home.mkdir()
+            first.mkdir()
+            second.mkdir()
+            (first / "same.txt").write_text("first\n", encoding="utf-8")
+            (second / "same.txt").write_text("second\n", encoding="utf-8")
+            env = {**os.environ, "HOME": str(home)}
+            processes = [
+                subprocess.Popen(
+                    [str(TRASH), str(directory / "same.txt")],
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for directory in (first, second)
+            ]
+            results = [process.communicate(timeout=10) for process in processes]
+            for process, (_, stderr) in zip(processes, results):
+                self.assertEqual(process.returncode, 0, stderr)
+            trash = home / ".Trash" if sys.platform == "darwin" else home / ".local" / "share" / "Trash" / "files"
+            contents = sorted(path.read_text(encoding="utf-8") for path in trash.glob("same*.txt"))
+            self.assertEqual(contents, ["first\n", "second\n"])
+
 
 if __name__ == "__main__":
     unittest.main()

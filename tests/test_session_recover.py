@@ -22,13 +22,24 @@ class SessionRecoveryTests(unittest.TestCase):
             repo.mkdir()
             session = codex_root / "session.jsonl"
             secret = "".join(("actual", "secret", "value", "123"))
+            auth_secret = "".join(("opaque", "session", "credential", "456"))
+            cookie_secret = "".join(("private", "cookie", "value", "789"))
+            authorization = "".join(("Author", "ization"))
+            bearer = "".join(("Bea", "rer"))
+            cookie = "".join(("Coo", "kie"))
             records = [
                 {"type": "session_meta", "payload": {"cwd": str(repo), "id": "fixture"}},
                 {
                     "type": "event_msg",
                     "payload": {
                         "type": "user_message",
-                        "message": "<environment_context>hidden policy</environment_context>Fix billing serialization. SERVICE_SECRET=" + secret,
+                        "message": (
+                            "<environment_context>hidden policy</environment_context>"
+                            "Fix billing serialization. SERVICE_SECRET="
+                            + secret
+                            + f"\n{authorization}: {bearer} {auth_secret}"
+                            + f"\n{cookie}: session={cookie_secret}"
+                        ),
                     },
                 },
                 {"type": "response_item", "payload": {"type": "function_call_output", "output": "raw tool output"}},
@@ -55,6 +66,8 @@ class SessionRecoveryTests(unittest.TestCase):
             rows = json.loads(found.stdout)
             self.assertEqual(rows[0]["host"], "codex")
             self.assertNotIn(secret, rows[0]["last_user"])
+            self.assertNotIn(auth_secret, rows[0]["last_user"])
+            self.assertNotIn(cookie_secret, rows[0]["last_user"])
 
             output = root / "recovery.md"
             subprocess.run(
@@ -69,6 +82,8 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertIn("Implemented the lease and tests", rendered)
             self.assertIn("[REDACTED]", rendered)
             self.assertNotIn(secret, rendered)
+            self.assertNotIn(auth_secret, rendered)
+            self.assertNotIn(cookie_secret, rendered)
             self.assertNotIn("hidden policy", rendered)
             self.assertNotIn("raw tool output", rendered)
 
@@ -82,11 +97,21 @@ class SessionRecoveryTests(unittest.TestCase):
             claude_root.mkdir()
             repo.mkdir()
             session = claude_root / "session.jsonl"
+            auth_secret = "".join(("opaque", "claude", "credential", "321"))
+            authorization = "".join(("Author", "ization"))
+            bearer = "".join(("Bea", "rer"))
             records = [
                 {
                     "type": "user",
                     "cwd": str(repo),
-                    "message": {"content": [{"type": "text", "text": "Resume the parser repair."}]},
+                    "message": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Resume the parser repair.\n{authorization}: {bearer} {auth_secret}",
+                            }
+                        ]
+                    },
                 },
                 {
                     "type": "assistant",
@@ -113,8 +138,17 @@ class SessionRecoveryTests(unittest.TestCase):
                 capture_output=True,
                 check=True,
             ).stdout
+            found = subprocess.run(
+                [str(RECOVER), "find", "--cwd", str(repo), "--query", "parser", "--json"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout
             self.assertIn("Resume the parser repair", rendered)
             self.assertIn("The parser repair is verified", rendered)
+            self.assertNotIn(auth_secret, rendered)
+            self.assertNotIn(auth_secret, found)
             self.assertNotIn("private reasoning", rendered)
             self.assertNotIn("private tool payload", rendered)
 

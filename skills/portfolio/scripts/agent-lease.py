@@ -215,6 +215,16 @@ def public_metadata(value: dict, *, locked: bool = True) -> dict:
     }
 
 
+def owned_remote(repo: Path, token: dict) -> tuple[str, dict]:
+    current = remote_sha(repo, token["ref"])
+    if not current:
+        raise LeaseError("lease is no longer active")
+    held = metadata_for(repo, token["ref"], current)
+    if not held or held.get("lease_id") != token.get("lease_id"):
+        raise LeaseError("lease ownership changed")
+    return current, held
+
+
 def acquire(args: argparse.Namespace) -> int:
     repo = coordination_repo(args.coordination_repo)
     git(repo, "remote", "get-url", remote_name())
@@ -243,16 +253,24 @@ def acquire(args: argparse.Namespace) -> int:
             "expires_at": acquired + args.ttl,
         }
         commit = make_commit(repo, metadata)
-        result = git(repo, "push", "--porcelain", remote_name(), f"{commit}:{ref}", check=False)
-        if result.returncode != 0:
-            continue
         token = {
             **metadata,
             "ref": ref,
             "commit": commit,
             "coordination_repo": str(repo),
         }
-        atomic_json(token_path(metadata["lease_id"]), token)
+        path = token_path(metadata["lease_id"])
+        try:
+            atomic_json(path, token)
+        except OSError as exc:
+            raise LeaseError("cannot persist lease token; remote lease was not acquired") from exc
+        result = git(repo, "push", "--porcelain", remote_name(), f"{commit}:{ref}", check=False)
+        if result.returncode != 0:
+            if remote_sha(repo, ref) == commit:
+                print(json.dumps(public_metadata(metadata), sort_keys=True))
+                return 0
+            path.unlink(missing_ok=True)
+            continue
         print(json.dumps(public_metadata(metadata), sort_keys=True))
         return 0
 
@@ -282,18 +300,22 @@ def status(args: argparse.Namespace) -> int:
 def renew(args: argparse.Namespace) -> int:
     token = load_token(args.lease_id)
     repo = coordination_repo(token.get("coordination_repo"))
-    current = remote_sha(repo, token["ref"])
-    if current != token.get("commit"):
-        raise LeaseError("lease ownership changed; refusing renewal")
-    metadata = {key: token.get(key) for key in ("version", "scope", "lease_id", "owner", "head", "acquired_at", "expires_at")}
+    current, held = owned_remote(repo, token)
+    metadata = {key: held.get(key) for key in ("version", "scope", "lease_id", "owner", "head", "acquired_at", "expires_at")}
     metadata["head"] = args.head if args.head is not None else metadata.get("head")
     metadata["expires_at"] = now_epoch() + args.ttl
     commit = make_commit(repo, metadata)
     if not replace_ref(repo, token["ref"], current, commit):
         raise LeaseError("lease changed while renewing")
-    token.update(metadata)
-    token["commit"] = commit
-    atomic_json(token_path(args.lease_id), token)
+    renewed_token = {**token, **metadata, "commit": commit}
+    try:
+        atomic_json(token_path(args.lease_id), renewed_token)
+    except OSError as exc:
+        if replace_ref(repo, token["ref"], commit, current):
+            raise LeaseError("cannot persist renewed lease; remote lease was restored") from exc
+        raise LeaseError(
+            "cannot persist renewed lease; lease remains manageable by its existing lease id"
+        ) from exc
     print(json.dumps(public_metadata(metadata), sort_keys=True))
     return 0
 
@@ -301,17 +323,15 @@ def renew(args: argparse.Namespace) -> int:
 def verify(args: argparse.Namespace) -> int:
     token = load_token(args.lease_id)
     repo = coordination_repo(token.get("coordination_repo"))
-    current = remote_sha(repo, token["ref"])
-    if current != token.get("commit"):
-        raise LeaseError("lease is no longer owned by this token")
-    if int(token.get("expires_at", 0)) <= now_epoch():
+    _, held = owned_remote(repo, token)
+    if int(held.get("expires_at", 0)) <= now_epoch():
         raise LeaseError("lease expired")
-    expected_head = args.head or token.get("head")
+    expected_head = args.head or held.get("head")
     if args.repo and expected_head:
         actual = git(Path(args.repo).expanduser().resolve(), "rev-parse", "HEAD").stdout.strip()
         if actual != expected_head:
             raise LeaseError(f"exact-head fence failed: expected {expected_head[:12]}, found {actual[:12]}")
-    print(json.dumps(public_metadata(token), sort_keys=True))
+    print(json.dumps(public_metadata(held), sort_keys=True))
     return 0
 
 
@@ -323,7 +343,8 @@ def release(args: argparse.Namespace) -> int:
         token_path(args.lease_id).unlink(missing_ok=True)
         print(json.dumps({"released": True, "lease_id": args.lease_id}, sort_keys=True))
         return 0
-    if current != token.get("commit"):
+    held = metadata_for(repo, token["ref"], current)
+    if not held or held.get("lease_id") != token.get("lease_id"):
         raise LeaseError("lease ownership changed; refusing release")
     if not delete_ref(repo, token["ref"], current):
         raise LeaseError("lease changed while releasing")

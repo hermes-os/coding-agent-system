@@ -158,6 +158,34 @@ class AutoreviewTests(unittest.TestCase):
             self.assertIn("secret-like patch content blocked", blocked.stderr)
             self.assertNotIn(secret, blocked.stderr)
 
+    def test_authorization_header_credentials_fail_closed(self):
+        for scheme_parts in (("Bea", "rer"), ("Ba", "sic")):
+            with self.subTest(scheme="".join(scheme_parts)), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self.make_repo(root)
+                base = git(root, "rev-parse", "HEAD")
+                header = "".join(("Author", "ization"))
+                scheme = "".join(scheme_parts)
+                credential = "".join(("opaque", "review", scheme.lower(), "987654"))
+                (root / "request.txt").write_text(
+                    f'"{header}": "{scheme} {credential}"\n',
+                    encoding="utf-8",
+                )
+                git(root, "add", "request.txt")
+                git(root, "commit", "-m", "add request fixture")
+                blocked = run(
+                    "prepare",
+                    "--base",
+                    base,
+                    "--intent",
+                    "Add request fixture",
+                    cwd=root,
+                    check=False,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertIn("secret-like patch content blocked", blocked.stderr)
+                self.assertNotIn(credential, blocked.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

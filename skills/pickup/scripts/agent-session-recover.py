@@ -39,6 +39,11 @@ ASSIGNMENT_RE = re.compile(
     r"\s*[:=]\s*([^\s,;]+)"
 )
 AUTH_QUERY_RE = re.compile(r"(?i)([?&](?:token|code|secret|key|password)=)[^&#\s]+")
+AUTHORIZATION_RE = re.compile(
+    r"(\bauthorization[\"']?\s*:\s*[\"']?\s*(?:bearer|basic)\s+)[A-Za-z0-9+/_.~=-]{8,}",
+    re.IGNORECASE,
+)
+COOKIE_RE = re.compile(r"(\b(?:cookie|set-cookie)\s*:\s*)[^\r\n]+", re.IGNORECASE)
 
 
 @dataclass
@@ -105,6 +110,10 @@ def redact(text: str) -> tuple[str, int]:
 
     text = ASSIGNMENT_RE.sub(assignment, text)
     text, replaced = AUTH_QUERY_RE.subn(r"\1[REDACTED]", text)
+    count += replaced
+    text, replaced = AUTHORIZATION_RE.subn(r"\1[REDACTED]", text)
+    count += replaced
+    text, replaced = COOKIE_RE.subn(r"\1[REDACTED]", text)
     count += replaced
     home = str(Path.home())
     if home and home in text:
