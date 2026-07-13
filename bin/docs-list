@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""List repository docs with Peter-style summary/read_when frontmatter."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+
+EXCLUDED_DIRS = {"archive", "research"}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", nargs="?", type=Path)
+    parser.add_argument("--root", dest="root_flag", type=Path)
+    parser.add_argument("--check", action="store_true")
+    return parser.parse_args()
+
+
+def markdown_files(docs_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in docs_dir.rglob("*.md")
+        if not any(part.startswith(".") or part in EXCLUDED_DIRS for part in path.relative_to(docs_dir).parts)
+    )
+
+
+def unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
+def metadata(path: Path) -> tuple[str | None, list[str], str | None]:
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return None, [], "missing frontmatter"
+    end = text.find("\n---", 4)
+    if end < 0:
+        return None, [], "unterminated frontmatter"
+
+    summary: str | None = None
+    read_when: list[str] = []
+    collecting = False
+    for raw_line in text[4:end].splitlines():
+        line = raw_line.strip()
+        if line.startswith("summary:"):
+            summary = unquote(line.split(":", 1)[1])
+            collecting = False
+        elif line.startswith("read_when:"):
+            collecting = True
+            inline = line.split(":", 1)[1].strip()
+            if inline.startswith("[") and inline.endswith("]"):
+                read_when.extend(
+                    unquote(item)
+                    for item in inline[1:-1].split(",")
+                    if unquote(item)
+                )
+                collecting = False
+        elif collecting and line.startswith("- "):
+            value = unquote(line[2:])
+            if value:
+                read_when.append(value)
+        elif line:
+            collecting = False
+
+    if not summary:
+        return None, read_when, "missing summary"
+    if not read_when:
+        return summary, [], "missing read_when"
+    return summary, read_when, None
+
+
+def main() -> int:
+    args = parse_args()
+    root = (args.root_flag or args.root or Path.cwd()).expanduser().resolve()
+    docs_dir = root / "docs"
+    if not docs_dir.is_dir():
+        print(f"No docs directory: {docs_dir}")
+        return 0
+
+    errors = 0
+    for path in markdown_files(docs_dir):
+        summary, read_when, error = metadata(path)
+        relative = path.relative_to(docs_dir)
+        if summary:
+            print(f"{relative} - {summary}")
+            print(f"  Read when: {'; '.join(read_when)}")
+        else:
+            print(f"{relative} - [{error}]")
+        if error:
+            errors += 1
+
+    if errors:
+        print(f"\n{errors} document(s) need summary/read_when frontmatter.", file=sys.stderr)
+    return 1 if args.check and errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

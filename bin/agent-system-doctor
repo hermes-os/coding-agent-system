@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Validate installed global agent wiring and optional repository pointers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import re
+import sys
+
+
+CLAUDE_MODEL_ENV_KEYS = {
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_MODEL",
+    "CLAUDE_CODE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+}
+
+
+def codex_model_pins(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    section = None
+    pins: list[str] = []
+    section_re = re.compile(r"^\s*\[([^]]+)]\s*$")
+    model_re = re.compile(r"^\s*model\s*=")
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        match = section_re.match(line)
+        if match:
+            section = match.group(1)
+        if model_re.match(line) and (
+            section is None or section == "profiles" or section.startswith("profiles.")
+        ):
+            pins.append(f"{path}:{number}")
+    return pins
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--home", type=Path, default=Path.home())
+    parser.add_argument("--repo", type=Path)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    home = args.home.expanduser().resolve()
+    agents = home / ".agents"
+    errors: list[str] = []
+
+    canonical = agents / "AGENTS.md"
+    if not canonical.is_file():
+        errors.append(f"missing {canonical}")
+
+    for adapter in (
+        home / ".codex" / "AGENTS.md",
+        home / ".claude" / "CLAUDE.md",
+        home / ".claude" / "AGENTS.md",
+    ):
+        if not adapter.is_symlink() or adapter.resolve() != canonical.resolve():
+            errors.append(f"bad policy adapter {adapter}")
+
+    skills = sorted(
+        path.name
+        for path in (agents / "skills").iterdir()
+        if path.is_dir() and (path / "SKILL.md").is_file()
+    ) if (agents / "skills").is_dir() else []
+    required = {"behavior-validator", "delegate", "handoff", "pickup", "review"}
+    missing = sorted(required - set(skills))
+    if missing:
+        errors.append(f"missing global skills: {', '.join(missing)}")
+
+    for name in required & set(skills):
+        skill = agents / "skills" / name / "SKILL.md"
+        text = skill.read_text(encoding="utf-8")
+        frontmatter = text.split("---", 2)[1] if text.startswith("---\n") else ""
+        if f"name: {name}\n" not in frontmatter or "description:" not in frontmatter:
+            errors.append(f"invalid skill frontmatter {skill}")
+
+    for config in (
+        home / ".codex" / "hooks.json",
+        home / ".claude" / "settings.json",
+        home / ".cursor" / "hooks.json",
+    ):
+        try:
+            value = json.loads(config.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"invalid host config {config}: {exc}")
+            continue
+        if "dispatch.py" not in json.dumps(value):
+            errors.append(f"dispatcher missing from {config}")
+
+    claude_settings = home / ".claude" / "settings.json"
+    try:
+        claude_value = json.loads(claude_settings.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        claude_value = {}
+    claude_env = claude_value.get("env", {}) if isinstance(claude_value, dict) else {}
+    if not isinstance(claude_env, dict):
+        claude_env = {}
+    claude_pins = sorted(CLAUDE_MODEL_ENV_KEYS & set(claude_env))
+    if isinstance(claude_value, dict) and "model" in claude_value:
+        claude_pins.insert(0, "model")
+    if claude_pins:
+        errors.append(f"Claude model pins remain: {', '.join(claude_pins)}")
+
+    codex_pins = codex_model_pins(home / ".codex" / "config.toml")
+    if codex_pins:
+        errors.append(f"Codex model pins remain: {', '.join(codex_pins)}")
+
+    cursor_rule = home / ".cursor" / "rules" / "global-engineering.mdc"
+    if not cursor_rule.is_file() or "# Global Engineering System" not in cursor_rule.read_text(encoding="utf-8"):
+        errors.append(f"missing Cursor global rule {cursor_rule}")
+
+    if args.repo:
+        repo = args.repo.expanduser().resolve()
+        repo_agents = repo / "AGENTS.md"
+        if not repo_agents.is_file():
+            errors.append(f"missing repository AGENTS.md: {repo_agents}")
+        elif "READ ~/.agents/AGENTS.md BEFORE ANYTHING" not in repo_agents.read_text(encoding="utf-8"):
+            errors.append(f"repository global pointer missing: {repo_agents}")
+        claude = repo / "CLAUDE.md"
+        if not claude.is_symlink() or claude.resolve() != repo_agents.resolve():
+            errors.append(f"repository CLAUDE.md is not a pointer to AGENTS.md: {claude}")
+
+    if errors:
+        print("Agent system doctor: FAIL", file=sys.stderr)
+        for error in errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
+    print("Agent system doctor: PASS")
+    print(f"Global skills: {', '.join(sorted(required))}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
