@@ -41,7 +41,10 @@ class AutoreviewTests(unittest.TestCase):
         git(root, "add", "app.py")
         git(root, "commit", "-m", "initial")
         base = git(root, "rev-parse", "HEAD")
-        (root / "app.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+        (root / "app.py").write_text(
+            "def value():\n    scope_secrets = secret_findings('intent')\n    return 2\n",
+            encoding="utf-8",
+        )
         git(root, "add", "app.py")
         git(root, "commit", "-m", "change value")
         return base, git(root, "rev-parse", "HEAD")
@@ -66,7 +69,10 @@ class AutoreviewTests(unittest.TestCase):
             self.assertEqual(manifest["head_sha"], head)
             self.assertEqual(manifest["repository"], "example/review-fixture")
             self.assertEqual(manifest["changed_files"][0]["path"], "app.py")
-            self.assertEqual((bundle / "files" / "app.py").read_text(encoding="utf-8"), "def value():\n    return 2\n")
+            self.assertEqual(
+                (bundle / "files" / "app.py").read_text(encoding="utf-8"),
+                "def value():\n    scope_secrets = secret_findings('intent')\n    return 2\n",
+            )
 
             result = json.loads((bundle / "result-template.json").read_text(encoding="utf-8"))
             result["reviewer_provenance"] = "independent fixture reviewer"

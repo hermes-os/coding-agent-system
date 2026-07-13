@@ -27,8 +27,8 @@ SECRET_PATTERNS = {
     "jwt": re.compile(r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"),
 }
 ASSIGNMENT_RE = re.compile(
-    r"(?im)^\+[^+]?.*?\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
-    r"\s*[:=]\s*[\"']?([^\s\"',;]+)"
+    r"(?m)^[+ -]?[^+\n]*?\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
+    r"\s*[:=]\s*([\"']?)([^\s\"',;]+)"
 )
 PLACEHOLDERS = ("example", "placeholder", "redacted", "dummy", "process.env", "getenv", "${", "{{")
 
@@ -90,8 +90,24 @@ def sensitive_path(value: str) -> bool:
 def secret_findings(text: str) -> list[str]:
     findings = [name for name, pattern in SECRET_PATTERNS.items() if pattern.search(text)]
     for match in ASSIGNMENT_RE.finditer(text):
-        value = match.group(2).lower()
-        if len(value) >= 8 and not any(marker in value for marker in PLACEHOLDERS):
+        quoted = bool(match.group(2))
+        value = match.group(3)
+        lowered = value.lower()
+        if len(value) < 8 or any(marker in lowered for marker in PLACEHOLDERS):
+            continue
+        if any(marker in value for marker in ("(", "${", "{{")):
+            continue
+        if not quoted and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", value) and (value.isalpha() or "_" in value or "." in value):
+            continue
+        classes = sum(
+            (
+                any(character.islower() for character in value),
+                any(character.isupper() for character in value),
+                any(character.isdigit() for character in value),
+                any(not character.isalnum() for character in value),
+            )
+        )
+        if quoted or classes >= 2:
             findings.append(f"assigned-{match.group(1).lower()}")
     return sorted(set(findings))
 
