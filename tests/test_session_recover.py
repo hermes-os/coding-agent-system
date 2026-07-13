@@ -37,6 +37,10 @@ class SessionRecoveryTests(unittest.TestCase):
             cookie_secret = "".join(("private", "cookie", "value", "789"))
             structured_secret = "".join(("quoted", "credential", "value", "654"))
             uri_secret = "".join(("database", "credential", "852"))
+            provider_secret = "".join(("sk-", "proj-", "x" * 40))
+            claude_secret = "".join(("sk-", "ant-api03-", "y" * 40))
+            long_secret = "q" * 600
+            named_secrets = ["".join(("opaque", "named", str(index), "24680")) for index in range(3)]
             authorization = "".join(("Author", "ization"))
             bearer = "".join(("Bea", "rer"))
             cookie = "".join(("Coo", "kie"))
@@ -55,6 +59,12 @@ class SessionRecoveryTests(unittest.TestCase):
                             + f"\n{cookie}: session={cookie_secret}"
                             + f'\n"{structured_key}": "{structured_secret}"'
                             + f"\npostgres://user:{uri_secret}@database.example/app"
+                            + "\n" + provider_secret
+                            + "\n" + claude_secret
+                            + f'\naccess_token="{long_secret}"'
+                            + f"\napiKey: {named_secrets[0]}"
+                            + f'\n"api-key": "{named_secrets[1]}"'
+                            + f"\nprivateKey={named_secrets[2]}"
                         ),
                     },
                 },
@@ -86,6 +96,8 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertNotIn(cookie_secret, rows[0]["last_user"])
             self.assertNotIn(structured_secret, rows[0]["last_user"])
             self.assertNotIn(uri_secret, rows[0]["last_user"])
+            self.assertNotIn(provider_secret, rows[0]["last_user"])
+            self.assertNotIn(claude_secret, rows[0]["last_user"])
 
             output = root / "recovery.md"
             subprocess.run(
@@ -104,6 +116,11 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertNotIn(cookie_secret, rendered)
             self.assertNotIn(structured_secret, rendered)
             self.assertNotIn(uri_secret, rendered)
+            self.assertNotIn(provider_secret, rendered)
+            self.assertNotIn(claude_secret, rendered)
+            self.assertNotIn(long_secret, rendered)
+            for named_secret in named_secrets:
+                self.assertNotIn(named_secret, rendered)
             self.assertNotIn("hidden policy", rendered)
             self.assertNotIn("raw tool output", rendered)
 

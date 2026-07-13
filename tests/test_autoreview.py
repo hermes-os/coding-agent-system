@@ -78,6 +78,7 @@ class AutoreviewTests(unittest.TestCase):
             self.assertEqual(manifest["head_sha"], head)
             self.assertEqual(manifest["repository"], "example/review-fixture")
             self.assertEqual(manifest["changed_files"][0]["path"], "app.py")
+            self.assertEqual(manifest["snapshots"][0]["lines"], 3)
             self.assertEqual(
                 (bundle / "files" / "app.py").read_text(encoding="utf-8"),
                 "def value():\n    scope_secrets = secret_findings('intent')\n    return 2\n",
@@ -100,6 +101,27 @@ class AutoreviewTests(unittest.TestCase):
             self.assertEqual(json.loads(validated.stdout)["verdict"], "pass")
             checked = run("check", "--bundle", str(bundle), cwd=root)
             self.assertTrue(json.loads(checked.stdout)["valid"])
+
+            module = load_autoreview_module()
+            finding = {
+                "severity": "P2",
+                "classification": "blocker",
+                "file": "outside.py",
+                "line": 1,
+                "title": "Invalid reference",
+                "impact": "The result is not bound to the candidate.",
+                "evidence": "The path is absent.",
+                "correction": "Use a frozen path.",
+            }
+            invalid = {**result, "verdict": "findings", "findings": [finding]}
+            with self.assertRaisesRegex(module.ReviewError, "outside the frozen candidate"):
+                module.validate_result(manifest, invalid)
+            invalid["findings"][0] = {**finding, "file": "app.py", "line": 4}
+            with self.assertRaisesRegex(module.ReviewError, "outside the frozen source"):
+                module.validate_result(manifest, invalid)
+            invalid["findings"][0] = {**finding, "file": "app.py", "line": True}
+            with self.assertRaisesRegex(module.ReviewError, "positive line"):
+                module.validate_result(manifest, invalid)
 
     def test_findings_exit_nonzero_and_secret_like_patch_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -230,6 +252,70 @@ class AutoreviewTests(unittest.TestCase):
             "assigned-service_api_key",
             module.secret_findings("service_api_key=opaqueCredential24680"),
         )
+
+    def test_provider_keys_and_long_assignments_fail_closed(self):
+        opaque = "".join(("opaque", "credential", "24680"))
+        fixtures = {
+            "openai": "".join(("sk-", "proj-", "x" * 40)),
+            "anthropic": "".join(("sk-", "ant-api03-", "y" * 40)),
+            "long-assignment": f'{"".join(("access", "_token"))}="{"q" * 600}"',
+            "camel-api": f"apiKey: {opaque}",
+            "hyphen-api": f'"api-key": "{opaque}"',
+            "camel-private": f"privateKey={opaque}",
+        }
+        for label, credential in fixtures.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self.make_repo(root)
+                base = git(root, "rev-parse", "HEAD")
+                (root / "credential.txt").write_text(credential + "\n", encoding="utf-8")
+                git(root, "add", "credential.txt")
+                git(root, "commit", "-m", "add credential fixture")
+                blocked = run(
+                    "prepare",
+                    "--base",
+                    base,
+                    "--intent",
+                    "Add credential fixture",
+                    cwd=root,
+                    check=False,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertIn("secret-like patch content blocked", blocked.stderr)
+                self.assertNotIn(credential, blocked.stderr)
+
+    def test_deleted_and_renamed_paths_keep_line_limits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git(root, "init")
+            git(root, "config", "user.name", "Fixture")
+            git(root, "config", "user.email", "fixture@example.test")
+            git(root, "remote", "add", "origin", "https://github.com/example/review-fixture.git")
+            (root / "old.py").write_text("first\nsecond\n", encoding="utf-8")
+            (root / "deleted.py").write_text("one\ntwo\n", encoding="utf-8")
+            git(root, "add", "old.py", "deleted.py")
+            git(root, "commit", "-m", "initial")
+            base = git(root, "rev-parse", "HEAD")
+            (root / "old.py").rename(root / "new.py")
+            (root / "deleted.py").unlink()
+            git(root, "add", "-A")
+            git(root, "commit", "-m", "rename and delete")
+            bundle = root / ".review-bundle"
+            run(
+                "prepare",
+                "--base",
+                base,
+                "--intent",
+                "Rename and delete source files",
+                "--out",
+                str(bundle),
+                cwd=root,
+            )
+            manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+            snapshots = {snapshot["path"]: snapshot for snapshot in manifest["snapshots"]}
+            self.assertEqual(snapshots["deleted.py"]["lines"], 2)
+            self.assertEqual(snapshots["new.py"]["old_path"], "old.py")
+            self.assertEqual(snapshots["new.py"]["old_lines"], 2)
 
     def test_bundle_inventory_and_diff_identity_are_deterministic(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -32,11 +32,12 @@ SECRET_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
     re.compile(r"\b(?:sk|pk)_(?:live|test)_[0-9A-Za-z]{16,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"),
 )
 ASSIGNMENT_RE = re.compile(
-    r"\b(?P<name>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
-    r"[\"']?\s*[:=]\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"'\r\n]{1,512})(?P=quote)|"
+    r"\b(?P<name>[A-Z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|(?:API|PRIVATE|ACCESS|CLIENT)[_-]?KEY)[A-Z0-9_-]*)"
+    r"[\"']?\s*[:=]\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"'\r\n]+)(?P=quote)|"
     r"(?P<bare>[^\s\"',;}\]]+))",
     re.IGNORECASE | re.MULTILINE,
 )

@@ -48,6 +48,7 @@ SECRET_PATTERNS = {
     "aws-access-key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     "google-api-key": re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
     "stripe-key": re.compile(r"\b(?:sk|pk)_(?:live|test)_[0-9A-Za-z]{16,}\b"),
+    "provider-api-key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     "jwt": re.compile(r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"),
     "authorization-header": re.compile(
         r"\bauthorization[\"']?\s*:\s*[\"']?\s*(?:bearer|basic)\s+[A-Za-z0-9+/_.~=-]{8,}",
@@ -56,8 +57,8 @@ SECRET_PATTERNS = {
 }
 ASSIGNMENT_RE = re.compile(
     r"^[+ -]?\s*(?:(?:export|const|let|var)\s+)?(?:[{,]\s*)?[\"']?"
-    r"(?P<name>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
-    r"[\"']?\s*[:=]\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"'\r\n]{1,512})(?P=quote)|"
+    r"(?P<name>[A-Z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|(?:API|PRIVATE|ACCESS|CLIENT)[_-]?KEY)[A-Z0-9_-]*)"
+    r"[\"']?\s*[:=]\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"'\r\n]+)(?P=quote)|"
     r"(?P<bare>[^\s\"',;}\]]+))",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -195,6 +196,10 @@ def object_bytes(root: Path, revision: str, path: str) -> bytes | None:
     return git(root, "show", spec, text=False).stdout
 
 
+def source_lines(content: bytes) -> int:
+    return max(1, len(content.splitlines()))
+
+
 def fingerprint(
     base: str,
     head: str,
@@ -242,6 +247,7 @@ def canonical_patch(root: Path, base: str, head: str) -> bytes:
 
 def snapshot_inventory(
     root: Path,
+    base: str,
     head: str,
     entries: list[dict],
     maximum_bytes: int,
@@ -253,7 +259,10 @@ def snapshot_inventory(
         path = entry["path"]
         content = object_bytes(root, head, path)
         if content is None:
-            snapshots.append({"path": path, "deleted": True})
+            previous = object_bytes(root, base, path)
+            if previous is None:
+                raise ReviewError(f"cannot read deleted source snapshot: {path}")
+            snapshots.append({"path": path, "deleted": True, "lines": source_lines(previous)})
             continue
         total += len(content)
         if total > maximum_bytes:
@@ -263,7 +272,14 @@ def snapshot_inventory(
             "sha256": hashlib.sha256(content).hexdigest(),
             "bytes": len(content),
             "binary": b"\0" in content,
+            "lines": source_lines(content),
         }
+        if entry.get("old_path"):
+            previous = object_bytes(root, base, entry["old_path"])
+            if previous is None:
+                raise ReviewError(f"cannot read prior source snapshot: {entry['old_path']}")
+            record["old_path"] = entry["old_path"]
+            record["old_lines"] = source_lines(previous)
         snapshots.append(record)
         snapshot_secrets = secret_findings(content.decode("utf-8", errors="replace"))
         if snapshot_secrets:
@@ -333,7 +349,7 @@ def prepare(args: argparse.Namespace) -> int:
     if secrets:
         raise ReviewError("secret-like patch content blocked: " + ", ".join(secrets))
 
-    snapshots, snapshot_payloads = snapshot_inventory(root, head, entries, args.max_snapshot_bytes)
+    snapshots, snapshot_payloads = snapshot_inventory(root, base, head, entries, args.max_snapshot_bytes)
     review_fingerprint = fingerprint(
         base,
         head,
@@ -468,17 +484,30 @@ def validate_inventory(manifest: dict) -> tuple[list[dict], list[dict]]:
             raise ReviewError("invalid source snapshot metadata")
         path = snapshot.get("path")
         if snapshot.get("deleted") is True:
-            if entry["status"][0] != "D" or set(snapshot) != {"path", "deleted"}:
+            if entry["status"][0] != "D" or set(snapshot) != {"path", "deleted", "lines"}:
                 raise ReviewError(f"invalid deleted snapshot metadata: {path}")
+            if type(snapshot.get("lines")) is not int or snapshot["lines"] < 1:
+                raise ReviewError(f"invalid deleted snapshot line count: {path}")
             continue
         if entry["status"][0] == "D":
             raise ReviewError(f"deleted snapshot is not marked deleted: {path}")
         if not isinstance(snapshot.get("binary"), bool):
             raise ReviewError(f"invalid binary snapshot flag: {path}")
-        if not isinstance(snapshot.get("bytes"), int) or snapshot["bytes"] < 0:
+        if type(snapshot.get("lines")) is not int or snapshot["lines"] < 1:
+            raise ReviewError(f"invalid source snapshot line count: {path}")
+        if type(snapshot.get("bytes")) is not int or snapshot["bytes"] < 0:
             raise ReviewError(f"invalid source snapshot size: {path}")
         if not isinstance(snapshot.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", snapshot["sha256"]):
             raise ReviewError(f"invalid source snapshot hash: {path}")
+        expected_keys = {"path", "sha256", "bytes", "binary", "lines"}
+        if entry.get("old_path"):
+            expected_keys.update(("old_path", "old_lines"))
+            if snapshot.get("old_path") != entry["old_path"]:
+                raise ReviewError(f"prior snapshot path mismatch: {path}")
+            if type(snapshot.get("old_lines")) is not int or snapshot["old_lines"] < 1:
+                raise ReviewError(f"invalid prior snapshot line count: {path}")
+        if set(snapshot) != expected_keys:
+            raise ReviewError(f"unexpected source snapshot metadata: {path}")
     return entries, snapshots
 
 
@@ -538,6 +567,8 @@ def load_bundle(path: Path) -> tuple[Path, dict]:
             raise ReviewError(f"source snapshot hash mismatch: {path_value}")
         if (b"\0" in content) != snapshot.get("binary"):
             raise ReviewError(f"source snapshot binary flag mismatch: {path_value}")
+        if source_lines(content) != snapshot.get("lines"):
+            raise ReviewError(f"source snapshot line count mismatch: {path_value}")
 
     actual_files: set[str] = set()
     if files_root.exists():
@@ -552,6 +583,12 @@ def load_bundle(path: Path) -> tuple[Path, dict]:
 
 
 def validate_result(manifest: dict, result: dict) -> str:
+    entries, snapshots = validate_inventory(manifest)
+    line_limits: dict[str, int] = {}
+    for entry, snapshot in zip(entries, snapshots):
+        line_limits[entry["path"]] = snapshot["lines"]
+        if entry.get("old_path"):
+            line_limits[entry["old_path"]] = snapshot["old_lines"]
     if result.get("schema_version") != SCHEMA_VERSION:
         raise ReviewError("unsupported result schema")
     if result.get("fingerprint") != manifest.get("fingerprint"):
@@ -580,8 +617,12 @@ def validate_result(manifest: dict, result: dict) -> str:
         if not isinstance(path, str):
             raise ReviewError(f"finding {index} requires a file")
         safe_relative(path)
-        if not isinstance(finding.get("line"), int) or finding["line"] < 1:
+        if path not in line_limits:
+            raise ReviewError(f"finding {index} cites a file outside the frozen candidate")
+        if type(finding.get("line")) is not int or finding["line"] < 1:
             raise ReviewError(f"finding {index} requires a positive line")
+        if finding["line"] > line_limits[path]:
+            raise ReviewError(f"finding {index} cites a line outside the frozen source")
         for field in ("title", "impact", "evidence", "correction"):
             value = finding.get(field)
             if not isinstance(value, str) or not value.strip():
