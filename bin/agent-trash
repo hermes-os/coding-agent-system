@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 from urllib.parse import quote
 
 
@@ -18,7 +19,25 @@ def trash_root() -> Path:
     home = Path.home()
     if sys.platform == "darwin":
         return home / ".Trash"
-    return home / ".local" / "share" / "Trash" / "files"
+    configured = os.environ.get("XDG_DATA_HOME")
+    data_home = Path(configured).expanduser() if configured else home / ".local" / "share"
+    if not data_home.is_absolute():
+        data_home = home / ".local" / "share"
+    return data_home / "Trash" / "files"
+
+
+def secure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+
+
+def prepare_trash(root: Path) -> None:
+    if sys.platform == "darwin":
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return
+    secure_directory(root.parent)
+    secure_directory(root.parent / "info")
+    secure_directory(root)
 
 
 def unique_destination(root: Path, name: str, reserved: set[Path]) -> Path:
@@ -36,7 +55,7 @@ def unique_destination(root: Path, name: str, reserved: set[Path]) -> Path:
 
 @contextmanager
 def trash_lock(root: Path):
-    root.mkdir(parents=True, exist_ok=True)
+    prepare_trash(root)
     descriptor = os.open(root / ".agent-trash.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -46,23 +65,55 @@ def trash_lock(root: Path):
         os.close(descriptor)
 
 
-def write_trashinfo(source: Path, destination: Path) -> None:
+def stage_trashinfo(source: Path, destination: Path) -> Path | None:
     if sys.platform == "darwin":
-        return
+        return None
     info_dir = destination.parent.parent / "info"
-    info_dir.mkdir(parents=True, exist_ok=True)
+    secure_directory(info_dir)
     deleted = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     content = f"[Trash Info]\nPath={quote(str(source))}\nDeletionDate={deleted}\n"
-    (info_dir / f"{destination.name}.trashinfo").write_text(content, encoding="utf-8")
+    target = info_dir / f"{destination.name}.trashinfo"
+    descriptor, raw_temp = tempfile.mkstemp(prefix=f".{target.name}.", dir=info_dir)
+    temp = Path(raw_temp)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        temp.chmod(0o600)
+        temp.replace(target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return target
+
+
+def move_to_trash(source: Path, destination: Path) -> None:
+    info = stage_trashinfo(source, destination)
+    try:
+        shutil.move(str(source), str(destination))
+    except Exception:
+        if info:
+            info.unlink(missing_ok=True)
+        raise
+
+
+def contains(path: Path, candidate: Path) -> bool:
+    try:
+        candidate.relative_to(path)
+    except ValueError:
+        return False
+    return True
 
 
 def guarded_source(raw: str, cwd: Path, root: Path) -> Path:
     source = Path(raw).expanduser()
     if not source.is_absolute():
         source = cwd / source
-    source = source.absolute()
-    protected = {Path("/"), Path.home().absolute(), root.absolute()}
-    if source in protected:
+    source = Path(os.path.abspath(source))
+    canonical = source.parent.resolve(strict=False) / source.name if source.is_symlink() else source.resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    trash = root.resolve(strict=False)
+    protected = {Path("/"), home, trash}
+    if canonical in protected or contains(canonical, trash) or contains(trash, canonical):
         raise ValueError(f"refusing protected path: {raw}")
     return source
 
@@ -110,8 +161,7 @@ def main() -> int:
             destination = unique_destination(root, source.name, reserved)
             reserved.add(destination)
             try:
-                shutil.move(str(source), str(destination))
-                write_trashinfo(source, destination)
+                move_to_trash(source, destination)
             except OSError as exc:
                 print(f"agent-trash: {source}: {exc}", file=sys.stderr)
                 return 1

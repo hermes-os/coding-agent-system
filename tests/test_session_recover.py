@@ -1,13 +1,24 @@
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]
 RECOVER = SYSTEM_ROOT / "skills" / "pickup" / "scripts" / "agent-session-recover.py"
+
+
+def load_recovery_module():
+    spec = importlib.util.spec_from_file_location("agent_session_recover_fixture", RECOVER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class SessionRecoveryTests(unittest.TestCase):
@@ -24,9 +35,12 @@ class SessionRecoveryTests(unittest.TestCase):
             secret = "".join(("actual", "secret", "value", "123"))
             auth_secret = "".join(("opaque", "session", "credential", "456"))
             cookie_secret = "".join(("private", "cookie", "value", "789"))
+            structured_secret = "".join(("quoted", "credential", "value", "654"))
+            uri_secret = "".join(("database", "credential", "852"))
             authorization = "".join(("Author", "ization"))
             bearer = "".join(("Bea", "rer"))
             cookie = "".join(("Coo", "kie"))
+            structured_key = "".join(("pass", "word"))
             records = [
                 {"type": "session_meta", "payload": {"cwd": str(repo), "id": "fixture"}},
                 {
@@ -39,6 +53,8 @@ class SessionRecoveryTests(unittest.TestCase):
                             + secret
                             + f"\n{authorization}: {bearer} {auth_secret}"
                             + f"\n{cookie}: session={cookie_secret}"
+                            + f'\n"{structured_key}": "{structured_secret}"'
+                            + f"\npostgres://user:{uri_secret}@database.example/app"
                         ),
                     },
                 },
@@ -68,6 +84,8 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertNotIn(secret, rows[0]["last_user"])
             self.assertNotIn(auth_secret, rows[0]["last_user"])
             self.assertNotIn(cookie_secret, rows[0]["last_user"])
+            self.assertNotIn(structured_secret, rows[0]["last_user"])
+            self.assertNotIn(uri_secret, rows[0]["last_user"])
 
             output = root / "recovery.md"
             subprocess.run(
@@ -84,6 +102,8 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertNotIn(secret, rendered)
             self.assertNotIn(auth_secret, rendered)
             self.assertNotIn(cookie_secret, rendered)
+            self.assertNotIn(structured_secret, rendered)
+            self.assertNotIn(uri_secret, rendered)
             self.assertNotIn("hidden policy", rendered)
             self.assertNotIn("raw tool output", rendered)
 
@@ -151,6 +171,21 @@ class SessionRecoveryTests(unittest.TestCase):
             self.assertNotIn(auth_secret, found)
             self.assertNotIn("private reasoning", rendered)
             self.assertNotIn("private tool payload", rendered)
+
+    def test_query_selection_keeps_matching_response_and_latest_status(self):
+        module = load_recovery_module()
+        turns = [
+            module.Turn("user", "Repair billing serialization"),
+            module.Turn("assistant", "Billing serialization is repaired and tested"),
+            module.Turn("user", "Unrelated cleanup"),
+            module.Turn("assistant", "Cleanup finished"),
+            module.Turn("user", "Latest status request"),
+            module.Turn("assistant", "Current branch is ready"),
+        ]
+        selected = module.selected_turns(turns, "billing serialization", 4)
+        texts = [turn.text for turn in selected]
+        self.assertEqual(texts[0:2], [turns[0].text, turns[1].text])
+        self.assertEqual(texts[-2:], [turns[-2].text, turns[-1].text])
 
 
 if __name__ == "__main__":

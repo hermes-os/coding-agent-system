@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,14 @@ def git(cwd, *args):
         capture_output=True,
         check=True,
     ).stdout.strip()
+
+
+def load_autoreview_module():
+    spec = importlib.util.spec_from_file_location("agent_autoreview_fixture", AUTOREVIEW)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 class AutoreviewTests(unittest.TestCase):
@@ -185,6 +194,118 @@ class AutoreviewTests(unittest.TestCase):
                 self.assertEqual(blocked.returncode, 1)
                 self.assertIn("secret-like patch content blocked", blocked.stderr)
                 self.assertNotIn(credential, blocked.stderr)
+
+    def test_lowercase_and_structured_credentials_fail_closed(self):
+        fixtures = (("pass", "word", False), ("API", "_KEY", True))
+        for first, second, structured in fixtures:
+            with self.subTest(structured=structured), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self.make_repo(root)
+                base = git(root, "rev-parse", "HEAD")
+                key = first + second
+                credential = "".join(("opaque", "structured", "value", "24680"))
+                value = f'"{key}": "{credential}"\n' if structured else f"{key} = {credential}\n"
+                (root / "settings.txt").write_text(value, encoding="utf-8")
+                git(root, "add", "settings.txt")
+                git(root, "commit", "-m", "add settings fixture")
+                blocked = run(
+                    "prepare",
+                    "--base",
+                    base,
+                    "--intent",
+                    "Add settings fixture",
+                    cwd=root,
+                    check=False,
+                )
+                self.assertEqual(blocked.returncode, 1)
+                self.assertIn("secret-like patch content blocked", blocked.stderr)
+                self.assertNotIn(credential, blocked.stderr)
+
+    def test_bundle_inventory_and_diff_identity_are_deterministic(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            base, _ = self.make_repo(root)
+            first = Path(temp) / "review-first"
+            second = Path(temp) / "review-second"
+            run(
+                "prepare",
+                "--base",
+                base,
+                "--intent",
+                "Return the updated value",
+                "--out",
+                str(first),
+                cwd=root,
+            )
+            first_manifest = json.loads((first / "manifest.json").read_text(encoding="utf-8"))
+            first_patch = (first / "patch.diff").read_bytes()
+
+            git(root, "config", "color.ui", "always")
+            git(root, "config", "diff.algorithm", "histogram")
+            git(root, "config", "diff.context", "0")
+            git(root, "config", "diff.noprefix", "true")
+            git(root, "config", "diff.renames", "false")
+            git(root, "config", "core.abbrev", "7")
+            order_file = root / ".git" / "diff-order"
+            order_file.write_text("other.py\napp.py\n", encoding="utf-8")
+            attributes_file = root / ".git" / "global-attributes"
+            attributes_file.write_text("app.py binary\n", encoding="utf-8")
+            git(root, "config", "diff.orderFile", str(order_file))
+            git(root, "config", "core.attributesFile", str(attributes_file))
+            run(
+                "prepare",
+                "--base",
+                base,
+                "--intent",
+                "Return the updated value",
+                "--out",
+                str(second),
+                cwd=root,
+            )
+            second_manifest = json.loads((second / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual((second / "patch.diff").read_bytes(), first_patch)
+            self.assertEqual(second_manifest["fingerprint"], first_manifest["fingerprint"])
+
+            result = json.loads((first / "result-template.json").read_text(encoding="utf-8"))
+            result["reviewer_provenance"] = "independent fixture reviewer"
+            result_path = first / "result.json"
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            tampered = {**first_manifest, "snapshots": []}
+            (first / "manifest.json").write_text(json.dumps(tampered), encoding="utf-8")
+            rejected = run(
+                "validate",
+                "--bundle",
+                str(first),
+                "--result",
+                str(result_path),
+                cwd=root,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("snapshot inventory is incomplete", rejected.stderr)
+
+            (first / "manifest.json").write_text(json.dumps(first_manifest), encoding="utf-8")
+            source = first / "files" / "app.py"
+            original = source.read_bytes()
+            source.write_bytes(original + b"tampered\n")
+            rejected = run(
+                "validate",
+                "--bundle",
+                str(first),
+                "--result",
+                str(result_path),
+                cwd=root,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("snapshot size mismatch", rejected.stderr)
+
+            module = load_autoreview_module()
+            self.assertNotEqual(
+                module.status_context({"fingerprint": "a" * 64}),
+                module.status_context({"fingerprint": "b" * 64}),
+            )
 
 
 if __name__ == "__main__":

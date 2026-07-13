@@ -16,7 +16,31 @@ import tempfile
 
 
 SCHEMA_VERSION = 1
-STATUS_CONTEXT = "agent-system/autoreview"
+STATUS_CONTEXT_PREFIX = "agent-system/autoreview"
+CANONICAL_GIT_CONFIG = (
+    "-c",
+    "color.ui=false",
+    "-c",
+    "core.quotePath=true",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "diff.algorithm=myers",
+    "-c",
+    "diff.orderFile=/dev/null",
+    "-c",
+    "diff.context=3",
+    "-c",
+    "diff.indentHeuristic=false",
+    "-c",
+    "diff.compactionHeuristic=false",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.renames=true",
+)
 SECRET_PATTERNS = {
     "private-key": re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----"),
     "github-token": re.compile(r"\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_-]{16,}\b"),
@@ -31,8 +55,10 @@ SECRET_PATTERNS = {
     ),
 }
 ASSIGNMENT_RE = re.compile(
-    r"(?m)^[+ -]?[^+\n]*?\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
-    r"\s*[:=]\s*([\"']?)([^\s\"',;]+)"
+    r"^[+ -]?[^+\n]*?\b(?P<name>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
+    r"[\"']?\s*[:=]\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"'\r\n]{1,512})(?P=quote)|"
+    r"(?P<bare>[^\s\"',;}\]]+))",
+    re.IGNORECASE | re.MULTILINE,
 )
 PLACEHOLDERS = ("example", "placeholder", "redacted", "dummy", "process.env", "getenv", "${", "{{")
 
@@ -94,8 +120,8 @@ def sensitive_path(value: str) -> bool:
 def secret_findings(text: str) -> list[str]:
     findings = [name for name, pattern in SECRET_PATTERNS.items() if pattern.search(text)]
     for match in ASSIGNMENT_RE.finditer(text):
-        quoted = bool(match.group(2))
-        value = match.group(3)
+        quoted = match.group("quoted") is not None
+        value = match.group("quoted") or match.group("bare") or ""
         lowered = value.lower()
         if len(value) < 8 or any(marker in lowered for marker in PLACEHOLDERS):
             continue
@@ -112,12 +138,24 @@ def secret_findings(text: str) -> list[str]:
             )
         )
         if quoted or classes >= 2:
-            findings.append(f"assigned-{match.group(1).lower()}")
+            findings.append(f"assigned-{match.group('name').lower()}")
     return sorted(set(findings))
 
 
 def changed_entries(root: Path, base: str, head: str) -> list[dict]:
-    raw = git(root, "diff", "--name-status", "-z", "--find-renames", base, head).stdout
+    raw = git(
+        root,
+        *CANONICAL_GIT_CONFIG,
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames=50%",
+        base,
+        head,
+    ).stdout
     parts = raw.split("\0")
     if parts and parts[-1] == "":
         parts.pop()
@@ -144,7 +182,7 @@ def changed_entries(root: Path, base: str, head: str) -> list[dict]:
             index += 1
             safe_relative(path)
             entries.append({"status": status, "path": path})
-    return entries
+    return sorted(entries, key=lambda entry: (entry["path"], entry.get("old_path", ""), entry["status"]))
 
 
 def object_bytes(root: Path, revision: str, path: str) -> bytes | None:
@@ -154,13 +192,85 @@ def object_bytes(root: Path, revision: str, path: str) -> bytes | None:
     return git(root, "show", spec, text=False).stdout
 
 
-def fingerprint(base: str, head: str, intent: str, evidence: list[str], patch: bytes) -> str:
-    digest = hashlib.sha256()
-    for value in (base, head, intent, json.dumps(evidence, sort_keys=True)):
-        digest.update(value.encode("utf-8"))
-        digest.update(b"\0")
-    digest.update(patch)
-    return digest.hexdigest()
+def fingerprint(
+    base: str,
+    head: str,
+    intent: str,
+    evidence: list[str],
+    patch: bytes,
+    changed_files: list[dict],
+    snapshots: list[dict],
+) -> str:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "base_sha": base,
+        "head_sha": head,
+        "intent": intent,
+        "evidence": evidence,
+        "patch_sha256": hashlib.sha256(patch).hexdigest(),
+        "changed_files": changed_files,
+        "snapshots": snapshots,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def canonical_patch(root: Path, base: str, head: str) -> bytes:
+    return git(
+        root,
+        *CANONICAL_GIT_CONFIG,
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--diff-algorithm=myers",
+        "--unified=3",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--find-renames=50%",
+        "--submodule=short",
+        base,
+        head,
+        text=False,
+    ).stdout
+
+
+def snapshot_inventory(
+    root: Path,
+    head: str,
+    entries: list[dict],
+    maximum_bytes: int,
+) -> tuple[list[dict], dict[str, bytes]]:
+    total = 0
+    snapshots: list[dict] = []
+    payloads: dict[str, bytes] = {}
+    for entry in entries:
+        path = entry["path"]
+        content = object_bytes(root, head, path)
+        if content is None:
+            snapshots.append({"path": path, "deleted": True})
+            continue
+        total += len(content)
+        if total > maximum_bytes:
+            raise ReviewError(f"source snapshots exceed bundle limit ({total} bytes)")
+        record = {
+            "path": path,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+            "binary": b"\0" in content,
+        }
+        snapshots.append(record)
+        snapshot_secrets = secret_findings(content.decode("utf-8", errors="replace"))
+        if snapshot_secrets:
+            raise ReviewError(f"secret-like source snapshot blocked in {path}: " + ", ".join(snapshot_secrets))
+        payloads[path] = content
+    return snapshots, payloads
+
+
+def status_context(manifest: dict) -> str:
+    return f"{STATUS_CONTEXT_PREFIX}/{manifest['fingerprint'][:16]}"
 
 
 def remote_slug(root: Path) -> str:
@@ -212,7 +322,7 @@ def prepare(args: argparse.Namespace) -> int:
     if sensitive:
         raise ReviewError("sensitive paths cannot enter a review bundle: " + ", ".join(sensitive))
 
-    patch = git(root, "diff", "--binary", "--no-ext-diff", "--find-renames", base, head, text=False).stdout
+    patch = canonical_patch(root, base, head)
     if len(patch) > args.max_patch_bytes:
         raise ReviewError(f"patch exceeds bundle limit ({len(patch)} bytes)")
     patch_text = patch.decode("utf-8", errors="replace")
@@ -220,7 +330,16 @@ def prepare(args: argparse.Namespace) -> int:
     if secrets:
         raise ReviewError("secret-like patch content blocked: " + ", ".join(secrets))
 
-    review_fingerprint = fingerprint(base, head, args.intent.strip(), args.evidence, patch)
+    snapshots, snapshot_payloads = snapshot_inventory(root, head, entries, args.max_snapshot_bytes)
+    review_fingerprint = fingerprint(
+        base,
+        head,
+        args.intent.strip(),
+        args.evidence,
+        patch,
+        entries,
+        snapshots,
+    )
     if args.out:
         destination = Path(args.out).expanduser().resolve()
         if destination.exists():
@@ -232,34 +351,12 @@ def prepare(args: argparse.Namespace) -> int:
         destination = build
     build.chmod(0o700)
 
-    snapshot_bytes = 0
-    snapshots: list[dict] = []
     try:
-        for entry in entries:
-            path = entry["path"]
-            content = object_bytes(root, head, path)
-            if content is None:
-                continue
-            snapshot_bytes += len(content)
-            if snapshot_bytes > args.max_snapshot_bytes:
-                raise ReviewError(f"source snapshots exceed bundle limit ({snapshot_bytes} bytes)")
-            record = {
-                "path": path,
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "bytes": len(content),
-                "binary": b"\0" in content,
-            }
-            snapshots.append(record)
-            if not record["binary"]:
-                snapshot_secrets = secret_findings(content.decode("utf-8", errors="replace"))
-                if snapshot_secrets:
-                    raise ReviewError(
-                        f"secret-like source snapshot blocked in {path}: " + ", ".join(snapshot_secrets)
-                    )
-                output = build / "files" / Path(*safe_relative(path).parts)
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(content)
-                output.chmod(0o600)
+        for path, content in snapshot_payloads.items():
+            output = build / "files" / Path(*safe_relative(path).parts)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(content)
+            output.chmod(0o600)
 
         manifest = {
             "schema_version": SCHEMA_VERSION,
@@ -329,6 +426,59 @@ def load_json(path: Path, label: str) -> dict:
     return value
 
 
+def validate_inventory(manifest: dict) -> tuple[list[dict], list[dict]]:
+    entries = manifest.get("changed_files")
+    snapshots = manifest.get("snapshots")
+    if not isinstance(entries, list) or not entries:
+        raise ReviewError("bundle changed-files inventory is invalid")
+    if not isinstance(snapshots, list) or len(snapshots) != len(entries):
+        raise ReviewError("bundle snapshot inventory is incomplete")
+
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ReviewError("invalid changed-file metadata")
+        status = entry.get("status")
+        path = entry.get("path")
+        if not isinstance(status, str) or not re.fullmatch(r"[ACDMRTUXB][0-9]{0,3}", status):
+            raise ReviewError("invalid changed-file status")
+        if not isinstance(path, str):
+            raise ReviewError("invalid changed-file path")
+        safe_relative(path)
+        if path in seen:
+            raise ReviewError(f"duplicate changed-file path: {path}")
+        seen.add(path)
+        old_path = entry.get("old_path")
+        if status[0] in ("R", "C"):
+            if not isinstance(old_path, str):
+                raise ReviewError("rename or copy metadata requires old_path")
+            safe_relative(old_path)
+        elif old_path is not None:
+            raise ReviewError("unexpected old_path metadata")
+
+    if [item.get("path") if isinstance(item, dict) else None for item in snapshots] != [
+        entry["path"] for entry in entries
+    ]:
+        raise ReviewError("bundle snapshots do not exactly match changed files")
+    for entry, snapshot in zip(entries, snapshots):
+        if not isinstance(snapshot, dict):
+            raise ReviewError("invalid source snapshot metadata")
+        path = snapshot.get("path")
+        if snapshot.get("deleted") is True:
+            if entry["status"][0] != "D" or set(snapshot) != {"path", "deleted"}:
+                raise ReviewError(f"invalid deleted snapshot metadata: {path}")
+            continue
+        if entry["status"][0] == "D":
+            raise ReviewError(f"deleted snapshot is not marked deleted: {path}")
+        if not isinstance(snapshot.get("binary"), bool):
+            raise ReviewError(f"invalid binary snapshot flag: {path}")
+        if not isinstance(snapshot.get("bytes"), int) or snapshot["bytes"] < 0:
+            raise ReviewError(f"invalid source snapshot size: {path}")
+        if not isinstance(snapshot.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", snapshot["sha256"]):
+            raise ReviewError(f"invalid source snapshot hash: {path}")
+    return entries, snapshots
+
+
 def load_bundle(path: Path) -> tuple[Path, dict]:
     bundle = path.expanduser().resolve()
     manifest = load_json(bundle / "manifest.json", "bundle manifest")
@@ -341,25 +491,60 @@ def load_bundle(path: Path) -> tuple[Path, dict]:
         raise ReviewError("bundle patch is missing") from exc
     if hashlib.sha256(patch).hexdigest() != manifest.get("patch_sha256"):
         raise ReviewError("bundle patch hash does not match manifest")
+    if manifest.get("patch_bytes") != len(patch):
+        raise ReviewError("bundle patch size does not match manifest")
     evidence = manifest.get("evidence", [])
     if not isinstance(evidence, list) or not all(isinstance(item, str) for item in evidence):
         raise ReviewError("bundle evidence must be a string list")
-    expected = fingerprint(manifest["base_sha"], manifest["head_sha"], manifest["intent"], evidence, patch)
+    for field in ("base_sha", "head_sha"):
+        if not isinstance(manifest.get(field), str) or not re.fullmatch(r"[a-f0-9]{40}", manifest[field]):
+            raise ReviewError(f"bundle {field} is invalid")
+    if not isinstance(manifest.get("intent"), str) or not manifest["intent"].strip():
+        raise ReviewError("bundle intent is invalid")
+    entries, snapshots = validate_inventory(manifest)
+    expected = fingerprint(
+        manifest["base_sha"],
+        manifest["head_sha"],
+        manifest["intent"],
+        evidence,
+        patch,
+        entries,
+        snapshots,
+    )
     if expected != manifest.get("fingerprint"):
         raise ReviewError("bundle fingerprint does not match contents")
-    for snapshot in manifest.get("snapshots", []):
-        if not isinstance(snapshot, dict) or snapshot.get("binary"):
+
+    files_root = bundle / "files"
+    expected_files: set[str] = set()
+    for snapshot in snapshots:
+        if snapshot.get("deleted") is True:
             continue
         path_value = snapshot.get("path")
-        if not isinstance(path_value, str):
-            raise ReviewError("invalid source snapshot metadata")
-        source = bundle / "files" / Path(*safe_relative(path_value).parts)
+        expected_files.add(path_value)
+        source = files_root / Path(*safe_relative(path_value).parts)
+        if source.is_symlink():
+            raise ReviewError(f"source snapshot cannot be a symlink: {path_value}")
         try:
+            source.resolve().relative_to(files_root.resolve())
             content = source.read_bytes()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise ReviewError(f"source snapshot missing: {path_value}") from exc
+        if len(content) != snapshot.get("bytes"):
+            raise ReviewError(f"source snapshot size mismatch: {path_value}")
         if hashlib.sha256(content).hexdigest() != snapshot.get("sha256"):
             raise ReviewError(f"source snapshot hash mismatch: {path_value}")
+        if (b"\0" in content) != snapshot.get("binary"):
+            raise ReviewError(f"source snapshot binary flag mismatch: {path_value}")
+
+    actual_files: set[str] = set()
+    if files_root.exists():
+        for candidate in files_root.rglob("*"):
+            if candidate.is_symlink():
+                raise ReviewError("source snapshot tree contains a symlink")
+            if candidate.is_file():
+                actual_files.add(candidate.relative_to(files_root).as_posix())
+    if actual_files != expected_files:
+        raise ReviewError("bundle source files do not exactly match snapshot inventory")
     return bundle, manifest
 
 
@@ -486,7 +671,8 @@ def existing_status(root: Path, manifest: dict) -> dict | None:
     except json.JSONDecodeError as exc:
         raise ReviewError("GitHub returned invalid status data") from exc
     statuses = value.get("statuses", []) if isinstance(value, dict) else []
-    return next((item for item in statuses if isinstance(item, dict) and item.get("context") == STATUS_CONTEXT), None)
+    context = status_context(manifest)
+    return next((item for item in statuses if isinstance(item, dict) and item.get("context") == context), None)
 
 
 def status(args: argparse.Namespace) -> int:
@@ -495,7 +681,7 @@ def status(args: argparse.Namespace) -> int:
     item = existing_status(root, manifest)
     expected_suffix = manifest["fingerprint"][:12]
     matched = bool(item and expected_suffix in str(item.get("description", "")))
-    output = {"matched": matched, "context": STATUS_CONTEXT, "head_sha": manifest["head_sha"]}
+    output = {"matched": matched, "context": status_context(manifest), "head_sha": manifest["head_sha"]}
     if item:
         output["state"] = item.get("state")
         output["description"] = item.get("description")
@@ -520,7 +706,7 @@ def publish(args: argparse.Namespace) -> int:
         "-f",
         f"state={state}",
         "-f",
-        f"context={STATUS_CONTEXT}",
+        f"context={status_context(manifest)}",
         "-f",
         f"description={description}",
     ]

@@ -27,7 +27,7 @@ report the structured findings for a separately assigned fix-issue job.
 ## Reconciliation
 
 Run nightly. Inspect recent default-branch commits and open PR heads, then run
-the same workflow only when the exact candidate lacks the autoreview status.
+the same workflow only when the exact fingerprint lacks its autoreview status.
 Process candidates serially. Do not perform broad repository review, repairs,
 or queue maintenance in this automation.
 

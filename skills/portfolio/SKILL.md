@@ -38,10 +38,14 @@ temporary remote lock refs provide atomic cross-host ownership without a diary.
 
 ```bash
 head=$(git rev-parse HEAD)
-agent-lease acquire "repo:<owner>/<repo>:write" --head "$head"
-agent-lease acquire "public:mutation" --head "$head"
-agent-lease verify <lease-id> --repo "$PWD"
-agent-lease release <lease-id>
+repo_lease_id="$(agent-lease acquire "repo:<owner>/<repo>:write" --head "$head" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease_id"])')"
+agent-lease verify "$repo_lease_id" --repo "$PWD" --head "$head"
+public_lease_id="$(agent-lease acquire "public:mutation" --head "$head" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease_id"])')"
+agent-lease verify "$public_lease_id" --repo "$PWD" --head "$head"
+# Perform exactly one synchronous provider write here.
+agent-lease release "$public_lease_id"
+# Keep the repository lease while observing CI or deployment.
+agent-lease release "$repo_lease_id"
 ```
 
 - Acquire the repository lease before mutation ownership and renew it during
@@ -49,11 +53,15 @@ agent-lease release <lease-id>
   the global public lease second, immediately before a push, PR mutation, merge,
   workflow approval, release, deployment, or provider write.
 - Private implementation and proof continue in parallel. Admit one new public
-  sequence at a time; once admitted, let it reach its natural safe boundary.
+  write at a time. Release the public lease immediately after that synchronous
+  write; never hold it while waiting for review, CI, or deployment.
 - Recheck the exact candidate SHA after acquiring the public lease and directly
   before every irreversible boundary. Drift invalidates review and admission.
-- Release in reverse order. Expired leases may be reaped only after checking
-  worker, GitHub, CI, deployment, and provider state.
+- Reacquire and reverify before each later public write. Keep the repository
+  lease through active waits, then release it when repository ownership ends.
+- TTL is limited to 24 hours. An expired lease remains owned until `agent-lease
+  reap <scope>` succeeds after checking worker, GitHub, CI, deployment, and
+  provider state; acquisition never reaps implicitly.
 - Use operation plus candidate SHA as the idempotency key. Repeated automation
   wakes reconcile current state and become no-ops when the outcome already
   exists.

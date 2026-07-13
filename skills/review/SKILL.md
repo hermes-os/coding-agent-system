@@ -15,7 +15,7 @@ agent-autoreview validate --bundle <bundle-dir> --result <result.json> --record
 ```
 
 `prepare` requires a committed candidate, fails closed on sensitive paths or
-secret-like patch text, snapshots changed text files, and prints the bundle
+secret-like patch text, snapshots changed source files, and prints the bundle
 path. Give only that bundle plus the role assignment to a fresh reviewer. The
 reviewer writes `result.json` from the generated template. Record provenance
 for the reviewer actually used; never make an identity an acceptance rule.
@@ -43,9 +43,10 @@ and report the scope break. Pair this source-aware review with
 `behavior-validator` when user-visible behavior needs independent proof.
 
 For an authorized GitHub workflow, `agent-autoreview publish` records an
-idempotent commit status after validation. Acquire the public mutation lease
-from `portfolio` first. Read `references/cursor-automation.md` only when
-configuring Cursor Automations.
+idempotent fingerprint-specific commit status after validation. Acquire the
+public mutation lease from `portfolio` only for that publish, then release it
+immediately. Read `references/cursor-automation.md` only when configuring
+Cursor Automations.
 
 ## Output
 

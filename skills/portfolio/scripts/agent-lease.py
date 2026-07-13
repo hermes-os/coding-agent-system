@@ -18,7 +18,15 @@ import time
 import uuid
 
 
+MAX_TTL_SECONDS = 86_400
+REPOSITORY_SCOPE_RE = re.compile(r"repo:[a-z0-9_.-]+/[a-z0-9_.-]+:write")
+
+
 class LeaseError(RuntimeError):
+    pass
+
+
+class LeaseChanged(LeaseError):
     pass
 
 
@@ -27,7 +35,24 @@ def now_epoch() -> int:
 
 
 def iso_time(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OSError, OverflowError, ValueError) as exc:
+        raise LeaseError("lease contains an invalid timestamp") from exc
+
+
+def lease_epoch(value: object, label: str) -> int:
+    try:
+        epoch = int(value)
+    except (TypeError, ValueError) as exc:
+        raise LeaseError(f"lease contains an invalid {label}") from exc
+    if epoch < 0:
+        raise LeaseError(f"lease contains an invalid {label}")
+    return epoch
+
+
+def is_expired(value: dict) -> bool:
+    return lease_epoch(value.get("expires_at"), "expires_at") <= now_epoch()
 
 
 def state_root() -> Path:
@@ -119,9 +144,17 @@ def remote_name() -> str:
 
 
 def lock_ref(scope: str) -> str:
-    readable = re.sub(r"[^a-z0-9]+", "-", scope.lower()).strip("-")[:32] or "lease"
+    scope = canonical_scope(scope)
+    readable = re.sub(r"[^a-z0-9]+", "-", scope).strip("-")[:32] or "lease"
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
     return f"refs/heads/agent-locks/{readable}-{digest}"
+
+
+def canonical_scope(scope: str) -> str:
+    normalized = scope.strip().lower()
+    if normalized == "public:mutation" or REPOSITORY_SCOPE_RE.fullmatch(normalized):
+        return normalized
+    raise LeaseError("scope must be public:mutation or repo:<owner>/<repo>:write")
 
 
 def remote_sha(repo: Path, ref: str) -> str | None:
@@ -134,6 +167,10 @@ def metadata_for(repo: Path, ref: str, expected: str) -> dict | None:
     if git(repo, "cat-file", "-e", f"{expected}^{{commit}}", check=False).returncode != 0:
         fetched = git(repo, "fetch", "--quiet", "--no-tags", remote_name(), ref, check=False)
         if fetched.returncode != 0:
+            return None
+        if git(repo, "cat-file", "-e", f"{expected}^{{commit}}", check=False).returncode != 0:
+            if remote_sha(repo, ref) != expected:
+                raise LeaseChanged("lease changed while loading metadata")
             return None
     result = git(repo, "show", "-s", "--format=%B", expected, check=False)
     if result.returncode != 0:
@@ -148,8 +185,22 @@ def metadata_for(repo: Path, ref: str, expected: str) -> dict | None:
     return None
 
 
+def read_remote_metadata(repo: Path, ref: str) -> tuple[str | None, dict | None]:
+    for _ in range(3):
+        current = remote_sha(repo, ref)
+        if not current:
+            return None, None
+        try:
+            metadata = metadata_for(repo, ref, current)
+        except LeaseChanged:
+            continue
+        if remote_sha(repo, ref) == current:
+            return current, metadata
+    raise LeaseError("lease changed repeatedly; retry")
+
+
 def make_commit(repo: Path, metadata: dict) -> str:
-    tree = git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+    tree = git(repo, "mktree", input_text="").stdout.strip()
     env = os.environ.copy()
     env.update(
         {
@@ -204,22 +255,23 @@ def owner_name(explicit: str | None) -> str:
 
 
 def public_metadata(value: dict, *, locked: bool = True) -> dict:
+    acquired_at = lease_epoch(value.get("acquired_at"), "acquired_at") if value.get("acquired_at") is not None else None
+    expires_at = lease_epoch(value.get("expires_at"), "expires_at") if value.get("expires_at") is not None else None
     return {
         "locked": locked,
         "scope": value.get("scope"),
         "lease_id": value.get("lease_id"),
         "owner": value.get("owner"),
         "head": value.get("head"),
-        "acquired_at": iso_time(int(value["acquired_at"])) if value.get("acquired_at") else None,
-        "expires_at": iso_time(int(value["expires_at"])) if value.get("expires_at") else None,
+        "acquired_at": iso_time(acquired_at) if acquired_at is not None else None,
+        "expires_at": iso_time(expires_at) if expires_at is not None else None,
     }
 
 
 def owned_remote(repo: Path, token: dict) -> tuple[str, dict]:
-    current = remote_sha(repo, token["ref"])
+    current, held = read_remote_metadata(repo, token["ref"])
     if not current:
         raise LeaseError("lease is no longer active")
-    held = metadata_for(repo, token["ref"], current)
     if not held or held.get("lease_id") != token.get("lease_id"):
         raise LeaseError("lease ownership changed")
     return current, held
@@ -228,30 +280,30 @@ def owned_remote(repo: Path, token: dict) -> tuple[str, dict]:
 def acquire(args: argparse.Namespace) -> int:
     repo = coordination_repo(args.coordination_repo)
     git(repo, "remote", "get-url", remote_name())
-    ref = lock_ref(args.scope)
+    scope = canonical_scope(args.scope)
+    ref = lock_ref(scope)
 
     for _ in range(3):
-        current = remote_sha(repo, ref)
+        current, held = read_remote_metadata(repo, ref)
         if current:
-            held = metadata_for(repo, ref, current)
             if not held:
                 raise LeaseError("existing lease metadata is unreadable; refusing to replace it")
-            if int(held.get("expires_at", 0)) > now_epoch():
-                print(json.dumps(public_metadata(held), sort_keys=True), file=sys.stderr)
-                return 2
-            if not delete_ref(repo, ref, current):
-                continue
+            output = public_metadata(held)
+            output["expired"] = is_expired(held)
+            print(json.dumps(output, sort_keys=True), file=sys.stderr)
+            return 2
 
         acquired = now_epoch()
         metadata = {
             "version": 1,
-            "scope": args.scope,
+            "scope": scope,
             "lease_id": uuid.uuid4().hex,
             "owner": owner_name(args.owner),
             "head": args.head,
             "acquired_at": acquired,
             "expires_at": acquired + args.ttl,
         }
+        public_metadata(metadata)
         commit = make_commit(repo, metadata)
         token = {
             **metadata,
@@ -274,8 +326,7 @@ def acquire(args: argparse.Namespace) -> int:
         print(json.dumps(public_metadata(metadata), sort_keys=True))
         return 0
 
-    current = remote_sha(repo, ref)
-    held = metadata_for(repo, ref, current) if current else None
+    current, held = read_remote_metadata(repo, ref)
     if held:
         print(json.dumps(public_metadata(held), sort_keys=True), file=sys.stderr)
     return 2
@@ -283,16 +334,16 @@ def acquire(args: argparse.Namespace) -> int:
 
 def status(args: argparse.Namespace) -> int:
     repo = coordination_repo(args.coordination_repo)
-    ref = lock_ref(args.scope)
-    current = remote_sha(repo, ref)
+    scope = canonical_scope(args.scope)
+    ref = lock_ref(scope)
+    current, held = read_remote_metadata(repo, ref)
     if not current:
-        print(json.dumps({"locked": False, "scope": args.scope}, sort_keys=True))
+        print(json.dumps({"locked": False, "scope": scope}, sort_keys=True))
         return 0
-    held = metadata_for(repo, ref, current)
     if not held:
         raise LeaseError("lease metadata is unreadable")
     result = public_metadata(held)
-    result["expired"] = int(held.get("expires_at", 0)) <= now_epoch()
+    result["expired"] = is_expired(held)
     print(json.dumps(result, sort_keys=True))
     return 0
 
@@ -304,6 +355,7 @@ def renew(args: argparse.Namespace) -> int:
     metadata = {key: held.get(key) for key in ("version", "scope", "lease_id", "owner", "head", "acquired_at", "expires_at")}
     metadata["head"] = args.head if args.head is not None else metadata.get("head")
     metadata["expires_at"] = now_epoch() + args.ttl
+    public_metadata(metadata)
     commit = make_commit(repo, metadata)
     if not replace_ref(repo, token["ref"], current, commit):
         raise LeaseError("lease changed while renewing")
@@ -324,13 +376,18 @@ def verify(args: argparse.Namespace) -> int:
     token = load_token(args.lease_id)
     repo = coordination_repo(token.get("coordination_repo"))
     _, held = owned_remote(repo, token)
-    if int(held.get("expires_at", 0)) <= now_epoch():
+    if is_expired(held):
         raise LeaseError("lease expired")
-    expected_head = args.head or held.get("head")
-    if args.repo and expected_head:
+    stored_head = held.get("head")
+    if args.head is not None:
+        if not stored_head or args.head != stored_head:
+            raise LeaseError("exact-head assertion does not match the lease fence")
+    if args.repo:
+        if not stored_head:
+            raise LeaseError("lease has no exact-head fence for repository verification")
         actual = git(Path(args.repo).expanduser().resolve(), "rev-parse", "HEAD").stdout.strip()
-        if actual != expected_head:
-            raise LeaseError(f"exact-head fence failed: expected {expected_head[:12]}, found {actual[:12]}")
+        if actual != stored_head:
+            raise LeaseError(f"exact-head fence failed: expected {stored_head[:12]}, found {actual[:12]}")
     print(json.dumps(public_metadata(held), sort_keys=True))
     return 0
 
@@ -338,12 +395,11 @@ def verify(args: argparse.Namespace) -> int:
 def release(args: argparse.Namespace) -> int:
     token = load_token(args.lease_id)
     repo = coordination_repo(token.get("coordination_repo"))
-    current = remote_sha(repo, token["ref"])
+    current, held = read_remote_metadata(repo, token["ref"])
     if current is None:
         token_path(args.lease_id).unlink(missing_ok=True)
         print(json.dumps({"released": True, "lease_id": args.lease_id}, sort_keys=True))
         return 0
-    held = metadata_for(repo, token["ref"], current)
     if not held or held.get("lease_id") != token.get("lease_id"):
         raise LeaseError("lease ownership changed; refusing release")
     if not delete_ref(repo, token["ref"], current):
@@ -355,20 +411,20 @@ def release(args: argparse.Namespace) -> int:
 
 def reap(args: argparse.Namespace) -> int:
     repo = coordination_repo(args.coordination_repo)
-    ref = lock_ref(args.scope)
-    current = remote_sha(repo, ref)
+    scope = canonical_scope(args.scope)
+    ref = lock_ref(scope)
+    current, held = read_remote_metadata(repo, ref)
     if not current:
-        print(json.dumps({"reaped": False, "scope": args.scope, "reason": "not-locked"}, sort_keys=True))
+        print(json.dumps({"reaped": False, "scope": scope, "reason": "not-locked"}, sort_keys=True))
         return 0
-    held = metadata_for(repo, ref, current)
     if not held:
         raise LeaseError("lease metadata is unreadable; refusing to reap")
-    if int(held.get("expires_at", 0)) > now_epoch():
+    if not is_expired(held):
         print(json.dumps(public_metadata(held), sort_keys=True), file=sys.stderr)
         return 2
     if not delete_ref(repo, ref, current):
         raise LeaseError("lease changed while reaping")
-    print(json.dumps({"reaped": True, "scope": args.scope}, sort_keys=True))
+    print(json.dumps({"reaped": True, "scope": scope}, sort_keys=True))
     return 0
 
 
@@ -414,8 +470,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    if hasattr(args, "ttl") and args.ttl < 1:
-        raise LeaseError("ttl must be positive")
+    if hasattr(args, "ttl") and not 1 <= args.ttl <= MAX_TTL_SECONDS:
+        raise LeaseError(f"ttl must be between 1 and {MAX_TTL_SECONDS} seconds")
     return args.handler(args)
 
 

@@ -20,14 +20,16 @@ heavy operation per host.
 For an actionable repository, acquire its write lease before mutation. Before
 any push, PR mutation, merge, workflow approval, release, deployment, or
 provider write, acquire public:mutation second and verify the exact candidate
-head. Use operation plus candidate SHA as the idempotency key. Let an admitted
-public sequence reach a safe boundary, then release public and repository
-leases in reverse order.
+head. Use operation plus candidate SHA as the idempotency key. Perform one
+synchronous provider write and release public:mutation immediately; never hold
+it during CI or deployment waits. Reacquire and reverify before each later
+write. Keep the repository lease until that repository owner's work ends.
 
-Reap an expired lease only after verifying its worker and external operation
-are no longer active. Continue active waits through terminal CI or deployment
-state. Surface only one exact access, irreversible choice, or genuine product
-decision after every safe reversible action is complete.
+An expired lease is not automatically available. Reap it only after verifying
+its worker and external operation are no longer active. Continue active waits
+through terminal CI or deployment state. Surface only one exact access,
+irreversible choice, or genuine product decision after every safe reversible
+action is complete.
 ```
 
 Keep implementation workers and the heartbeat distinct. The heartbeat

@@ -35,8 +35,10 @@ SECRET_PATTERNS = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"),
 )
 ASSIGNMENT_RE = re.compile(
-    r"(?im)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
-    r"\s*[:=]\s*([^\s,;]+)"
+    r"\b(?P<name>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
+    r"[\"']?\s*[:=]\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"'\r\n]{1,512})(?P=quote)|"
+    r"(?P<bare>[^\s\"',;}\]]+))",
+    re.IGNORECASE | re.MULTILINE,
 )
 AUTH_QUERY_RE = re.compile(r"(?i)([?&](?:token|code|secret|key|password)=)[^&#\s]+")
 AUTHORIZATION_RE = re.compile(
@@ -44,6 +46,7 @@ AUTHORIZATION_RE = re.compile(
     re.IGNORECASE,
 )
 COOKIE_RE = re.compile(r"(\b(?:cookie|set-cookie)\s*:\s*)[^\r\n]+", re.IGNORECASE)
+URI_CREDENTIAL_RE = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^:/\s]+:)[^@\s/]+(@)")
 
 
 @dataclass
@@ -106,7 +109,7 @@ def redact(text: str) -> tuple[str, int]:
     def assignment(match: re.Match) -> str:
         nonlocal count
         count += 1
-        return f"{match.group(1)}=[REDACTED]"
+        return f"{match.group('name')}=[REDACTED]"
 
     text = ASSIGNMENT_RE.sub(assignment, text)
     text, replaced = AUTH_QUERY_RE.subn(r"\1[REDACTED]", text)
@@ -114,6 +117,8 @@ def redact(text: str) -> tuple[str, int]:
     text, replaced = AUTHORIZATION_RE.subn(r"\1[REDACTED]", text)
     count += replaced
     text, replaced = COOKIE_RE.subn(r"\1[REDACTED]", text)
+    count += replaced
+    text, replaced = URI_CREDENTIAL_RE.subn(r"\1[REDACTED]\2", text)
     count += replaced
     home = str(Path.home())
     if home and home in text:
@@ -282,8 +287,10 @@ def selected_turns(turns: list[Turn], query: str, maximum: int) -> list[Turn]:
     anchor = user_matches[-1] if user_matches else (user_indexes[-1] if user_indexes else None)
     if anchor is None or anchor >= len(turns) - maximum:
         return turns[-maximum:]
-    tail = turns[-(maximum - 1) :] if maximum > 1 else []
-    return [turns[anchor], *tail]
+    anchor_indexes = list(range(anchor, min(len(turns), anchor + min(2, maximum))))
+    remaining = maximum - len(anchor_indexes)
+    tail_indexes = list(range(max(anchor_indexes[-1] + 1, len(turns) - remaining), len(turns))) if remaining else []
+    return [turns[index] for index in [*anchor_indexes, *tail_indexes]]
 
 
 def render_session(args: argparse.Namespace) -> int:
@@ -308,16 +315,16 @@ def render_session(args: argparse.Namespace) -> int:
     ]
     blocks: list[str] = []
     remaining = args.max_chars
-    for turn in reversed(chosen):
-        text = turn.text[: min(2400, remaining)]
+    for index, turn in enumerate(chosen):
+        turns_left = len(chosen) - index
+        allowance = remaining // turns_left
+        prefix = f"**{turn.role.title()}**\n\n"
+        text = turn.text[: min(2400, max(0, allowance - len(prefix) - 1))]
         if not text:
             continue
-        block = f"**{turn.role.title()}**\n\n{text}\n"
-        if len(block) > remaining:
-            continue
+        block = f"{prefix}{text}\n"
         blocks.append(block)
         remaining -= len(block)
-    blocks.reverse()
     output = "\n".join([*header, *blocks]).rstrip() + "\n"
 
     if args.out:
@@ -325,10 +332,14 @@ def render_session(args: argparse.Namespace) -> int:
         destination.parent.mkdir(parents=True, exist_ok=True)
         descriptor, raw_temp = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
         temp = Path(raw_temp)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(output)
-        temp.chmod(0o600)
-        temp.replace(destination)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(output)
+            temp.chmod(0o600)
+            temp.replace(destination)
+        finally:
+            if temp.exists():
+                temp.unlink()
         print(destination)
     else:
         print(output, end="")

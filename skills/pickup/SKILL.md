@@ -25,10 +25,11 @@ died before writing one:
 
 ```bash
 agent-session-recover find --cwd "$PWD" --query "<task terms>"
-agent-session-recover render <session-path> --query "<task terms>" --out /tmp/recovery.md
+agent-session-recover render <session-path> --query "<task terms>"
 ```
 
 The helper reads local Codex and Claude logs, emits only sanitized visible
 turns, and omits reasoning, tool payloads, system policy, and secrets. Read the
-smallest matching extract, reconcile it against current evidence, then delete
-the temporary extract with `agent-trash`. Never auto-load transcript history.
+smallest matching stdout extract and reconcile it against current evidence.
+When a file is genuinely needed, use a private `mktemp` path and remove it as
+soon as pickup is complete. Never auto-load transcript history.
