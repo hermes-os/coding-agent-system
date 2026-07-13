@@ -29,6 +29,7 @@ mkdir -p \
   "$AGENTS_HOME/skills" \
   "$AGENTS_HOME/hooks" \
   "$AGENTS_HOME/bin" \
+  "$AGENTS_HOME/shell" \
   "$HOME/.codex/prompts" \
   "$HOME/.claude/commands" \
   "$HOME/.claude/skills" \
@@ -40,10 +41,15 @@ link_managed "$SYSTEM_ROOT/hooks/dispatch.py" "$AGENTS_HOME/hooks/dispatch.py"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$AGENTS_HOME/bin/docs-list"
 link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$AGENTS_HOME/bin/agent-system-doctor"
 link_managed "$SYSTEM_ROOT/bin/committer" "$AGENTS_HOME/bin/committer"
+link_managed "$SYSTEM_ROOT/bin/agent-claude" "$AGENTS_HOME/bin/agent-claude"
+link_managed "$SYSTEM_ROOT/bin/agent-codex" "$AGENTS_HOME/bin/agent-codex"
+link_managed "$SYSTEM_ROOT/shell/default-invocations.sh" "$AGENTS_HOME/shell/default-invocations.sh"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/docs-list"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/agent-docs-list"
 link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$HOME/.local/bin/agent-system-doctor"
 link_managed "$SYSTEM_ROOT/bin/committer" "$HOME/.local/bin/committer"
+link_managed "$SYSTEM_ROOT/bin/agent-claude" "$HOME/.local/bin/agent-claude"
+link_managed "$SYSTEM_ROOT/bin/agent-codex" "$HOME/.local/bin/agent-codex"
 link_managed \
   "$SYSTEM_ROOT/skills/maintain-skills/scripts/skill-audit.py" \
   "$AGENTS_HOME/bin/agent-skill-audit"

@@ -39,12 +39,16 @@ COMMAND_SKILLS = REQUIRED_SKILLS - {"behavior-validator"}
 
 REQUIRED_BINARIES = {
     "agent-capabilities",
+    "agent-claude",
+    "agent-codex",
     "agent-docs-list",
     "agent-repo-inventory",
     "agent-skill-audit",
     "agent-system-doctor",
     "committer",
 }
+
+SHELL_BLOCK_MARKER = "# >>> global agent invocation defaults >>>"
 
 
 def codex_model_pins(path: Path) -> list[str]:
@@ -148,10 +152,36 @@ def main() -> int:
         claude_pins.insert(0, "model")
     if claude_pins:
         errors.append(f"Claude model pins remain: {', '.join(claude_pins)}")
+    permissions = claude_value.get("permissions", {}) if isinstance(claude_value, dict) else {}
+    if not isinstance(permissions, dict) or permissions.get("defaultMode") != "bypassPermissions":
+        errors.append("Claude bypassPermissions is not the default")
+    if not isinstance(claude_value, dict) or claude_value.get("skipDangerousModePermissionPrompt") is not True:
+        errors.append("Claude dangerous-mode acknowledgement is not persisted")
 
-    codex_pins = codex_model_pins(home / ".codex" / "config.toml")
+    codex_config = home / ".codex" / "config.toml"
+    codex_pins = codex_model_pins(codex_config)
     if codex_pins:
         errors.append(f"Codex model pins remain: {', '.join(codex_pins)}")
+    try:
+        codex_text = codex_config.read_text(encoding="utf-8")
+    except OSError:
+        codex_text = ""
+    if not re.search(r'^sandbox_mode\s*=\s*"danger-full-access"\s*$', codex_text, re.MULTILINE):
+        errors.append("Codex danger-full-access sandbox is not the default")
+    if not re.search(r'^approval_policy\s*=\s*"never"\s*$', codex_text, re.MULTILINE):
+        errors.append("Codex never-ask approval policy is not the default")
+
+    launch_defaults = agents / "shell" / "default-invocations.sh"
+    if not launch_defaults.is_file():
+        errors.append(f"missing invocation defaults {launch_defaults}")
+    for rc_name in (".zshrc", ".bashrc"):
+        rc_path = home / rc_name
+        try:
+            rc_text = rc_path.read_text(encoding="utf-8")
+        except OSError:
+            rc_text = ""
+        if SHELL_BLOCK_MARKER not in rc_text:
+            errors.append(f"missing invocation source block {rc_path}")
 
     cursor_rule = home / ".cursor" / "rules" / "global-engineering.mdc"
     if not cursor_rule.is_file() or "# Global Engineering System" not in cursor_rule.read_text(encoding="utf-8"):

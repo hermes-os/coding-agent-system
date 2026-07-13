@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Standard Codex invocation: keep the host remotely controllable and launch
+# interactive work without approval or sandbox prompts.
+set -euo pipefail
+
+resolve_codex() {
+  local candidate
+  for candidate in \
+    "${AGENT_CODEX_BIN:-}" \
+    "$HOME/.codex/packages/standalone/current/bin/codex" \
+    "$HOME/.codex/packages/standalone/current/codex" \
+    "$HOME/.local/bin/codex" \
+    "${CODEX_NATIVE_BIN:-}" \
+    /usr/local/bin/codex \
+    /opt/homebrew/bin/codex; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  command -v codex 2>/dev/null || return 1
+}
+
+codex_bin="$(resolve_codex || true)"
+if [[ -z "$codex_bin" ]]; then
+  echo "agent-codex: Codex executable not found" >&2
+  exit 127
+fi
+
+passthrough=0
+remote_requested=0
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help|-v|-V|--version)
+      passthrough=1
+      ;;
+    --remote|--remote=*)
+      remote_requested=1
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|cloud|features|help|archive|delete|unarchive)
+    passthrough=1
+    ;;
+esac
+
+remote_control_running() {
+  local pid_file="$HOME/.codex/app-server-daemon/app-server.pid"
+  local pid
+  [[ -s "$pid_file" ]] || return 1
+  pid="$(tr -d '[:space:]' <"$pid_file")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+desktop_app_server_running() {
+  [[ "${AGENT_CODEX_IGNORE_DESKTOP_APP_SERVER:-0}" != "1" ]] || return 1
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  command -v pgrep >/dev/null 2>&1 || return 1
+  pgrep -f '/Applications/(Codex|ChatGPT)\.app/Contents/Resources/codex .*app-server' \
+    >/dev/null 2>&1
+}
+
+start_remote_control() {
+  local state_dir="$HOME/.codex/app-server-daemon"
+  local log="$state_dir/launcher.log"
+  if remote_control_running || desktop_app_server_running; then
+    return 0
+  fi
+  mkdir -p "$state_dir"
+  if ! "$codex_bin" remote-control start --json >"$log" 2>&1; then
+    echo "agent-codex: Remote Control could not start; see $log" >&2
+  fi
+}
+
+if (( ! passthrough && ! remote_requested )) && \
+  [[ "${AGENT_REMOTE_CONTROL:-1}" != "0" && "${AGENT_CODEX_REMOTE_CONTROL:-1}" != "0" ]]; then
+  start_remote_control
+fi
+
+if (( passthrough )); then
+  exec "$codex_bin" "$@"
+fi
+
+exec "$codex_bin" \
+  --dangerously-bypass-approvals-and-sandbox \
+  --dangerously-bypass-hook-trust \
+  --search \
+  "$@"

@@ -133,6 +133,7 @@ class AgentSystemTests(unittest.TestCase):
                             "unused": False,
                             "useful": True,
                         },
+                        "permissions": {"allow": ["Read"], "deny": []},
                     }
                 ),
                 encoding="utf-8",
@@ -154,6 +155,8 @@ class AgentSystemTests(unittest.TestCase):
             self.assertIn('model = "tool-model"', updated)
             self.assertIn('model_reasoning_effort = "high"', updated)
             self.assertIn('secret_setting = "preserve"', updated)
+            self.assertIn('sandbox_mode = "danger-full-access"', updated)
+            self.assertIn('approval_policy = "never"', updated)
             self.assertIn("memories = false", updated)
             self.assertNotIn("code-review@claude-plugins-official", updated)
             self.assertIn('[projects."/workspace"]', updated)
@@ -165,6 +168,9 @@ class AgentSystemTests(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_DEFAULT_OPUS_MODEL", settings["env"])
             self.assertEqual(settings["enabledPlugins"], {"useful": True})
             self.assertFalse(settings["autoMemoryEnabled"])
+            self.assertEqual(settings["permissions"]["defaultMode"], "bypassPermissions")
+            self.assertEqual(settings["permissions"]["allow"], ["Read"])
+            self.assertTrue(settings["skipDangerousModePermissionPrompt"])
             known = json.loads((plugins / "known_marketplaces.json").read_text(encoding="utf-8"))
             self.assertEqual(known, {"useful": {"source": "keep"}})
             self.assertTrue((home / ".cursor" / "rules" / "global-engineering.mdc").is_file())
@@ -216,6 +222,14 @@ class AgentSystemTests(unittest.TestCase):
                 SYSTEM_ROOT / "bin" / "committer",
             )
             self.assertEqual(
+                (home / ".local" / "bin" / "agent-claude").resolve(),
+                SYSTEM_ROOT / "bin" / "agent-claude",
+            )
+            self.assertEqual(
+                (home / ".local" / "bin" / "agent-codex").resolve(),
+                SYSTEM_ROOT / "bin" / "agent-codex",
+            )
+            self.assertEqual(
                 (home / ".local" / "bin" / "agent-skill-audit").resolve(),
                 SYSTEM_ROOT / "skills" / "maintain-skills" / "scripts" / "skill-audit.py",
             )
@@ -229,6 +243,9 @@ class AgentSystemTests(unittest.TestCase):
             )
             cursor_hooks = json.loads((home / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
             self.assertEqual(cursor_hooks["version"], 1)
+            for name in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
+                text = (home / name).read_text(encoding="utf-8")
+                self.assertEqual(text.count("# >>> global agent invocation defaults >>>"), 1)
             doctor = subprocess.run(
                 [str(SYSTEM_ROOT / "bin" / "agent-system-doctor"), "--home", str(home)],
                 text=True,
@@ -236,6 +253,86 @@ class AgentSystemTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(doctor.returncode, 0, doctor.stderr)
+
+    def test_standard_launchers_add_remote_control_only_to_interactive_work(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log = root / "calls.log"
+            stub = root / "native-agent"
+            stub.write_text(
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >>"$AGENT_TEST_LOG"\n',
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            env = {
+                **os.environ,
+                "HOME": str(root),
+                "AGENT_TEST_LOG": str(log),
+                "AGENT_CLAUDE_BIN": str(stub),
+                "AGENT_CODEX_BIN": str(stub),
+                "AGENT_CODEX_IGNORE_DESKTOP_APP_SERVER": "1",
+            }
+
+            subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-claude"), "fix it"],
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-claude"), "doctor"],
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-codex"), "fix it"],
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-codex"), "doctor"],
+                env=env,
+                check=True,
+            )
+
+            calls = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                calls,
+                [
+                    "--remote-control --permission-mode bypassPermissions fix it",
+                    "doctor",
+                    "remote-control start --json",
+                    "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --search fix it",
+                    "doctor",
+                ],
+            )
+
+    def test_vm_codex_helpers_reuse_standalone_install_and_start_remote_control(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            log = home / "codex.log"
+            codex = home / ".codex" / "packages" / "standalone" / "current" / "bin" / "codex"
+            codex.parent.mkdir(parents=True)
+            codex.write_text(
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >>"$AGENT_TEST_LOG"\n',
+                encoding="utf-8",
+            )
+            codex.chmod(0o755)
+            env = {**os.environ, "HOME": str(home), "AGENT_TEST_LOG": str(log)}
+
+            install = subprocess.run(
+                [str(SYSTEM_ROOT.parent / "codex" / "install-standalone.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertIn("already present", install.stdout)
+            subprocess.run(
+                [str(SYSTEM_ROOT.parent / "codex" / "start-remote-control.sh")],
+                env=env,
+                check=True,
+            )
+            self.assertEqual(log.read_text(encoding="utf-8"), "remote-control start\n")
 
     def test_prune_removes_known_legacy_memory_and_gate_paths(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Standard Claude invocation: remote-controllable interactive sessions with
+# permissions bypassed. Administrative and noninteractive commands pass through.
+set -euo pipefail
+
+resolve_claude() {
+  local candidate
+  for candidate in \
+    "${AGENT_CLAUDE_BIN:-}" \
+    "${CLAUDE_NATIVE_BIN:-}" \
+    "$HOME/.local/bin/claude" \
+    "$HOME/.npm-global/bin/claude" \
+    /usr/local/bin/claude \
+    /opt/homebrew/bin/claude; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  command -v claude 2>/dev/null || return 1
+}
+
+claude_bin="$(resolve_claude || true)"
+if [[ -z "$claude_bin" ]]; then
+  echo "agent-claude: Claude Code executable not found" >&2
+  exit 127
+fi
+
+passthrough=0
+remote_requested=0
+for arg in "$@"; do
+  case "$arg" in
+    -p|--print|-h|--help|-v|--version|--bare|--safe-mode)
+      passthrough=1
+      ;;
+    --remote-control|--remote-control=*)
+      remote_requested=1
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  agents|auth|auto-mode|doctor|install|mcp|plugin|plugins|project|remote-control|setup-token|ultrareview|update|upgrade)
+    passthrough=1
+    ;;
+esac
+
+if [[ "${AGENT_REMOTE_CONTROL:-1}" == "0" || "${AGENT_CLAUDE_REMOTE_CONTROL:-1}" == "0" ]]; then
+  passthrough=1
+fi
+
+if (( passthrough )); then
+  exec "$claude_bin" "$@"
+fi
+
+if (( remote_requested )); then
+  exec "$claude_bin" --permission-mode bypassPermissions "$@"
+fi
+
+# Keep another option immediately after --remote-control so its optional name
+# argument cannot consume the user's initial prompt.
+exec "$claude_bin" --remote-control --permission-mode bypassPermissions "$@"

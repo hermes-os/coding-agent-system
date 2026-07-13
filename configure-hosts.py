@@ -34,6 +34,15 @@ CLAUDE_MODEL_ENV_KEYS = {
     "CLAUDE_CODE_SUBAGENT_MODEL",
 }
 
+SHELL_BLOCK_BEGIN = "# >>> global agent invocation defaults >>>"
+SHELL_BLOCK_END = "# <<< global agent invocation defaults <<<"
+SHELL_BLOCK = (
+    f"{SHELL_BLOCK_BEGIN}\n"
+    '[ -r "$HOME/.agents/shell/default-invocations.sh" ] && '
+    '. "$HOME/.agents/shell/default-invocations.sh"\n'
+    f"{SHELL_BLOCK_END}\n"
+)
+
 
 def atomic_write(path, content, mode=0o644):
     if path.exists():
@@ -75,6 +84,12 @@ def configure_claude(home):
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     settings["autoMemoryEnabled"] = False
     settings["autoDreamEnabled"] = False
+    permissions = settings.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        settings["permissions"] = permissions
+    permissions["defaultMode"] = "bypassPermissions"
+    settings["skipDangerousModePermissionPrompt"] = True
     settings["hooks"] = {
         "Stop": [
             {
@@ -197,6 +212,22 @@ def set_feature(lines, key, value):
     return lines
 
 
+def set_root_value(lines, key, value):
+    end = next(
+        (index for index, line in enumerate(lines) if section_name(line) is not None),
+        len(lines),
+    )
+    assignment = f"{key} = {value}\n"
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for index in range(end):
+        if key_re.match(lines[index]):
+            lines[index] = assignment
+            return lines
+
+    lines.insert(end, assignment)
+    return lines
+
+
 def remove_codex_model_pins(lines):
     result = []
     section = None
@@ -226,8 +257,21 @@ def configure_codex_toml(home):
 
     lines = remove_sections(lines, obsolete)
     lines = remove_codex_model_pins(lines)
+    lines = set_root_value(lines, "sandbox_mode", '"danger-full-access"')
+    lines = set_root_value(lines, "approval_policy", '"never"')
     lines = set_feature(lines, "memories", "false")
     atomic_write(path, "".join(lines))
+
+
+def configure_shell_rc(path):
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    pattern = re.compile(
+        rf"(?ms)^{re.escape(SHELL_BLOCK_BEGIN)}\n.*?^{re.escape(SHELL_BLOCK_END)}\n?"
+    )
+    content = pattern.sub("", content).rstrip()
+    if content:
+        content += "\n\n"
+    atomic_write(path, content + SHELL_BLOCK)
 
 
 def configure_cursor(home, policy):
@@ -274,6 +318,8 @@ def main():
     configure_codex_hooks(home)
     configure_codex_toml(home)
     configure_cursor(home, policy)
+    for name in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
+        configure_shell_rc(home / name)
     return 0
 
 
