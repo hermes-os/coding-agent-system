@@ -15,6 +15,7 @@ TOOL_GROUPS = {
     "core": ("git", "gh", "rg", "jq", "curl", "ssh", "tmux", "make"),
     "runtimes": ("node", "npm", "npx", "pnpm", "yarn", "bun", "python3", "ruby", "go", "rustc", "swift"),
     "agents": ("codex", "claude", "cursor-agent"),
+    "agent_system": ("agent-autoreview", "agent-lease", "agent-session-recover", "agent-trash"),
     "platforms": ("vercel", "wrangler", "prisma", "docker"),
     "browser_gui": ("playwright", "agent-browser", "peekaboo"),
 }

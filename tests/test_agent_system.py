@@ -222,6 +222,10 @@ class AgentSystemTests(unittest.TestCase):
                 SYSTEM_ROOT / "bin" / "committer",
             )
             self.assertEqual(
+                (home / ".local" / "bin" / "agent-trash").resolve(),
+                SYSTEM_ROOT / "bin" / "agent-trash",
+            )
+            self.assertEqual(
                 (home / ".local" / "bin" / "agent-claude").resolve(),
                 SYSTEM_ROOT / "bin" / "agent-claude",
             )
@@ -240,6 +244,18 @@ class AgentSystemTests(unittest.TestCase):
             self.assertEqual(
                 (home / ".local" / "bin" / "agent-repo-inventory").resolve(),
                 SYSTEM_ROOT / "skills" / "portfolio" / "scripts" / "repo-inventory.py",
+            )
+            self.assertEqual(
+                (home / ".local" / "bin" / "agent-lease").resolve(),
+                SYSTEM_ROOT / "skills" / "portfolio" / "scripts" / "agent-lease.py",
+            )
+            self.assertEqual(
+                (home / ".local" / "bin" / "agent-autoreview").resolve(),
+                SYSTEM_ROOT / "skills" / "review" / "scripts" / "agent-autoreview.py",
+            )
+            self.assertEqual(
+                (home / ".local" / "bin" / "agent-session-recover").resolve(),
+                SYSTEM_ROOT / "skills" / "pickup" / "scripts" / "agent-session-recover.py",
             )
             cursor_hooks = json.loads((home / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
             self.assertEqual(cursor_hooks["version"], 1)

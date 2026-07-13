@@ -38,13 +38,17 @@ REQUIRED_SKILLS = {
 COMMAND_SKILLS = REQUIRED_SKILLS - {"behavior-validator"}
 
 REQUIRED_BINARIES = {
+    "agent-autoreview",
     "agent-capabilities",
     "agent-claude",
     "agent-codex",
     "agent-docs-list",
+    "agent-lease",
     "agent-repo-inventory",
+    "agent-session-recover",
     "agent-skill-audit",
     "agent-system-doctor",
+    "agent-trash",
     "committer",
 }
 

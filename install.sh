@@ -41,6 +41,7 @@ link_managed "$SYSTEM_ROOT/hooks/dispatch.py" "$AGENTS_HOME/hooks/dispatch.py"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$AGENTS_HOME/bin/docs-list"
 link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$AGENTS_HOME/bin/agent-system-doctor"
 link_managed "$SYSTEM_ROOT/bin/committer" "$AGENTS_HOME/bin/committer"
+link_managed "$SYSTEM_ROOT/bin/agent-trash" "$AGENTS_HOME/bin/agent-trash"
 link_managed "$SYSTEM_ROOT/bin/agent-claude" "$AGENTS_HOME/bin/agent-claude"
 link_managed "$SYSTEM_ROOT/bin/agent-codex" "$AGENTS_HOME/bin/agent-codex"
 link_managed "$SYSTEM_ROOT/shell/default-invocations.sh" "$AGENTS_HOME/shell/default-invocations.sh"
@@ -48,6 +49,7 @@ link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/docs-list"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/agent-docs-list"
 link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$HOME/.local/bin/agent-system-doctor"
 link_managed "$SYSTEM_ROOT/bin/committer" "$HOME/.local/bin/committer"
+link_managed "$SYSTEM_ROOT/bin/agent-trash" "$HOME/.local/bin/agent-trash"
 link_managed "$SYSTEM_ROOT/bin/agent-claude" "$HOME/.local/bin/agent-claude"
 link_managed "$SYSTEM_ROOT/bin/agent-codex" "$HOME/.local/bin/agent-codex"
 link_managed \
@@ -68,6 +70,24 @@ link_managed \
 link_managed \
   "$SYSTEM_ROOT/skills/portfolio/scripts/repo-inventory.py" \
   "$HOME/.local/bin/agent-repo-inventory"
+link_managed \
+  "$SYSTEM_ROOT/skills/portfolio/scripts/agent-lease.py" \
+  "$AGENTS_HOME/bin/agent-lease"
+link_managed \
+  "$SYSTEM_ROOT/skills/portfolio/scripts/agent-lease.py" \
+  "$HOME/.local/bin/agent-lease"
+link_managed \
+  "$SYSTEM_ROOT/skills/review/scripts/agent-autoreview.py" \
+  "$AGENTS_HOME/bin/agent-autoreview"
+link_managed \
+  "$SYSTEM_ROOT/skills/review/scripts/agent-autoreview.py" \
+  "$HOME/.local/bin/agent-autoreview"
+link_managed \
+  "$SYSTEM_ROOT/skills/pickup/scripts/agent-session-recover.py" \
+  "$AGENTS_HOME/bin/agent-session-recover"
+link_managed \
+  "$SYSTEM_ROOT/skills/pickup/scripts/agent-session-recover.py" \
+  "$HOME/.local/bin/agent-session-recover"
 
 for skill in "$SYSTEM_ROOT"/skills/*; do
   [[ -f "$skill/SKILL.md" ]] || continue

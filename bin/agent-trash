@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Move files to the user Trash without permanent deletion."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import shutil
+import sys
+from urllib.parse import quote
+
+
+def trash_root() -> Path:
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / ".Trash"
+    return home / ".local" / "share" / "Trash" / "files"
+
+
+def unique_destination(root: Path, name: str, reserved: set[Path]) -> Path:
+    candidate = root / name
+    if candidate not in reserved and not candidate.exists() and not candidate.is_symlink():
+        return candidate
+    source = Path(name)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    for number in range(1, 10_000):
+        candidate = root / f"{source.stem}-{stamp}-{number}{source.suffix}"
+        if candidate not in reserved and not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise RuntimeError(f"cannot allocate a Trash name for {name}")
+
+
+def write_trashinfo(source: Path, destination: Path) -> None:
+    if sys.platform == "darwin":
+        return
+    info_dir = destination.parent.parent / "info"
+    info_dir.mkdir(parents=True, exist_ok=True)
+    deleted = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    content = f"[Trash Info]\nPath={quote(str(source))}\nDeletionDate={deleted}\n"
+    (info_dir / f"{destination.name}.trashinfo").write_text(content, encoding="utf-8")
+
+
+def guarded_source(raw: str, cwd: Path, root: Path) -> Path:
+    source = Path(raw).expanduser()
+    if not source.is_absolute():
+        source = cwd / source
+    source = source.absolute()
+    protected = {Path("/"), Path.home().absolute(), root.absolute()}
+    if source in protected:
+        raise ValueError(f"refusing protected path: {raw}")
+    return source
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("paths", nargs="+")
+    parser.add_argument("--allow-missing", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    cwd = Path.cwd()
+    root = trash_root()
+    errors: list[str] = []
+    planned: list[tuple[Path, Path]] = []
+    reserved: set[Path] = set()
+
+    for raw in args.paths:
+        try:
+            source = guarded_source(raw, cwd, root)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if not source.exists() and not source.is_symlink():
+            if not args.allow_missing:
+                errors.append(f"missing: {raw}")
+            continue
+        destination = unique_destination(root, source.name, reserved)
+        reserved.add(destination)
+        planned.append((source, destination))
+
+    if errors:
+        for error in errors:
+            print(f"agent-trash: {error}", file=sys.stderr)
+        return 1
+
+    for source, destination in planned:
+        if args.dry_run:
+            print(f"would trash {source}")
+            continue
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(source), str(destination))
+            write_trashinfo(source, destination)
+        except OSError as exc:
+            print(f"agent-trash: {source}: {exc}", file=sys.stderr)
+            return 1
+        print(f"trashed {source}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -21,12 +21,15 @@ and changelog conventions without asking for the same approval again.
 4. Synchronize without discarding work. Fast-forward clean branches; rebase,
    merge, or force-with-lease only when the repository convention and stated
    scope require it.
-5. Push the intended branch. Merge a pull request only when that is the chosen
+5. In orchestrated or potentially concurrent work, acquire the repository and
+   public leases through `portfolio`, then verify the reviewed exact head.
+   Branch drift invalidates admission and requires synchronization and review.
+6. Push the intended branch. Merge a pull request only when that is the chosen
    repository path, and verify the remote state rather than assuming success.
-6. Observe required CI and normal deployment or publication triggered by the
+7. Observe required CI and normal deployment or publication triggered by the
    authorized action. Run the narrowest useful live smoke when applicable.
-7. Return to the repository's expected branch/state and report commit, remote,
-   checks, deployment, and residual risk.
+8. Release shared leases at a safe boundary, return to the expected branch and
+   state, and report commit, remote, checks, deployment, and residual risk.
 
 Never include unrelated files, secrets, generated credentials, or unverified
 claims. Stop only for a real conflict, failed proof, or an irreversible effect

@@ -17,6 +17,7 @@ bash -n \
 while IFS= read -r -d '' script; do
   python3 -m py_compile "$script"
 done < <(find "$ROOT" -type f -name '*.py' -print0)
+python3 -m py_compile "$ROOT/bin/agent-trash"
 "$ROOT/skills/maintain-skills/scripts/skill-audit.py" \
   --root "$ROOT/skills" \
   --check \

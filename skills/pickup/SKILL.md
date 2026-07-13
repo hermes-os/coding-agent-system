@@ -1,6 +1,6 @@
 ---
 name: pickup
-description: "Reconstruct and resume unfinished repository work from current evidence."
+description: "Reconstruct and resume unfinished work from repository evidence or a dead session."
 ---
 
 # Pickup
@@ -17,3 +17,18 @@ Rehydrate only the context needed to act:
 
 Treat current code, git, tests, and provider state as authoritative when a
 handoff or plan has drifted. Do not load unrelated historical plans or chats.
+
+## Dead Session Recovery
+
+Use local transcripts only when no adequate handoff exists or the prior session
+died before writing one:
+
+```bash
+agent-session-recover find --cwd "$PWD" --query "<task terms>"
+agent-session-recover render <session-path> --query "<task terms>" --out /tmp/recovery.md
+```
+
+The helper reads local Codex and Claude logs, emits only sanitized visible
+turns, and omits reasoning, tool payloads, system policy, and secrets. Read the
+smallest matching extract, reconcile it against current evidence, then delete
+the temporary extract with `agent-trash`. Never auto-load transcript history.

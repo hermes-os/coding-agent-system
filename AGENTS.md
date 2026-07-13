@@ -32,8 +32,8 @@ skills add job workflows.
 - Define observable success criteria before substantial edits.
 - Add or update focused tests for changed behavior when practical.
 - Run narrow checks first, then the repository's required gate.
-- Use an assigned `review` role for non-trivial or risky diffs. Reviews are
-  advisory: verify each finding against the real code before acting.
+- Use `review` for non-trivial or risky diffs. Freeze the exact candidate,
+  validate its structured result, and verify each finding against real code.
 - Use `behavior-validator` when user-visible behavior needs source-blind proof.
 - Never claim success without fresh evidence. State skipped checks and residual
   risk plainly.
@@ -50,8 +50,11 @@ skills add job workflows.
   questions. Update it in place; never create parallel trackers.
 - Milestones must be small and independently landable. Delivery follows the
   repository's branch and review convention.
-- Use `portfolio` for cross-repository coordination. Reconstruct status from
-  repositories and active plans instead of maintaining a global diary.
+- Use `portfolio` for continuous or cross-repository coordination. Keep one
+  execution owner per repository; parallelize private analysis, then serialize
+  shared public mutations with exact-head leases.
+- Scheduled automation is a wake-up mechanism, never the coordination state.
+  Reconstruct status from repositories and active plans, not a global diary.
 - Use `handoff` when pausing and `pickup` when resuming. Handoffs report current
   evidence; they are not an append-only memory store.
 - On completion, move durable product facts into canonical docs and user-facing
@@ -62,6 +65,8 @@ skills add job workflows.
 
 - Safe inspection commands are always allowed.
 - Never discard, overwrite, or revert unrelated work.
+- Use `agent-trash` for routine deletion so recovery remains possible. Use
+  permanent deletion only when the task explicitly requires it.
 - Prefer `committer` with explicit paths when creating a commit in a dirty or
   concurrently edited repository.
 - A request to implement authorizes local edits and tests. A request to land,
