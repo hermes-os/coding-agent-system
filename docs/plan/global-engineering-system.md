@@ -112,6 +112,27 @@ behavior. Validation also contains hand-maintained catalogs that can drift.
 - CI-repair candidate proof: `./validate.sh` passes all 69 tests in 239.761
   seconds, followed by the strict skill audit, repository check, syntax checks,
   and `git diff --check`.
+- The live Mac has an unmanifested install linked to the VM-embedded source.
+  Its initial 89-path dry preflight made no host changes. Frozen review
+  `00a7d62ee3ba0ff77f49dee978d4394e5a43f81d6f34db4eb93fee881c94433a`
+  then found that the first candidate reconstructed ownership from the new
+  catalog and omitted binary sources from tracked-source proof; no live
+  migration was attempted.
+- The repaired migration reads and validates the legacy source's own catalog,
+  requires every adopted source to be tracked in a clean tree, rejects altered
+  legacy-only destinations, and retires exact legacy-only paths. The focused
+  catalog-drift, untracked-source, migration, and doctor regression passes in
+  8.948 seconds. `./validate.sh` passes all 70 tests in 197.356 seconds,
+  followed by the strict skill audit, repository check, syntax checks, and
+  `git diff --check`.
+- Frozen review
+  `5979728655677ec1917880e8effe7e09e71623b214b1d4197eb68c80df651796`
+  found that ignored files were absent from the clean-tree proof. Migration now
+  treats ignored paths as source dirt too. The ignored-skill-payload regression
+  and full migration scenario pass in 10.564 seconds; `./validate.sh` passes all
+  70 tests in 214.296 seconds with the remaining validation stages.
+- The VM-embedded source predates `system.json`; the independently versioned VM
+  transition must add its exact legacy catalog before the live migration.
 
 ## Open Questions
 

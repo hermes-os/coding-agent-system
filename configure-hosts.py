@@ -153,6 +153,134 @@ def resolve_host_integration(system_root, explicit):
     return root
 
 
+def legacy_catalog_sources(root, catalog):
+    skills = catalog.get("skills")
+    binaries = catalog.get("binaries")
+    if not isinstance(skills, list) or not isinstance(binaries, list):
+        raise SystemExit(f"Invalid legacy catalog entries in {root / 'system.json'}")
+
+    required = [
+        root / "system.json",
+        root / "AGENTS.md",
+        root / "hooks" / "dispatch.py",
+        root / "bin" / "agent-claude",
+        root / "bin" / "agent-codex",
+        root / "shell" / "default-invocations.sh",
+    ]
+    skill_names = set()
+    for skill in skills:
+        if not isinstance(skill, dict):
+            raise SystemExit(f"Invalid legacy skill entry in {root / 'system.json'}")
+        name = skill.get("name")
+        command = skill.get("command")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9-]*", name) is None
+            or name in skill_names
+            or not isinstance(command, bool)
+        ):
+            raise SystemExit(f"Invalid legacy skill entry in {root / 'system.json'}")
+        skill_names.add(name)
+        required.append(root / "skills" / name / "SKILL.md")
+
+    binary_names = set()
+    for binary in binaries:
+        if not isinstance(binary, dict):
+            raise SystemExit(f"Invalid legacy binary entry in {root / 'system.json'}")
+        name = binary.get("name")
+        source = binary.get("source")
+        source_path = Path(source) if isinstance(source, str) else None
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9-]*", name) is None
+            or name in binary_names
+            or source_path is None
+            or source_path.is_absolute()
+            or ".." in source_path.parts
+        ):
+            raise SystemExit(f"Invalid legacy binary entry in {root / 'system.json'}")
+        binary_names.add(name)
+        required.append(root / source_path)
+    return required
+
+
+def resolve_migration_root(explicit, system_root):
+    if explicit is None:
+        return None, None
+    candidate = explicit.expanduser()
+    if candidate.is_symlink():
+        raise SystemExit(f"Legacy system root must not be a symlink: {candidate}")
+    root = candidate.resolve()
+    if root == system_root:
+        raise SystemExit("Legacy system root must differ from the new system root")
+    catalog_path = root / "system.json"
+    if (
+        not catalog_path.is_file()
+        or catalog_path.is_symlink()
+        or catalog_path.resolve() != catalog_path
+    ):
+        raise SystemExit(f"Legacy system root lacks a regular catalog: {catalog_path}")
+    catalog = load_catalog(root)
+    required = legacy_catalog_sources(root, catalog)
+    missing = [path for path in required if not path.is_file()]
+    symlinks = [
+        path
+        for path in required
+        if path.exists() and (path.is_symlink() or path.resolve() != path)
+    ]
+    if missing or symlinks:
+        problems = [
+            *(f"missing {path}" for path in missing),
+            *(f"symlinked source {path}" for path in symlinks),
+        ]
+        raise SystemExit(
+            "Invalid legacy system root:\n" + "\n".join(f"- {problem}" for problem in problems)
+        )
+
+    repository = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if repository.returncode:
+        raise SystemExit(f"Legacy system root is not in a Git checkout: {root}")
+    git_root = Path(repository.stdout.strip()).resolve()
+    try:
+        pathspec = str(root.relative_to(git_root)) or "."
+    except ValueError as exc:
+        raise SystemExit(f"Legacy system root escapes its Git checkout: {root}") from exc
+    required_paths = [path.relative_to(git_root).as_posix() for path in required]
+    tracked = subprocess.run(
+        ["git", "-C", str(git_root), "ls-files", "--", *required_paths],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    tracked_paths = set(tracked.stdout.splitlines())
+    if tracked.returncode or tracked_paths != set(required_paths):
+        raise SystemExit(f"Legacy system root contains untracked required files: {root}")
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(git_root),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--",
+            pathspec,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if status.returncode or status.stdout.strip():
+        raise SystemExit(f"Legacy system root must be tracked and clean: {root}")
+    return root, catalog
+
+
 def managed_entries(home, agents_home, system_root, host_integration, catalog, policy):
     entries = {}
 
@@ -259,9 +387,10 @@ def legacy_generated_entry(previous, path):
     }
 
 
-def preflight_managed(manifest_path, desired, allowed_roots):
+def preflight_managed(manifest_path, desired, allowed_roots, adopted=None):
     previous = read_json(manifest_path)
     old_paths = previous.get("paths", {}) if isinstance(previous.get("paths"), dict) else {}
+    adopted = adopted or {}
     collisions = []
     for raw_path, entry in desired.items():
         path = Path(raw_path)
@@ -279,10 +408,49 @@ def preflight_managed(manifest_path, desired, allowed_roots):
         previous_entry = old_paths.get(raw_path) or legacy_generated_entry(previous, path)
         if isinstance(previous_entry, dict) and matches_managed(path, previous_entry):
             continue
+        adopted_entry = adopted.get(raw_path)
+        if isinstance(adopted_entry, dict) and matches_managed(path, adopted_entry):
+            continue
         collisions.append(f"unowned or modified destination: {path}")
+    for raw_path, entry in adopted.items():
+        if raw_path in desired:
+            continue
+        path = Path(raw_path)
+        root = managed_root(path, allowed_roots)
+        if not path.is_absolute() or root is None:
+            collisions.append(f"legacy destination is outside managed roots: {path}")
+            continue
+        resolved_root = root.resolve(strict=False)
+        resolved_parent = path.parent.resolve(strict=False)
+        if not contained_by(resolved_parent, (resolved_root,)):
+            collisions.append(f"legacy destination parent escapes through a symlink: {path}")
+            continue
+        if (path.exists() or path.is_symlink()) and not matches_managed(path, entry):
+            collisions.append(f"unowned or modified legacy destination: {path}")
     if collisions:
         detail = "\n".join(f"- {collision}" for collision in collisions)
         raise SystemExit(f"Managed-path preflight failed; no managed paths changed:\n{detail}")
+
+
+def retire_adopted(adopted, desired, allowed_roots):
+    retired = 0
+    for raw_path, entry in adopted.items():
+        if raw_path in desired:
+            continue
+        path = Path(raw_path)
+        if not (path.exists() or path.is_symlink()):
+            continue
+        root = managed_root(path, allowed_roots)
+        if (
+            root is None
+            or not contained_by(path.parent.resolve(strict=False), (root.resolve(strict=False),))
+            or not matches_managed(path, entry)
+        ):
+            raise SystemExit(f"Legacy destination changed after preflight: {path}")
+        path.unlink()
+        retired += 1
+    if retired:
+        print(f"Retired {retired} legacy managed path(s)")
 
 
 def install_managed(desired):
@@ -515,12 +683,16 @@ def main():
     parser.add_argument("--system-root", required=True, type=Path)
     parser.add_argument("--coordination-repo", type=Path)
     parser.add_argument("--host-integration", type=Path)
+    parser.add_argument("--migrate-from-system-root", type=Path)
     args = parser.parse_args()
     home = Path(os.environ.get("HOME", "~")).expanduser().resolve()
     system_root = args.system_root.expanduser().resolve()
     agents_home = Path(os.environ.get("AGENTS_HOME", home / ".agents")).expanduser().resolve()
     catalog = load_catalog(system_root)
     host_integration = resolve_host_integration(system_root, args.host_integration)
+    migration_root, migration_catalog = resolve_migration_root(
+        args.migrate_from_system_root, system_root
+    )
     try:
         budgets = hook_budgets(catalog)
     except ValueError as exc:
@@ -542,6 +714,17 @@ def main():
     entries = managed_entries(
         home, agents_home, system_root, host_integration, catalog, policy
     )
+    adopted = None
+    if migration_root is not None:
+        legacy_policy = (migration_root / "AGENTS.md").read_text(encoding="utf-8")
+        adopted = managed_entries(
+            home,
+            agents_home,
+            migration_root,
+            migration_root,
+            migration_catalog,
+            legacy_policy,
+        )
     allowed_roots = (
         agents_home,
         home / ".codex",
@@ -549,7 +732,7 @@ def main():
         home / ".cursor",
         home / ".local" / "bin",
     )
-    preflight_managed(manifest_path, entries, allowed_roots)
+    preflight_managed(manifest_path, entries, allowed_roots, adopted=adopted)
     preflight_host_documents(home, budgets, selected_shell_rc_paths)
 
     configure_codex_toml(home)
@@ -559,6 +742,7 @@ def main():
     for path in selected_shell_rc_paths:
         configure_shell_rc(path)
     install_managed(entries)
+    retire_adopted(adopted or {}, entries, allowed_roots)
     configure_agent_home(
         agents_home, coordination_repo, host_integration, selected_shell_rc_paths
     )

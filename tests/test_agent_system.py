@@ -3,6 +3,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -414,6 +415,183 @@ class AgentSystemTests(unittest.TestCase):
             )
             self.assertNotEqual(damaged.returncode, 0)
             self.assertIn("default invocation adapter", damaged.stderr)
+
+    def test_installer_migrates_only_an_exact_clean_legacy_install(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            home = base / "home"
+            legacy = base / "legacy-system"
+            home.mkdir()
+            shutil.copytree(
+                SYSTEM_ROOT,
+                legacy,
+                ignore=shutil.ignore_patterns(".git", "__pycache__"),
+            )
+            shutil.copy2(legacy / "host" / "local" / "bin" / "agent-claude", legacy / "bin")
+            shutil.copy2(legacy / "host" / "local" / "bin" / "agent-codex", legacy / "bin")
+            (legacy / "shell").mkdir(exist_ok=True)
+            shutil.copy2(
+                legacy / "host" / "local" / "shell" / "default-invocations.sh",
+                legacy / "shell",
+            )
+            catalog_path = legacy / "system.json"
+            legacy_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            legacy_catalog["skills"] = [
+                skill for skill in legacy_catalog["skills"] if skill["name"] != "release"
+            ]
+            legacy_catalog["skills"].append({"name": "legacy-task", "command": True})
+            legacy_catalog["binaries"] = [
+                binary
+                for binary in legacy_catalog["binaries"]
+                if binary["name"] != "agent-repo-adopt"
+            ]
+            legacy_catalog["binaries"].append(
+                {"name": "legacy-tool", "source": "bin/legacy-tool"}
+            )
+            catalog_path.write_text(json.dumps(legacy_catalog), encoding="utf-8")
+            legacy_skill = legacy / "skills" / "legacy-task"
+            legacy_skill.mkdir()
+            (legacy_skill / "SKILL.md").write_text(
+                "---\nname: legacy-task\ndescription: legacy fixture\n---\n",
+                encoding="utf-8",
+            )
+            legacy_tool = legacy / "bin" / "legacy-tool"
+            legacy_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            legacy_tool.chmod(0o755)
+            subprocess.run(["git", "init", "-q", str(legacy)], check=True)
+            subprocess.run(["git", "-C", str(legacy), "config", "user.name", "Fixture"], check=True)
+            subprocess.run(
+                ["git", "-C", str(legacy), "config", "user.email", "fixture@example.invalid"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(legacy), "add", "-A"], check=True)
+            subprocess.run(["git", "-C", str(legacy), "commit", "-q", "-m", "legacy"], check=True)
+
+            env = {**os.environ, "HOME": str(home)}
+            subprocess.run(
+                [
+                    "bash",
+                    str(legacy / "install.sh"),
+                    "--coordination-repo",
+                    str(legacy),
+                    "--host-integration",
+                    str(legacy),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            (home / ".agents" / "managed-install.json").unlink()
+            settings_path = home / ".claude" / "settings.json"
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings["keepUserSetting"] = True
+            settings_path.write_text(json.dumps(settings), encoding="utf-8")
+            cursor_command = home / ".cursor" / "commands" / "legacy-task.md"
+            legacy_command = cursor_command.read_text(encoding="utf-8")
+            cursor_command.write_text("user-owned replacement\n", encoding="utf-8")
+
+            migrate = [
+                "bash",
+                str(SYSTEM_ROOT / "install.sh"),
+                "--coordination-repo",
+                str(legacy),
+                "--migrate-from-system-root",
+                str(legacy),
+            ]
+            rejected = subprocess.run(migrate, env=env, text=True, capture_output=True, check=False)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("unowned or modified legacy destination", rejected.stderr)
+            self.assertEqual(
+                (home / ".agents" / "AGENTS.md").resolve(),
+                (legacy / "AGENTS.md").resolve(),
+            )
+            cursor_command.write_text(legacy_command, encoding="utf-8")
+
+            ignore_path = legacy / ".gitignore"
+            ignore_path.write_text("ignored-payload.py\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(legacy), "add", ".gitignore"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(legacy), "commit", "-q", "-m", "ignore fixture payload"],
+                check=True,
+            )
+            ignored_dir = legacy_skill / "scripts"
+            ignored_dir.mkdir()
+            ignored_payload = ignored_dir / "ignored-payload.py"
+            ignored_payload.write_text("raise SystemExit(1)\n", encoding="utf-8")
+            rejected_ignored = subprocess.run(
+                migrate, env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(rejected_ignored.returncode, 0)
+            self.assertIn("must be tracked and clean", rejected_ignored.stderr)
+            self.assertEqual(
+                (home / ".agents" / "AGENTS.md").resolve(),
+                (legacy / "AGENTS.md").resolve(),
+            )
+            ignored_payload.unlink()
+            ignored_dir.rmdir()
+
+            subprocess.run(
+                ["git", "-C", str(legacy), "rm", "--cached", "bin/legacy-tool"],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(legacy), "commit", "-q", "-m", "untrack legacy tool"],
+                check=True,
+            )
+            rejected_source = subprocess.run(
+                migrate, env=env, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(rejected_source.returncode, 0)
+            self.assertIn("untracked required files", rejected_source.stderr)
+            self.assertEqual(
+                (home / ".agents" / "AGENTS.md").resolve(),
+                (legacy / "AGENTS.md").resolve(),
+            )
+            subprocess.run(
+                ["git", "-C", str(legacy), "add", "bin/legacy-tool"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(legacy), "commit", "-q", "-m", "track legacy tool"],
+                check=True,
+            )
+
+            migrated = subprocess.run(migrate, env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(migrated.returncode, 0, migrated.stderr)
+            self.assertEqual((home / ".agents" / "AGENTS.md").resolve(), SYSTEM_ROOT / "AGENTS.md")
+            self.assertEqual(
+                (home / ".agents" / "bin" / "agent-codex").resolve(),
+                SYSTEM_ROOT / "host" / "local" / "bin" / "agent-codex",
+            )
+            manifest = json.loads(
+                (home / ".agents" / "managed-install.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["sourceRoot"], str(SYSTEM_ROOT))
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertTrue(settings["keepUserSetting"])
+            self.assertFalse((home / ".agents" / "skills" / "legacy-task").exists())
+            self.assertFalse((home / ".cursor" / "commands" / "legacy-task.md").exists())
+            self.assertFalse((home / ".agents" / "bin" / "legacy-tool").exists())
+            self.assertFalse((home / ".local" / "bin" / "legacy-tool").exists())
+            self.assertEqual(
+                (home / ".agents" / "skills" / "release").resolve(),
+                SYSTEM_ROOT / "skills" / "release",
+            )
+            self.assertEqual(
+                (home / ".agents" / "bin" / "agent-repo-adopt").resolve(),
+                SYSTEM_ROOT / "bin" / "agent-repo-adopt",
+            )
+            doctor = subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-system-doctor"), "--home", str(home)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
 
     def test_installer_wires_all_hosts(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -48,6 +48,18 @@ should keep cross-host lease refs in a different repository. The chosen path is
 recorded locally in `~/.agents/config.json`; it is host state, not project
 memory.
 
+To replace an older cataloged but unmanifested installation, pass its clean
+tracked source explicitly:
+
+```bash
+./install.sh --migrate-from-system-root /path/to/old/system
+```
+
+Migration uses the old source's own `system.json`, retires exact legacy-only
+paths, and accepts only destinations that still match that source tree. An
+altered, untracked, or unrelated path fails the whole preflight without
+changing host configuration.
+
 ## Repository Contract
 
 Product repositories keep one root `AGENTS.md` beginning with:
