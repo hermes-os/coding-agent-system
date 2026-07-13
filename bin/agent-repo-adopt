@@ -109,30 +109,46 @@ def valid_action(content: str) -> bool:
 
 
 def require_published(system_root: Path, repository: str, revision: str) -> None:
-    origin = git(system_root, "config", "--get", "remote.origin.url")
-    if github_repository(origin) != repository:
+    raw_origins = git(system_root, "config", "--get-all", "remote.origin.url").splitlines()
+    effective_origins = git(system_root, "remote", "get-url", "--all", "origin").splitlines()
+    if len(raw_origins) != 1 or github_repository(raw_origins[0]) != repository:
         raise ValueError(f"origin does not match catalog repository {repository}")
-    git(
-        system_root,
-        "fetch",
-        "--quiet",
-        "--prune",
-        "origin",
-        "+refs/heads/*:refs/remotes/origin/*",
-    )
-    containing = git(
-        system_root,
-        "for-each-ref",
-        f"--contains={revision}",
-        "--format=%(refname)",
-        "refs/remotes/origin/",
-    )
-    if not containing:
-        raise ValueError(f"global system revision is not published on origin: {revision}")
+    if len(effective_origins) != 1 or github_repository(effective_origins[0]) != repository:
+        raise ValueError(f"effective origin is rewritten away from catalog repository {repository}")
+
+    namespace = f"refs/agent-system-publication/{os.getpid()}-{revision[:12]}"
     try:
-        action = git(system_root, "show", f"{revision}:action.yml")
-    except ValueError as exc:
-        raise ValueError(f"published revision has no root action.yml: {revision}") from exc
+        git(
+            system_root,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "origin",
+            f"+refs/heads/*:{namespace}/*",
+        )
+        containing = git(
+            system_root,
+            "for-each-ref",
+            f"--contains={revision}",
+            "--format=%(refname)",
+            f"{namespace}/",
+        )
+        if not containing:
+            raise ValueError(f"global system revision is not published on origin: {revision}")
+        try:
+            action = git(system_root, "show", f"{revision}:action.yml")
+        except ValueError as exc:
+            raise ValueError(f"published revision has no root action.yml: {revision}") from exc
+    finally:
+        refs = git(
+            system_root,
+            "for-each-ref",
+            "--format=%(refname)",
+            f"{namespace}/",
+        )
+        for ref in refs.splitlines():
+            if ref:
+                git(system_root, "update-ref", "-d", ref)
     if not valid_action(action):
         raise ValueError(f"published revision has an invalid root action.yml: {revision}")
 

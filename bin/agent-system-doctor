@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tomllib
 
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.codex_config import model_pin_paths
@@ -173,9 +175,25 @@ def main() -> int:
     dispatch = system_root / "hooks" / "dispatch.py"
     if not exact_symlink(agents / "hooks" / "dispatch.py", dispatch):
         errors.append("global hook dispatcher is not linked to the canonical source")
-    launch_defaults = system_root / "shell" / "default-invocations.sh"
-    if not exact_symlink(agents / "shell" / "default-invocations.sh", launch_defaults):
+    config = read_json(agents / "config.json", errors)
+    host_integration_raw = config.get("hostIntegrationRoot")
+    if isinstance(host_integration_raw, str):
+        host_integration = Path(host_integration_raw).expanduser().resolve()
+    else:
+        errors.append("agent hostIntegrationRoot configuration is invalid")
+        host_integration = system_root / "host" / "local"
+    launch_defaults = host_integration / "shell" / "default-invocations.sh"
+    if (
+        not exact_symlink(agents / "shell" / "default-invocations.sh", launch_defaults)
+        or not launch_defaults.is_file()
+        or not os.access(launch_defaults, os.R_OK)
+    ):
         errors.append("default invocation adapter is not linked to the canonical source")
+    for name in ("agent-claude", "agent-codex"):
+        source = host_integration / "bin" / name
+        for binary in (agents / "bin" / name, home / ".local" / "bin" / name):
+            if not exact_symlink(binary, source) or not os.access(binary, os.X_OK):
+                errors.append(f"bad host invocation helper: {binary}")
 
     catalog_skills = {entry["name"]: entry for entry in catalog.get("skills", []) if isinstance(entry, dict)}
     installed_skills = {
@@ -267,7 +285,6 @@ def main() -> int:
     if not isinstance(features, dict) or features.get("memories") is not False:
         errors.append("Codex memories are not disabled")
 
-    config = read_json(agents / "config.json", errors)
     shell_paths = config.get("shellRcPaths")
     if not isinstance(shell_paths, list) or not all(isinstance(path, str) for path in shell_paths):
         errors.append("agent shellRcPaths configuration is invalid")

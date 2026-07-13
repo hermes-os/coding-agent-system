@@ -4,12 +4,18 @@ set -euo pipefail
 
 SYSTEM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COORDINATION_REPO="${AGENT_COORDINATION_REPO_DIR:-}"
+HOST_INTEGRATION="${AGENT_HOST_INTEGRATION_DIR:-$SYSTEM_ROOT/host/local}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --coordination-repo)
       [[ $# -ge 2 ]] || { echo "Error: --coordination-repo requires a path." >&2; exit 2; }
       COORDINATION_REPO=$2
+      shift 2
+      ;;
+    --host-integration)
+      [[ $# -ge 2 ]] || { echo "Error: --host-integration requires a path." >&2; exit 2; }
+      HOST_INTEGRATION=$2
       shift 2
       ;;
     *)
@@ -19,7 +25,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-configure_args=(--system-root "$SYSTEM_ROOT")
+configure_args=(--system-root "$SYSTEM_ROOT" --host-integration "$HOST_INTEGRATION")
 if [[ -n "$COORDINATION_REPO" ]]; then
   configure_args+=(--coordination-repo "$COORDINATION_REPO")
 fi

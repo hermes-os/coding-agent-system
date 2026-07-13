@@ -15,13 +15,16 @@ This repository owns the portable layer:
 - `bin/`: small deterministic helpers for continuity, delivery, review, and
   repository hygiene.
 - `system.json`: the exact managed skill, command, binary, and hook catalog.
-- `install.sh` and `configure-hosts.py`: idempotent host installation.
+- `install.sh` and `configure-hosts.py`: idempotent shared installation plus a
+  caller-selected host integration.
+- `host/local/`: the local-machine invocation defaults for `claude` and
+  `codex`; these are not part of the shared binary catalog.
 - `tests/` and `validate.sh`: portable enforcement.
 
 Product facts and workflows remain in each product repository. VM credentials,
-remote-control startup, and cloud bootstrap behavior belong in
+VM launch behavior, and cloud bootstrap belong in
 `hermes-os/coding-agent-vm-setup`, which pins this repository at an exact Git
-revision.
+revision and supplies its own host integration.
 
 ## Install
 
@@ -34,6 +37,11 @@ agent-system-doctor
 The installer wires the canonical policy and skills into `~/.agents`, Codex,
 Claude Code, and Cursor while preserving unrelated host configuration. Models
 remain task-prompt assignments. Persistent agent memory is disabled.
+
+The default install selects `host/local`, which keeps the requested local
+Remote Control and bypass-permission invocation behavior. Integrations such as
+the VM setup call `install.sh --host-integration /path/to/integration`; the
+shared catalog never owns those launchers.
 
 Use `install.sh --coordination-repo /path/to/git-root` when a host integration
 should keep cross-host lease refs in a different repository. The chosen path is

@@ -7,9 +7,9 @@ export PYTHONDONTWRITEBYTECODE=1
 bash -n \
   "$ROOT/install.sh" \
   "$ROOT/bin/committer" \
-  "$ROOT/bin/agent-claude" \
-  "$ROOT/bin/agent-codex" \
-  "$ROOT/shell/default-invocations.sh"
+  "$ROOT/host/local/bin/agent-claude" \
+  "$ROOT/host/local/bin/agent-codex" \
+  "$ROOT/host/local/shell/default-invocations.sh"
 while IFS= read -r -d '' script; do
   python3 - "$script" <<'PY'
 import ast

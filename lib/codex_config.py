@@ -31,6 +31,7 @@ class Statement:
     start: int
     end: int
     is_array_table: bool = False
+    key_path: tuple[str, ...] = ()
 
 
 def _unescaped(text: str, index: int) -> bool:
@@ -196,7 +197,15 @@ def statements(lines: list[str]) -> list[Statement]:
         end = index + 1
         while end <= len(lines) and not contexts[end - 1].ends_top_level:
             end += 1
-        result.append(Statement("assignment", (*table, *key), index, end))
+        result.append(
+            Statement(
+                "assignment",
+                (*table, *key),
+                index,
+                end,
+                key_path=key,
+            )
+        )
         index = end
     return result
 
@@ -209,37 +218,25 @@ def _remove_spans(lines: list[str], spans: list[tuple[int, int]]) -> list[str]:
     return [line for index, line in enumerate(lines) if not removed[index]]
 
 
-def _obsolete_table(path: tuple[str, ...]) -> bool:
-    if path in {("marketplaces", "karpathy-skills"), ("hooks", "state")}:
-        return True
-    if len(path) > 2 and path[:2] == ("hooks", "state"):
-        return True
-    return len(path) == 2 and path[0] == "plugins" and path[1] in {
-        "andrej-karpathy-skills@karpathy-skills",
-        "claude-code-setup@claude-plugins-official",
-        "claude-md-management@claude-plugins-official",
-        "code-review@claude-plugins-official",
-        "code-simplifier@claude-plugins-official",
-        "superpowers@claude-plugins-official",
-    }
-
-
 def _model_assignment(path: tuple[str, ...]) -> bool:
     return path == ("model",) or (len(path) >= 2 and path[0] == "profiles" and path[-1] == "model")
 
 
 def _strip_owned_values(lines: list[str]) -> list[str]:
     parsed = statements(lines)
-    headers = [statement for statement in parsed if statement.kind == "table"]
     spans: list[tuple[int, int]] = []
     for statement in parsed:
         if statement.kind == "assignment" and _model_assignment(statement.path):
             spans.append((statement.start, statement.end))
-    for index, header in enumerate(headers):
-        if _obsolete_table(header.path):
-            end = headers[index + 1].start if index + 1 < len(headers) else len(lines)
-            spans.append((header.start, end))
-    return _remove_spans(lines, spans)
+    result = _remove_spans(lines, spans)
+    remaining = tomllib.loads("".join(result))
+    pins = model_pin_paths(remaining)
+    if pins:
+        raise ValueError(
+            "cannot safely remove model pins embedded in inline tables: "
+            + ", ".join(pins)
+        )
+    return result
 
 
 def _upsert(lines: list[str], table: tuple[str, ...], key: str, value: str) -> list[str]:
@@ -247,7 +244,12 @@ def _upsert(lines: list[str], table: tuple[str, ...], key: str, value: str) -> l
     parsed = statements(lines)
     for statement in parsed:
         if statement.kind == "assignment" and statement.path == target:
-            return [*lines[: statement.start], f"{key} = {value}\n", *lines[statement.end :]]
+            assignment_key = ".".join(statement.key_path)
+            return [
+                *lines[: statement.start],
+                f"{assignment_key} = {value}\n",
+                *lines[statement.end :],
+            ]
 
     if not table:
         first_header = next(

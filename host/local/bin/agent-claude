@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Standard Claude invocation: remote-controllable interactive sessions with
+# Local Claude invocation: remote-controllable interactive sessions with
 # permissions bypassed. Administrative and noninteractive commands pass through.
 set -euo pipefail
 

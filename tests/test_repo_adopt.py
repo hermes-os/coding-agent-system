@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import runpy
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]
@@ -102,54 +104,79 @@ class RepositoryAdoptTests(unittest.TestCase):
                 ["git", "-C", str(source), "config", "remote.origin.url", canonical_url],
                 check=True,
             )
+            rewrite_key = f"url.file://{remote}.insteadOf"
             subprocess.run(
                 [
                     "git",
                     "-C",
                     str(source),
                     "config",
-                    f"url.file://{remote}.insteadOf",
+                    rewrite_key,
                     canonical_url,
                 ],
                 check=True,
             )
-            with self.assertRaisesRegex(ValueError, "no root action.yml"):
+            with self.assertRaisesRegex(ValueError, "effective origin is rewritten"):
                 require_published(source, repository, no_action)
-
-            (source / "action.yml").write_text(
-                "name: Fixture\ndescription: Fixture action\nruns:\n  using: composite\n  steps: []\n",
+            subprocess.run(
+                ["git", "-C", str(source), "config", "--unset-all", rewrite_key],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(source), "config", "remote.origin.url", "git@github.com:hermes-os/coding-agent-system.git"],
+                check=True,
+            )
+            ssh = base / "fixture-ssh"
+            ssh.write_text(
+                '#!/usr/bin/env bash\nexec git-upload-pack "$AGENT_TEST_REMOTE"\n',
                 encoding="utf-8",
             )
-            subprocess.run(["git", "-C", str(source), "add", "action.yml"], check=True)
-            subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "add action"], check=True)
-            published = subprocess.run(
-                ["git", "-C", str(source), "rev-parse", "HEAD"],
-                text=True,
-                capture_output=True,
-                check=True,
-            ).stdout.strip()
-            subprocess.run(["git", "-C", str(source), "push", "-q", "origin", "main"], check=True)
-            require_published(source, repository, published)
+            ssh.chmod(0o755)
 
-            (source / "README.md").write_text("unpublished\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True)
-            subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "unpublished"], check=True)
-            unpublished = subprocess.run(
-                ["git", "-C", str(source), "rev-parse", "HEAD"],
-                text=True,
-                capture_output=True,
-                check=True,
-            ).stdout.strip()
-            secondary = base / "secondary.git"
-            subprocess.run(["git", "init", "-q", "--bare", str(secondary)], check=True)
-            subprocess.run(["git", "-C", str(source), "remote", "add", "secondary", str(secondary)], check=True)
-            subprocess.run(["git", "-C", str(source), "push", "-q", "secondary", "main"], check=True)
-            subprocess.run(
-                ["git", "-C", str(source), "update-ref", "refs/remotes/origin/stale", unpublished],
-                check=True,
-            )
-            with self.assertRaisesRegex(ValueError, "not published on origin"):
-                require_published(source, repository, unpublished)
+            with mock.patch.dict(
+                os.environ,
+                {"GIT_SSH_COMMAND": str(ssh), "AGENT_TEST_REMOTE": str(remote)},
+            ):
+                with self.assertRaisesRegex(ValueError, "no root action.yml"):
+                    require_published(source, repository, no_action)
+
+                (source / "action.yml").write_text(
+                    "name: Fixture\ndescription: Fixture action\nruns:\n  using: composite\n  steps: []\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(["git", "-C", str(source), "add", "action.yml"], check=True)
+                subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "add action"], check=True)
+                published = subprocess.run(
+                    ["git", "-C", str(source), "rev-parse", "HEAD"],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip()
+                subprocess.run(
+                    ["git", "-C", str(source), "push", "-q", str(remote), "main"],
+                    check=True,
+                )
+                require_published(source, repository, published)
+
+                (source / "README.md").write_text("unpublished\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(source), "add", "README.md"], check=True)
+                subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "unpublished"], check=True)
+                unpublished = subprocess.run(
+                    ["git", "-C", str(source), "rev-parse", "HEAD"],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip()
+                secondary = base / "secondary.git"
+                subprocess.run(["git", "init", "-q", "--bare", str(secondary)], check=True)
+                subprocess.run(["git", "-C", str(source), "remote", "add", "secondary", str(secondary)], check=True)
+                subprocess.run(["git", "-C", str(source), "push", "-q", "secondary", "main"], check=True)
+                subprocess.run(
+                    ["git", "-C", str(source), "update-ref", "refs/remotes/origin/stale", unpublished],
+                    check=True,
+                )
+                with self.assertRaisesRegex(ValueError, "not published on origin"):
+                    require_published(source, repository, unpublished)
 
             subprocess.run(
                 ["git", "-C", str(source), "config", "remote.origin.url", "git@github.com:someone/fork.git"],

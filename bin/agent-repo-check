@@ -133,7 +133,15 @@ def check_plan(path: Path) -> list[str]:
 
 
 def run_check(command: list[str], label: str) -> str | None:
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
     if result.returncode == 0:
         return None
     detail = result.stderr.strip() or result.stdout.strip()
@@ -206,34 +214,33 @@ def main() -> int:
         tracked = []
         untracked = []
     for path in tracked:
-        candidate = repo / path
-        if candidate.exists() or candidate.is_symlink():
-            errors.extend(path_errors(path))
+        errors.extend(path_errors(path))
     for path in untracked:
         for problem in path_errors(path):
             warnings.append(problem.replace("tracked ", "untracked ", 1))
 
     docs = repo / "docs"
-    if docs.is_dir():
-        doc_symlinks = symlinks_beneath(docs)
-        if doc_symlinks:
-            errors.extend(f"documentation path must not be a symlink: {path}" for path in doc_symlinks)
-        else:
-            problem = run_check(
-                [str(system_root / "bin" / "docs-list"), "--check", str(repo)],
-                "documentation metadata check",
-            )
-            if problem:
-                errors.append(problem)
+    doc_symlinks = symlinks_beneath(docs)
+    if doc_symlinks:
+        errors.extend(f"documentation path must not be a symlink: {path}" for path in doc_symlinks)
+    elif docs.is_dir():
+        problem = run_check(
+            [str(system_root / "bin" / "docs-list"), "--check", str(repo)],
+            "documentation metadata check",
+        )
+        if problem:
+            errors.append(problem)
     plan_root = docs / "plan"
-    if plan_root.is_dir() and not symlinks_beneath(docs):
+    if plan_root.is_dir() and not doc_symlinks:
         for plan in sorted(plan_root.glob("*.md")):
             errors.extend(check_plan(plan))
 
     skill_root = repo / ".agents" / "skills"
-    if skill_root.is_dir():
-        ancestor = symlinked_ancestor(repo, skill_root)
-        skill_symlinks = symlinks_beneath(skill_root) if ancestor is None else [ancestor]
+    ancestor = symlinked_ancestor(repo, skill_root)
+    if ancestor is not None:
+        errors.append(f"repository skill path must not be a symlink: {ancestor}")
+    elif skill_root.is_dir():
+        skill_symlinks = symlinks_beneath(skill_root)
         if skill_symlinks:
             errors.extend(f"repository skill path must not be a symlink: {path}" for path in skill_symlinks)
         else:

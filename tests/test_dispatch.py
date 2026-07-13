@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -117,7 +119,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(response["decision"], "block")
         self.assertIn("unknown keys", response["reason"])
 
-    def test_hooks_only_and_nested_skill_layouts_fail_closed(self):
+    def test_hooks_only_skill_layout_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             hooks_only = root / ".agents" / "skills" / "hooks-only"
@@ -129,16 +131,150 @@ class DispatchTests(unittest.TestCase):
             result = self.run_dispatch(root, "claude", "Stop")
             self.assertIn("adjacent SKILL.md", json.loads(result.stdout)["reason"])
 
+    def test_repository_symlinked_roots_owners_and_executables_fail_before_execution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "repo"
+            external = base / "external"
+            root.mkdir()
+            external.mkdir()
+            self.repo_with_blocking_hook(external)
+            (root / ".agents").symlink_to(external / ".agents", target_is_directory=True)
+            result = self.run_dispatch(root, "claude", "Stop")
+            reason = json.loads(result.stdout)["reason"]
+            self.assertIn("repository skill path must not be a symlink", reason)
+            self.assertNotIn("retry this", reason)
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "repo"
+            external = base / "external"
+            root.mkdir()
+            self.repo_with_blocking_hook(external)
+            skill_root = root / ".agents" / "skills"
+            skill_root.mkdir(parents=True)
+            (skill_root / "example").symlink_to(
+                external / ".agents" / "skills" / "example",
+                target_is_directory=True,
+            )
+            result = self.run_dispatch(root, "claude", "Stop")
+            reason = json.loads(result.stdout)["reason"]
+            self.assertIn("repository skill owner must not be a symlink", reason)
+            self.assertNotIn("retry this", reason)
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "repo"
+            root.mkdir()
+            self.repo_with_blocking_hook(root)
+            skill = root / ".agents" / "skills" / "example"
+            external = base / "external.py"
+            external.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            external.chmod(0o755)
+            (skill / "block.py").unlink()
+            (skill / "block.py").symlink_to(external)
+            result = self.run_dispatch(root, "claude", "Stop")
+            reason = json.loads(result.stdout)["reason"]
+            self.assertIn("executable path must not be a symlink", reason)
+
+    def test_discovery_time_counts_against_the_event_deadline(self):
+        functions = runpy.run_path(str(DISPATCH))
+        schedule = functions["scheduled_hooks"]
+        globals_ = schedule.__globals__
+        original = globals_["hook_manifests"]
+
+        def delayed_discovery(_root: Path):
+            time.sleep(0.03)
+            return []
+
+        globals_["hook_manifests"] = delayed_discovery
+        try:
+            with self.assertRaisesRegex(TimeoutError, "skill discovery"):
+                schedule(
+                    Path.cwd(),
+                    "Stop",
+                    {"Stop"},
+                    {"Stop": 1},
+                    time.monotonic() + 0.01,
+                )
+        finally:
+            globals_["hook_manifests"] = original
+
+    def test_timeout_terminates_forked_hook_descendants(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            nested = root / ".agents" / "skills" / "group" / "nested"
-            nested.mkdir(parents=True)
-            (nested / "SKILL.md").write_text(
-                "---\nname: nested\ndescription: Nested fixture.\n---\n",
+            skill = root / ".agents" / "skills" / "forking"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: forking\ndescription: Forking hook fixture.\n---\n",
+                encoding="utf-8",
+            )
+            hook = skill / "fork.py"
+            hook.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "marker = Path(os.environ['AGENT_PROJECT_DIR']) / 'descendant-wrote'\n"
+                "code = \"import sys,time; from pathlib import Path; time.sleep(1.4); Path(sys.argv[1]).write_text('leaked')\"\n"
+                "subprocess.Popen([sys.executable, '-c', code, str(marker)])\n"
+                "time.sleep(10)\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            (skill / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "events": {
+                            "Stop": [{"command": ["fork.py"], "timeoutSeconds": 1}]
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
             result = self.run_dispatch(root, "claude", "Stop")
-            self.assertIn("direct children", json.loads(result.stdout)["reason"])
+            response = json.loads(result.stdout)
+            self.assertIn("runtime budget", response["reason"])
+            time.sleep(0.7)
+            self.assertFalse((root / "descendant-wrote").exists())
+
+    def test_hook_output_is_bounded_and_flooding_process_is_terminated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            skill = root / ".agents" / "skills" / "flood"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: flood\ndescription: Output flood fixture.\n---\n",
+                encoding="utf-8",
+            )
+            hook = skill / "flood.py"
+            hook.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "chunk = b'x' * 65536\n"
+                "while True:\n"
+                "    os.write(1, chunk)\n"
+                "    os.write(2, chunk)\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            (skill / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "events": {
+                            "Stop": [{"command": ["flood.py"], "timeoutSeconds": 20}]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            started = time.monotonic()
+            result = self.run_dispatch(root, "claude", "Stop")
+            elapsed = time.monotonic() - started
+            response = json.loads(result.stdout)
+            self.assertIn("hook output exceeds", response["reason"])
+            self.assertLess(elapsed, 10)
 
     def test_aggregate_event_budget_fails_before_any_hook_runs(self):
         with tempfile.TemporaryDirectory() as temp:

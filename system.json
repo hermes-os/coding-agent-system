@@ -26,8 +26,6 @@
   "binaries": [
     {"name": "agent-autoreview", "source": "skills/review/scripts/agent-autoreview.py"},
     {"name": "agent-capabilities", "source": "skills/capabilities/scripts/agent-capabilities.py"},
-    {"name": "agent-claude", "source": "bin/agent-claude"},
-    {"name": "agent-codex", "source": "bin/agent-codex"},
     {"name": "agent-docs-list", "source": "bin/docs-list"},
     {"name": "agent-lease", "source": "skills/portfolio/scripts/agent-lease.py"},
     {"name": "agent-repo-adopt", "source": "bin/agent-repo-adopt"},

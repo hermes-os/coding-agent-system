@@ -140,6 +140,35 @@ class RepositoryCheckTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(any("repository skill path" in error for error in report["errors"]))
 
+    def test_rejects_dangling_document_and_skill_root_symlinks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "repo"
+            root.mkdir()
+            self.init_repo(root)
+            (root / "docs").symlink_to(base / "missing-docs", target_is_directory=True)
+            (root / ".agents").symlink_to(base / "missing-agents", target_is_directory=True)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            joined = "\n".join(report["errors"])
+            self.assertIn("documentation path must not be a symlink", joined)
+            self.assertIn("repository skill path must not be a symlink", joined)
+
+    def test_deleted_tracked_credential_path_still_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            secret = root / ".env.production"
+            secret.write_text("SECRET=value\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-Af"], check=True)
+            secret.unlink()
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(
+                any("tracked credential-shaped file: .env.production" in error for error in report["errors"])
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

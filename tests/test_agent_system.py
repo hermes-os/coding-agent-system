@@ -34,6 +34,9 @@ class AgentSystemTests(unittest.TestCase):
             ],
         )
         self.assertEqual([entry["name"] for entry in catalog["skills"]], [path.name for path in skills])
+        binary_names = {entry["name"] for entry in catalog["binaries"]}
+        self.assertNotIn("agent-claude", binary_names)
+        self.assertNotIn("agent-codex", binary_names)
         for skill in skills:
             text = (skill / "SKILL.md").read_text(encoding="utf-8")
             self.assertTrue(text.startswith("---\n"), skill)
@@ -211,7 +214,7 @@ class AgentSystemTests(unittest.TestCase):
             self.assertIn('sandbox_mode = "danger-full-access"', updated)
             self.assertIn('approval_policy = "never"', updated)
             self.assertIn("memories = false", updated)
-            self.assertNotIn("code-review@claude-plugins-official", updated)
+            self.assertIn("code-review@claude-plugins-official", updated)
             self.assertIn('[projects."/workspace"]', updated)
             self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
             self.assertEqual(tomllib.loads(updated)["notices"][0]["name"], "preserve array table")
@@ -220,7 +223,14 @@ class AgentSystemTests(unittest.TestCase):
             self.assertNotIn("model", settings)
             self.assertEqual(settings["env"]["KEEP_ME"], "yes")
             self.assertNotIn("ANTHROPIC_DEFAULT_OPUS_MODEL", settings["env"])
-            self.assertEqual(settings["enabledPlugins"], {"useful": True})
+            self.assertEqual(
+                settings["enabledPlugins"],
+                {
+                    "code-review@claude-plugins-official": True,
+                    "unused": False,
+                    "useful": True,
+                },
+            )
             self.assertFalse(settings["autoMemoryEnabled"])
             self.assertEqual(settings["permissions"]["defaultMode"], "bypassPermissions")
             self.assertEqual(settings["permissions"]["allow"], ["Read"])
@@ -235,7 +245,13 @@ class AgentSystemTests(unittest.TestCase):
             self.assertIn("custom-cursor-stop", json.dumps(updated_cursor_hooks["hooks"]))
             self.assertIn("afterFileEdit", updated_cursor_hooks["hooks"])
             known = json.loads((plugins / "known_marketplaces.json").read_text(encoding="utf-8"))
-            self.assertEqual(known, {"useful": {"source": "keep"}})
+            self.assertEqual(
+                known,
+                {
+                    "karpathy-skills": {"source": "legacy"},
+                    "useful": {"source": "keep"},
+                },
+            )
             self.assertTrue((home / ".cursor" / "rules" / "global-engineering.mdc").is_file())
 
     def test_host_config_repairs_non_object_claude_env(self):
@@ -253,6 +269,151 @@ class AgentSystemTests(unittest.TestCase):
 
             updated = json.loads(settings.read_text(encoding="utf-8"))
             self.assertEqual(updated["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"], "1")
+
+    def test_codex_toml_handles_dotted_features_and_fails_safely_on_inline_model_pins(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                'features."memories" = true\n'
+                'profiles.fast.model = "pinned"\n'
+                'profiles.fast.model_reasoning_effort = "high"\n'
+                'keep = "yes"\n',
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            values = tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertIs(values["features"]["memories"], False)
+            self.assertNotIn("memories", values)
+            self.assertEqual(values["keep"], "yes")
+            self.assertNotIn("model", values["profiles"]["fast"])
+            self.assertEqual(values["profiles"]["fast"]["model_reasoning_effort"], "high")
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            config = home / ".codex" / "config.toml"
+            config.parent.mkdir(parents=True)
+            original = 'profiles.fast = { model = "pinned", model_reasoning_effort = "high" }\n'
+            config.write_text(original, encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("inline tables", result.stderr)
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+            self.assertFalse((home / ".agents" / "AGENTS.md").exists())
+
+    def test_installer_refuses_symlinked_shell_json_and_toml_configuration(self):
+        cases = (
+            (Path(".zshrc"), "# keep shell\n"),
+            (Path(".claude/settings.json"), "{}\n"),
+            (Path(".codex/config.toml"), 'keep = "yes"\n'),
+        )
+        for relative, original in cases:
+            with self.subTest(path=str(relative)), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp)
+                home = base / "home"
+                home.mkdir()
+                target = base / "managed-dotfile"
+                target.write_text(original, encoding="utf-8")
+                destination = home / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.symlink_to(target)
+                result = subprocess.run(
+                    ["bash", str(SYSTEM_ROOT / "install.sh")],
+                    env={**os.environ, "HOME": str(home)},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Host-configuration preflight failed", result.stderr)
+                self.assertTrue(destination.is_symlink())
+                self.assertEqual(target.read_text(encoding="utf-8"), original)
+                self.assertFalse((home / ".agents" / "AGENTS.md").exists())
+
+    def test_installer_wires_an_explicit_host_integration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            home = base / "home"
+            integration = base / "vm-host"
+            home.mkdir()
+            (integration / "bin").mkdir(parents=True)
+            (integration / "shell").mkdir()
+            for name in ("agent-claude", "agent-codex"):
+                helper = integration / "bin" / name
+                helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                helper.chmod(0o755)
+            shell_adapter = integration / "shell" / "default-invocations.sh"
+            shell_adapter.write_text(
+                "claude() { :; }\ncodex() { :; }\n",
+                encoding="utf-8",
+            )
+            shell_rc = home / ".zshrc"
+            shell_rc.write_text("# keep local shell config\n", encoding="utf-8")
+            shell_adapter.chmod(0)
+            rejected = subprocess.run(
+                [
+                    "bash",
+                    str(SYSTEM_ROOT / "install.sh"),
+                    "--host-integration",
+                    str(integration),
+                ],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("not readable", rejected.stderr)
+            self.assertEqual(shell_rc.read_text(encoding="utf-8"), "# keep local shell config\n")
+            self.assertFalse((home / ".agents" / "AGENTS.md").exists())
+            shell_adapter.chmod(0o644)
+            subprocess.run(
+                [
+                    "bash",
+                    str(SYSTEM_ROOT / "install.sh"),
+                    "--host-integration",
+                    str(integration),
+                ],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            config = json.loads((home / ".agents" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(Path(config["hostIntegrationRoot"]), integration.resolve())
+            self.assertEqual(
+                (home / ".agents" / "bin" / "agent-codex").resolve(),
+                (integration / "bin" / "agent-codex").resolve(),
+            )
+            doctor = subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-system-doctor"), "--home", str(home)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            shell_adapter.unlink()
+            damaged = subprocess.run(
+                [str(SYSTEM_ROOT / "bin" / "agent-system-doctor"), "--home", str(home)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(damaged.returncode, 0)
+            self.assertIn("default invocation adapter", damaged.stderr)
 
     def test_installer_wires_all_hosts(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -290,11 +451,11 @@ class AgentSystemTests(unittest.TestCase):
             )
             self.assertEqual(
                 (home / ".local" / "bin" / "agent-claude").resolve(),
-                SYSTEM_ROOT / "bin" / "agent-claude",
+                SYSTEM_ROOT / "host" / "local" / "bin" / "agent-claude",
             )
             self.assertEqual(
                 (home / ".local" / "bin" / "agent-codex").resolve(),
-                SYSTEM_ROOT / "bin" / "agent-codex",
+                SYSTEM_ROOT / "host" / "local" / "bin" / "agent-codex",
             )
             self.assertEqual(
                 (home / ".local" / "bin" / "agent-skill-audit").resolve(),
@@ -340,8 +501,12 @@ class AgentSystemTests(unittest.TestCase):
             )
             self.assertEqual(managed["sourceRoot"], str(SYSTEM_ROOT))
             self.assertEqual(managed["orphanedPaths"], [])
+            self.assertEqual(
+                Path(config["hostIntegrationRoot"]),
+                SYSTEM_ROOT / "host" / "local",
+            )
 
-    def test_standard_launchers_add_remote_control_only_to_interactive_work(self):
+    def test_local_launchers_add_remote_control_only_to_interactive_work(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             log = root / "calls.log"
@@ -361,22 +526,22 @@ class AgentSystemTests(unittest.TestCase):
             }
 
             subprocess.run(
-                [str(SYSTEM_ROOT / "bin" / "agent-claude"), "fix it"],
+                [str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-claude"), "fix it"],
                 env=env,
                 check=True,
             )
             subprocess.run(
-                [str(SYSTEM_ROOT / "bin" / "agent-claude"), "doctor"],
+                [str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-claude"), "doctor"],
                 env=env,
                 check=True,
             )
             subprocess.run(
-                [str(SYSTEM_ROOT / "bin" / "agent-codex"), "fix it"],
+                [str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-codex"), "fix it"],
                 env=env,
                 check=True,
             )
             subprocess.run(
-                [str(SYSTEM_ROOT / "bin" / "agent-codex"), "doctor"],
+                [str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-codex"), "doctor"],
                 env=env,
                 check=True,
             )

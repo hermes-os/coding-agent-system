@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
+
 from lib.codex_config import edit_codex_config
 from lib.host_contract import (
     cursor_rule,
@@ -21,20 +23,6 @@ from lib.host_contract import (
     is_managed_dispatch_command,
 )
 
-
-LEGACY_CODEX_PLUGINS = {
-    "andrej-karpathy-skills@karpathy-skills",
-    "claude-code-setup@claude-plugins-official",
-    "claude-md-management@claude-plugins-official",
-    "code-review@claude-plugins-official",
-    "code-simplifier@claude-plugins-official",
-    "superpowers@claude-plugins-official",
-}
-
-LEGACY_CLAUDE_PLUGINS = LEGACY_CODEX_PLUGINS | {
-    "coderabbit@claude-plugins-official",
-    "ralph-loop@claude-plugins-official",
-}
 
 CLAUDE_MODEL_ENV_KEYS = {
     "ANTHROPIC_MODEL",
@@ -57,14 +45,21 @@ SHELL_BLOCK = (
 
 
 def atomic_write(path, content, mode=0o644):
+    if path.is_symlink():
+        raise SystemExit(f"Refusing to replace symlinked configuration file: {path}")
     if path.exists():
         mode = stat.S_IMODE(path.stat().st_mode)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as handle:
         handle.write(content)
         temp = Path(handle.name)
-    temp.chmod(mode)
-    temp.replace(path)
+    try:
+        temp.chmod(mode)
+        if path.is_symlink():
+            raise SystemExit(f"Refusing to replace symlinked configuration file: {path}")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def read_json(path):
@@ -122,15 +117,43 @@ def resolve_coordination_repo(system_root, agents_home, explicit):
     return root
 
 
-def configure_agent_home(agents_home, coordination_repo, shell_rc_paths):
+def configure_agent_home(agents_home, coordination_repo, host_integration, shell_rc_paths):
     path = agents_home / "config.json"
     config = read_json(path)
     config["coordinationRepo"] = str(coordination_repo)
+    config["hostIntegrationRoot"] = str(host_integration)
     config["shellRcPaths"] = [str(path) for path in shell_rc_paths]
     write_json(path, config)
 
 
-def managed_entries(home, agents_home, system_root, catalog, policy):
+def resolve_host_integration(system_root, explicit):
+    root = (explicit or system_root / "host" / "local").expanduser().resolve()
+    required = (
+        root / "bin" / "agent-claude",
+        root / "bin" / "agent-codex",
+        root / "shell" / "default-invocations.sh",
+    )
+    missing = [path for path in required if not path.is_file()]
+    symlinks = [path for path in required if path.is_symlink()]
+    non_executable = [path for path in required[:2] if path.is_file() and not os.access(path, os.X_OK)]
+    shell_adapter = required[2]
+    unreadable = (
+        [shell_adapter]
+        if shell_adapter.is_file() and not os.access(shell_adapter, os.R_OK)
+        else []
+    )
+    if missing or symlinks or non_executable or unreadable:
+        problems = [
+            *(f"missing {path}" for path in missing),
+            *(f"symlinked source {path}" for path in symlinks),
+            *(f"not executable {path}" for path in non_executable),
+            *(f"not readable {path}" for path in unreadable),
+        ]
+        raise SystemExit("Invalid host integration:\n" + "\n".join(f"- {problem}" for problem in problems))
+    return root
+
+
+def managed_entries(home, agents_home, system_root, host_integration, catalog, policy):
     entries = {}
 
     def symlink(path, target):
@@ -154,7 +177,7 @@ def managed_entries(home, agents_home, system_root, catalog, policy):
     symlink(agents_home / "hooks" / "dispatch.py", system_root / "hooks" / "dispatch.py")
     symlink(
         agents_home / "shell" / "default-invocations.sh",
-        system_root / "shell" / "default-invocations.sh",
+        host_integration / "shell" / "default-invocations.sh",
     )
     for adapter in (
         home / ".codex" / "AGENTS.md",
@@ -169,6 +192,11 @@ def managed_entries(home, agents_home, system_root, catalog, policy):
             agents_home / "bin" / binary["name"],
             home / ".local" / "bin" / binary["name"],
         ):
+            symlink(destination, source)
+
+    for name in ("agent-claude", "agent-codex"):
+        source = host_integration / "bin" / name
+        for destination in (agents_home / "bin" / name, home / ".local" / "bin" / name):
             symlink(destination, source)
 
     for skill in catalog.get("skills", []):
@@ -367,6 +395,44 @@ def merge_cursor_hooks(existing, expected):
     return merged
 
 
+def preflight_configuration_paths(paths):
+    symlinks = sorted(path for path in paths if path.is_symlink())
+    if symlinks:
+        detail = "\n".join(f"- {path}" for path in symlinks)
+        raise SystemExit(
+            "Host-configuration preflight failed; no host configuration changed. "
+            f"Replace or retarget these symlinks explicitly:\n{detail}"
+        )
+
+
+def preflight_host_documents(home, budgets, shell_paths):
+    codex_config = home / ".codex" / "config.toml"
+    text = codex_config.read_text(encoding="utf-8") if codex_config.exists() else ""
+    try:
+        edit_codex_config(text)
+    except ValueError as exc:
+        raise SystemExit(f"Cannot safely update {codex_config}: {exc}") from exc
+
+    claude = read_json(home / ".claude" / "settings.json")
+    merge_grouped_hooks(
+        claude.get("hooks"), expected_grouped_hooks("claude", budgets), "Claude"
+    )
+    codex = read_json(home / ".codex" / "hooks.json")
+    merge_grouped_hooks(codex.get("hooks"), expected_grouped_hooks("codex", budgets), "Codex")
+    cursor_path = home / ".cursor" / "hooks.json"
+    cursor = read_json(cursor_path)
+    version = cursor.get("version")
+    if version not in (None, 1):
+        raise SystemExit(f"Unsupported Cursor hook schema version in {cursor_path}: {version}")
+    merge_cursor_hooks(cursor.get("hooks"), expected_cursor_hooks(budgets))
+    for path in shell_paths:
+        if path.exists():
+            try:
+                path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise SystemExit(f"Cannot safely update shell startup file {path}: {exc}") from exc
+
+
 def configure_claude(home, budgets):
     path = home / ".claude" / "settings.json"
     settings = read_json(path)
@@ -389,21 +455,7 @@ def configure_claude(home, budgets):
     settings["hooks"] = merge_grouped_hooks(
         settings.get("hooks"), expected_grouped_hooks("claude", budgets), "Claude"
     )
-    enabled = settings.get("enabledPlugins")
-    if isinstance(enabled, dict):
-        for plugin, is_enabled in list(enabled.items()):
-            if plugin in LEGACY_CLAUDE_PLUGINS or is_enabled is not True:
-                enabled.pop(plugin, None)
-    marketplaces = settings.get("extraKnownMarketplaces")
-    if isinstance(marketplaces, dict):
-        marketplaces.pop("karpathy-skills", None)
     write_json(path, settings)
-
-    marketplace_path = home / ".claude" / "plugins" / "known_marketplaces.json"
-    if marketplace_path.exists():
-        known_marketplaces = read_json(marketplace_path)
-        known_marketplaces.pop("karpathy-skills", None)
-        write_json(marketplace_path, known_marketplaces)
 
 
 def configure_codex_hooks(home, budgets):
@@ -438,7 +490,10 @@ def configure_shell_rc(path):
 
 def shell_rc_paths(home):
     login_candidates = [home / ".bash_profile", home / ".bash_login", home / ".profile"]
-    login = next((path for path in login_candidates if path.exists()), login_candidates[0])
+    login = next(
+        (path for path in login_candidates if path.exists() or path.is_symlink()),
+        login_candidates[0],
+    )
     return [home / ".zshrc", home / ".bashrc", login]
 
 
@@ -459,11 +514,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system-root", required=True, type=Path)
     parser.add_argument("--coordination-repo", type=Path)
+    parser.add_argument("--host-integration", type=Path)
     args = parser.parse_args()
     home = Path(os.environ.get("HOME", "~")).expanduser().resolve()
     system_root = args.system_root.expanduser().resolve()
     agents_home = Path(os.environ.get("AGENTS_HOME", home / ".agents")).expanduser().resolve()
     catalog = load_catalog(system_root)
+    host_integration = resolve_host_integration(system_root, args.host_integration)
     try:
         budgets = hook_budgets(catalog)
     except ValueError as exc:
@@ -471,7 +528,20 @@ def main():
     coordination_repo = resolve_coordination_repo(system_root, agents_home, args.coordination_repo)
     policy = (system_root / "AGENTS.md").read_text(encoding="utf-8")
     manifest_path = agents_home / "managed-install.json"
-    entries = managed_entries(home, agents_home, system_root, catalog, policy)
+    selected_shell_rc_paths = shell_rc_paths(home)
+    configuration_paths = (
+        home / ".codex" / "config.toml",
+        home / ".claude" / "settings.json",
+        home / ".codex" / "hooks.json",
+        home / ".cursor" / "hooks.json",
+        agents_home / "config.json",
+        manifest_path,
+        *selected_shell_rc_paths,
+    )
+    preflight_configuration_paths(configuration_paths)
+    entries = managed_entries(
+        home, agents_home, system_root, host_integration, catalog, policy
+    )
     allowed_roots = (
         agents_home,
         home / ".codex",
@@ -480,16 +550,18 @@ def main():
         home / ".local" / "bin",
     )
     preflight_managed(manifest_path, entries, allowed_roots)
+    preflight_host_documents(home, budgets, selected_shell_rc_paths)
 
     configure_codex_toml(home)
     configure_claude(home, budgets)
     configure_codex_hooks(home, budgets)
     configure_cursor(home, budgets)
-    selected_shell_rc_paths = shell_rc_paths(home)
     for path in selected_shell_rc_paths:
         configure_shell_rc(path)
     install_managed(entries)
-    configure_agent_home(agents_home, coordination_repo, selected_shell_rc_paths)
+    configure_agent_home(
+        agents_home, coordination_repo, host_integration, selected_shell_rc_paths
+    )
     orphaned = prune_stale_managed(manifest_path, entries, allowed_roots)
     write_json(
         manifest_path,
