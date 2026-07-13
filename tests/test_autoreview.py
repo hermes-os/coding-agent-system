@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]
@@ -63,16 +64,23 @@ class AutoreviewTests(unittest.TestCase):
             root = Path(temp)
             base, head = self.make_repo(root)
             bundle = root / ".review-bundle"
-            prepared = run(
-                "prepare",
-                "--base",
-                base,
-                "--intent",
-                "Return the updated value",
-                "--out",
-                str(bundle),
-                cwd=root,
-            )
+            hostile_pathspec_environment = {
+                "GIT_LITERAL_PATHSPECS": "1",
+                "GIT_GLOB_PATHSPECS": "1",
+                "GIT_NOGLOB_PATHSPECS": "1",
+                "GIT_ICASE_PATHSPECS": "1",
+            }
+            with mock.patch.dict(os.environ, hostile_pathspec_environment):
+                prepared = run(
+                    "prepare",
+                    "--base",
+                    base,
+                    "--intent",
+                    "Return the updated value",
+                    "--out",
+                    str(bundle),
+                    cwd=root,
+                )
             self.assertEqual(Path(prepared.stdout.strip()), bundle.resolve())
             manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["head_sha"], head)
@@ -122,6 +130,195 @@ class AutoreviewTests(unittest.TestCase):
             invalid["findings"][0] = {**finding, "file": "app.py", "line": True}
             with self.assertRaisesRegex(module.ReviewError, "positive line"):
                 module.validate_result(manifest, invalid)
+
+    def test_gitlink_snapshots_validate_without_materializing_submodule(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+
+            def prepare_and_validate(label, base_sha, intent):
+                bundle = base / f"review-{label}"
+                run(
+                    "prepare",
+                    "--base",
+                    base_sha,
+                    "--intent",
+                    intent,
+                    "--out",
+                    str(bundle),
+                    cwd=root,
+                )
+                manifest = json.loads(
+                    (bundle / "manifest.json").read_text(encoding="utf-8")
+                )
+                result = json.loads(
+                    (bundle / "result-template.json").read_text(encoding="utf-8")
+                )
+                result["reviewer_provenance"] = "independent fixture reviewer"
+                result_path = bundle / "result.json"
+                result_path.write_text(json.dumps(result), encoding="utf-8")
+                run(
+                    "validate",
+                    "--bundle",
+                    str(bundle),
+                    "--result",
+                    str(result_path),
+                    cwd=root,
+                )
+                return bundle, manifest
+
+            shared = base / "shared"
+            shared.mkdir()
+            git(shared, "init")
+            git(shared, "config", "user.name", "Fixture")
+            git(shared, "config", "user.email", "fixture@example.test")
+            (shared / "README.md").write_text("shared\n", encoding="utf-8")
+            git(shared, "add", "README.md")
+            git(shared, "commit", "-m", "shared initial")
+            shared_sha = git(shared, "rev-parse", "HEAD")
+
+            root = base / "superproject"
+            root.mkdir()
+            git(root, "init")
+            git(root, "config", "user.name", "Fixture")
+            git(root, "config", "user.email", "fixture@example.test")
+            git(root, "remote", "add", "origin", "https://github.com/example/vm-fixture.git")
+            (root / "README.md").write_text("vm\n", encoding="utf-8")
+            git(root, "add", "README.md")
+            git(root, "commit", "-m", "initial")
+            initial = git(root, "rev-parse", "HEAD")
+            magic_path = ":(exclude)module"
+            git(
+                root,
+                "--literal-pathspecs",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(shared),
+                magic_path,
+            )
+            git(root, "commit", "-m", "pin shared system")
+            pinned = git(root, "rev-parse", "HEAD")
+
+            bundle, manifest = prepare_and_validate(
+                "add", initial, "Pin the shared system"
+            )
+            snapshots = {snapshot["path"]: snapshot for snapshot in manifest["snapshots"]}
+            self.assertEqual(
+                snapshots[magic_path],
+                {
+                    "path": magic_path,
+                    "gitlink": True,
+                    "commit": shared_sha,
+                    "lines": 1,
+                },
+            )
+            self.assertFalse((bundle / "files" / magic_path).exists())
+
+            (shared / "README.md").write_text("shared v2\n", encoding="utf-8")
+            git(shared, "add", "README.md")
+            git(shared, "commit", "-m", "shared update")
+            updated_shared_sha = git(shared, "rev-parse", "HEAD")
+            git(root / magic_path, "fetch", "origin")
+            git(root / magic_path, "checkout", updated_shared_sha)
+            git(root, "--literal-pathspecs", "add", "--", magic_path)
+            (root / "ordinary.txt").write_text("ordinary\n", encoding="utf-8")
+            git(root, "add", "ordinary.txt")
+            git(root, "commit", "-m", "update shared system and ordinary file")
+            mixed_update = git(root, "rev-parse", "HEAD")
+            git(root, "config", "diff.ignoreSubmodules", "all")
+            git(root, "config", f"submodule.{magic_path}.ignore", "all")
+            _, updated_manifest = prepare_and_validate(
+                "update", pinned, "Update the shared system pin"
+            )
+            self.assertEqual(
+                {entry["path"] for entry in updated_manifest["changed_files"]},
+                {magic_path, "ordinary.txt"},
+            )
+            updated_snapshots = {
+                snapshot["path"]: snapshot for snapshot in updated_manifest["snapshots"]
+            }
+            self.assertEqual(updated_snapshots[magic_path]["commit"], updated_shared_sha)
+            git(root, "config", "--unset", "diff.ignoreSubmodules")
+            git(root, "config", "--unset", f"submodule.{magic_path}.ignore")
+
+            (shared / "README.md").write_text("shared v3\n", encoding="utf-8")
+            git(shared, "add", "README.md")
+            git(shared, "commit", "-m", "shared second update")
+            latest_shared_sha = git(shared, "rev-parse", "HEAD")
+            git(root / magic_path, "fetch", "origin")
+            git(root / magic_path, "checkout", latest_shared_sha)
+            git(root, "--literal-pathspecs", "add", "--", magic_path)
+            git(root, "commit", "-m", "update only shared system")
+            gitlink_only_update = git(root, "rev-parse", "HEAD")
+            git(root, "config", "diff.ignoreSubmodules", "all")
+            git(root, "config", f"submodule.{magic_path}.ignore", "all")
+            _, gitlink_only_manifest = prepare_and_validate(
+                "gitlink-only", mixed_update, "Update only the shared system pin"
+            )
+            self.assertEqual(
+                gitlink_only_manifest["changed_files"],
+                [{"status": "M", "path": magic_path}],
+            )
+            self.assertEqual(
+                gitlink_only_manifest["snapshots"][0]["commit"],
+                latest_shared_sha,
+            )
+            git(root, "config", "--unset", "diff.ignoreSubmodules")
+            git(root, "config", "--unset", f"submodule.{magic_path}.ignore")
+
+            renamed_path = "renamed-system"
+            git(root, "--literal-pathspecs", "mv", "--", magic_path, renamed_path)
+            modules_path = root / ".gitmodules"
+            modules_text = modules_path.read_text(encoding="utf-8")
+            modules_path.write_text(
+                modules_text.replace(
+                    f"path = {magic_path}", f"path = {renamed_path}"
+                ),
+                encoding="utf-8",
+            )
+            git(root, "add", "-A")
+            git(root, "commit", "-m", "rename shared system")
+            renamed = git(root, "rev-parse", "HEAD")
+            _, renamed_manifest = prepare_and_validate(
+                "rename", gitlink_only_update, "Rename the shared system pin"
+            )
+            renamed_snapshot = next(
+                snapshot
+                for snapshot in renamed_manifest["snapshots"]
+                if snapshot["path"] == renamed_path
+            )
+            self.assertEqual(
+                renamed_snapshot,
+                {
+                    "path": renamed_path,
+                    "gitlink": True,
+                    "commit": latest_shared_sha,
+                    "lines": 1,
+                    "old_path": magic_path,
+                    "old_commit": latest_shared_sha,
+                    "old_lines": 1,
+                },
+            )
+
+            git(root, "rm", "-f", renamed_path, ".gitmodules")
+            git(root, "commit", "-m", "remove shared system")
+            _, removed_manifest = prepare_and_validate(
+                "delete", renamed, "Remove the shared system pin"
+            )
+            removed_snapshots = {
+                snapshot["path"]: snapshot for snapshot in removed_manifest["snapshots"]
+            }
+            self.assertEqual(
+                removed_snapshots[renamed_path],
+                {
+                    "path": renamed_path,
+                    "deleted": True,
+                    "gitlink": True,
+                    "commit": latest_shared_sha,
+                    "lines": 1,
+                },
+            )
 
     def test_findings_exit_nonzero_and_secret_like_patch_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -41,6 +41,12 @@ CANONICAL_GIT_CONFIG = (
     "-c",
     "diff.renames=true",
 )
+GIT_PATHSPEC_ENVIRONMENT = (
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+)
 SECRET_PATTERNS = {
     "private-key": re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----"),
     "github-token": re.compile(r"\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_-]{16,}\b"),
@@ -78,7 +84,16 @@ def git(root: Path | None, *args: str, text: bool = True, check: bool = True):
     if root is not None:
         command.extend(["-C", str(root)])
     command.extend(args)
-    result = subprocess.run(command, text=text, capture_output=True, check=False)
+    environment = os.environ.copy()
+    for variable in GIT_PATHSPEC_ENVIRONMENT:
+        environment.pop(variable, None)
+    result = subprocess.run(
+        command,
+        text=text,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
     if check and result.returncode != 0:
         error = result.stderr if text else result.stderr.decode("utf-8", errors="replace")
         lines = [line.strip() for line in error.splitlines() if line.strip()]
@@ -156,6 +171,7 @@ def changed_entries(root: Path, base: str, head: str) -> list[dict]:
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
+        "--ignore-submodules=none",
         "--find-renames=50%",
         base,
         head,
@@ -196,6 +212,28 @@ def object_bytes(root: Path, revision: str, path: str) -> bytes | None:
     return git(root, "show", spec, text=False).stdout
 
 
+def tree_entry(root: Path, revision: str, path: str) -> dict | None:
+    raw = git(
+        root,
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        revision,
+        "--",
+        path,
+        text=False,
+    ).stdout
+    records = [record for record in raw.split(b"\0") if record]
+    for record in records:
+        metadata, separator, raw_path = record.partition(b"\t")
+        parts = metadata.decode("ascii", errors="strict").split()
+        candidate = os.fsdecode(raw_path)
+        if separator and len(parts) == 3 and candidate == path:
+            mode, object_type, object_name = parts
+            return {"mode": mode, "type": object_type, "object": object_name}
+    return None
+
+
 def source_lines(content: bytes) -> int:
     return max(1, len(content.splitlines()))
 
@@ -233,6 +271,7 @@ def canonical_patch(root: Path, base: str, head: str) -> bytes:
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
+        "--ignore-submodules=none",
         "--diff-algorithm=myers",
         "--unified=3",
         "--src-prefix=a/",
@@ -257,8 +296,41 @@ def snapshot_inventory(
     payloads: dict[str, bytes] = {}
     for entry in entries:
         path = entry["path"]
+        current_tree = tree_entry(root, head, path)
+        if current_tree is not None and current_tree["mode"] == "160000":
+            record = {
+                "path": path,
+                "gitlink": True,
+                "commit": current_tree["object"],
+                "lines": 1,
+            }
+            if entry.get("old_path"):
+                previous_tree = tree_entry(root, base, entry["old_path"])
+                if previous_tree is None or previous_tree["mode"] != "160000":
+                    raise ReviewError(f"cannot read prior gitlink snapshot: {entry['old_path']}")
+                record.update(
+                    {
+                        "old_path": entry["old_path"],
+                        "old_commit": previous_tree["object"],
+                        "old_lines": 1,
+                    }
+                )
+            snapshots.append(record)
+            continue
         content = object_bytes(root, head, path)
         if content is None:
+            previous_tree = tree_entry(root, base, path)
+            if previous_tree is not None and previous_tree["mode"] == "160000":
+                snapshots.append(
+                    {
+                        "path": path,
+                        "deleted": True,
+                        "gitlink": True,
+                        "commit": previous_tree["object"],
+                        "lines": 1,
+                    }
+                )
+                continue
             previous = object_bytes(root, base, path)
             if previous is None:
                 raise ReviewError(f"cannot read deleted source snapshot: {path}")
@@ -484,13 +556,39 @@ def validate_inventory(manifest: dict) -> tuple[list[dict], list[dict]]:
             raise ReviewError("invalid source snapshot metadata")
         path = snapshot.get("path")
         if snapshot.get("deleted") is True:
-            if entry["status"][0] != "D" or set(snapshot) != {"path", "deleted", "lines"}:
+            if entry["status"][0] != "D":
                 raise ReviewError(f"invalid deleted snapshot metadata: {path}")
             if type(snapshot.get("lines")) is not int or snapshot["lines"] < 1:
                 raise ReviewError(f"invalid deleted snapshot line count: {path}")
+            if snapshot.get("gitlink") is True:
+                if set(snapshot) != {"path", "deleted", "gitlink", "commit", "lines"}:
+                    raise ReviewError(f"invalid deleted gitlink metadata: {path}")
+                if snapshot["lines"] != 1 or not isinstance(
+                    snapshot.get("commit"), str
+                ) or not re.fullmatch(r"[a-f0-9]{40}", snapshot["commit"]):
+                    raise ReviewError(f"invalid deleted gitlink commit: {path}")
+            elif set(snapshot) != {"path", "deleted", "lines"}:
+                raise ReviewError(f"invalid deleted snapshot metadata: {path}")
             continue
         if entry["status"][0] == "D":
             raise ReviewError(f"deleted snapshot is not marked deleted: {path}")
+        if snapshot.get("gitlink") is True:
+            if snapshot.get("lines") != 1 or not isinstance(
+                snapshot.get("commit"), str
+            ) or not re.fullmatch(r"[a-f0-9]{40}", snapshot["commit"]):
+                raise ReviewError(f"invalid gitlink snapshot metadata: {path}")
+            expected_keys = {"path", "gitlink", "commit", "lines"}
+            if entry.get("old_path"):
+                expected_keys.update(("old_path", "old_commit", "old_lines"))
+                if snapshot.get("old_path") != entry["old_path"]:
+                    raise ReviewError(f"prior gitlink path mismatch: {path}")
+                if snapshot.get("old_lines") != 1 or not isinstance(
+                    snapshot.get("old_commit"), str
+                ) or not re.fullmatch(r"[a-f0-9]{40}", snapshot["old_commit"]):
+                    raise ReviewError(f"invalid prior gitlink commit: {path}")
+            if set(snapshot) != expected_keys:
+                raise ReviewError(f"unexpected gitlink snapshot metadata: {path}")
+            continue
         if not isinstance(snapshot.get("binary"), bool):
             raise ReviewError(f"invalid binary snapshot flag: {path}")
         if type(snapshot.get("lines")) is not int or snapshot["lines"] < 1:
@@ -549,7 +647,7 @@ def load_bundle(path: Path) -> tuple[Path, dict]:
     files_root = bundle / "files"
     expected_files: set[str] = set()
     for snapshot in snapshots:
-        if snapshot.get("deleted") is True:
+        if snapshot.get("deleted") is True or snapshot.get("gitlink") is True:
             continue
         path_value = snapshot.get("path")
         expected_files.add(path_value)

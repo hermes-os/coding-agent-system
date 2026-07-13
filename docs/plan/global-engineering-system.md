@@ -131,8 +131,34 @@ behavior. Validation also contains hand-maintained catalogs that can drift.
   treats ignored paths as source dirt too. The ignored-skill-payload regression
   and full migration scenario pass in 10.564 seconds; `./validate.sh` passes all
   70 tests in 214.296 seconds with the remaining validation stages.
-- The VM-embedded source predates `system.json`; the independently versioned VM
-  transition must add its exact legacy catalog before the live migration.
+- The independently versioned VM transition added an exact legacy catalog, and
+  the live Mac migration now manages all 89 paths from this standalone source
+  with the local host adapter and no orphaned paths.
+- The first frozen VM refactor review exposed that `agent-autoreview` treated a
+  gitlink as a deleted file and then rejected its own bundle. Gitlink snapshots
+  now bind the exact submodule commit without materializing its repository;
+  added and deleted gitlink validation passes, all nine autoreview tests pass in
+  54.412 seconds, and `./validate.sh` passes all 71 tests in 311.303 seconds.
+- Frozen review
+  `f0ece84c9fe1115594e5facef0e78cd6dc714ceeed7e366764c208b0f1e61098`
+  found Git pathspec magic remained active during tree lookup. Lookup now uses
+  literal pathspecs, and one magic-looking path passes add, update, rename, and
+  delete bundle validation. All nine autoreview tests pass in 63.533 seconds;
+  `./validate.sh` passes all 71 tests in 283.748 seconds.
+- Frozen review
+  `5c83eb9cafadba8095fffca65c87ac9bb0cc909c55544933bc3c6b4e37781da6`
+  found that Git submodule-ignore configuration could hide pin changes before
+  snapshotting. Both canonical diffs now force `--ignore-submodules=none`;
+  mixed and gitlink-only changes pass under repository and per-submodule
+  `ignore=all`. All nine autoreview tests pass in 37.986 seconds, and the final
+  `./validate.sh` run passes all 71 tests in 140.171 seconds.
+- Frozen review
+  `d448b0357f485adcbae273791053df177c1b354de99850f89148f0ff34f630a2`
+  found inherited global pathspec environment settings could conflict with
+  literal tree lookup. Canonical Git calls now remove all four pathspec
+  environment toggles before execution; the hostile-environment regression
+  passes with the magic-path cases. All nine autoreview tests pass in 30.990
+  seconds, and `./validate.sh` passes all 71 tests in 136.344 seconds.
 
 ## Open Questions
 
