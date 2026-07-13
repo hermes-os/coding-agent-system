@@ -104,6 +104,14 @@ behavior. Validation also contains hand-maintained catalogs that can drift.
 - Post-review candidate proof: `./validate.sh` passes all 69 tests in 221.959
   seconds, followed by the strict skill audit, repository check, syntax checks,
   and `git diff --check`.
+- The first published CI run, `29285718921`, exposed a timing assumption in the
+  lease-renewal regression on both Linux and macOS: renewing with the original
+  TTL inside the same second can correctly retain the same metadata commit.
+  The test now uses a distinct renewal TTL, and the focused cross-host lease
+  scenario passes three consecutive fresh runs.
+- CI-repair candidate proof: `./validate.sh` passes all 69 tests in 239.761
+  seconds, followed by the strict skill audit, repository check, syntax checks,
+  and `git diff --check`.
 
 ## Open Questions
 

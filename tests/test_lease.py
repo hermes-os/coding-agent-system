@@ -149,7 +149,7 @@ class LeaseTests(unittest.TestCase):
             observer.mkdir()
             git(observer, "init")
             git(observer, "remote", "add", "origin", str(remote))
-            renewed = command(["renew", first_lease, "--ttl", "60"], cwd=first, env=first_env)
+            renewed = command(["renew", first_lease, "--ttl", "120"], cwd=first, env=first_env)
             self.assertEqual(renewed.returncode, 0, renewed.stderr)
             module = load_lease_module()
             with self.assertRaises(module.LeaseChanged):
