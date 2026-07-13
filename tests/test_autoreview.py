@@ -221,6 +221,16 @@ class AutoreviewTests(unittest.TestCase):
                 self.assertIn("secret-like patch content blocked", blocked.stderr)
                 self.assertNotIn(credential, blocked.stderr)
 
+    def test_source_code_fixture_construction_is_not_a_secret_assignment(self):
+        module = load_autoreview_module()
+        fixture = '(root / "config.txt").write_text("SERVICE_API_KEY=" + secret)'
+        self.assertEqual(module.secret_findings(fixture), [])
+        self.assertEqual(module.secret_findings("renewed_token = {**token}"), [])
+        self.assertIn(
+            "assigned-service_api_key",
+            module.secret_findings("service_api_key=opaqueCredential24680"),
+        )
+
     def test_bundle_inventory_and_diff_identity_are_deterministic(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"

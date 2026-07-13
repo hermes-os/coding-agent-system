@@ -55,7 +55,8 @@ SECRET_PATTERNS = {
     ),
 }
 ASSIGNMENT_RE = re.compile(
-    r"^[+ -]?[^+\n]*?\b(?P<name>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
+    r"^[+ -]?\s*(?:(?:export|const|let|var)\s+)?(?:[{,]\s*)?[\"']?"
+    r"(?P<name>[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)"
     r"[\"']?\s*[:=]\s*(?:(?P<quote>[\"'])(?P<quoted>[^\"'\r\n]{1,512})(?P=quote)|"
     r"(?P<bare>[^\s\"',;}\]]+))",
     re.IGNORECASE | re.MULTILINE,
@@ -124,6 +125,8 @@ def secret_findings(text: str) -> list[str]:
         value = match.group("quoted") or match.group("bare") or ""
         lowered = value.lower()
         if len(value) < 8 or any(marker in lowered for marker in PLACEHOLDERS):
+            continue
+        if not quoted and value[0] in "{[(":
             continue
         if any(marker in value for marker in ("(", "${", "{{")):
             continue
