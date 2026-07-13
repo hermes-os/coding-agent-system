@@ -21,11 +21,17 @@ NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MODEL_PATTERNS = {
     "--model": re.compile(r"(?<![\w-])--model(?:\s|=)"),
     "anthropic_model": re.compile(r"\banthropic_model\b"),
+    "claude_code_model": re.compile(r"\bclaude_code_(?:subagent_)?model\b"),
     "claude-haiku": re.compile(r"\bclaude-haiku\b"),
     "claude-opus": re.compile(r"\bclaude-opus\b"),
     "claude-sonnet": re.compile(r"\bclaude-sonnet\b"),
+    "versioned-model": re.compile(
+        r"\b(?:codex|composer|gemini|grok|haiku|kimi|opus|sonnet)[-_ ]?\d+(?:\.\d+)*\b"
+    ),
     "gpt-": re.compile(r"\bgpt-[a-z0-9]"),
 }
+TEXT_SUFFIXES = {".json", ".md", ".mjs", ".py", ".sh", ".ts", ".tsx", ".yaml", ".yml"}
+MAX_HOOK_TIMEOUT_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -199,18 +205,42 @@ def validate_hooks(skill: Skill) -> list[str]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return [f"{manifest_path}: invalid JSON: {exc}"]
-    events = manifest.get("events") if isinstance(manifest, dict) else None
-    if not isinstance(events, dict):
-        return [f"{manifest_path}: events must be an object"]
-
+    if not isinstance(manifest, dict):
+        return [f"{manifest_path}: manifest must be an object"]
     errors: list[str] = []
+    unknown_root = sorted(set(manifest) - {"version", "events"})
+    if unknown_root:
+        errors.append(f"{manifest_path}: unknown keys: {', '.join(unknown_root)}")
+    if manifest.get("version") != 1:
+        errors.append(f"{manifest_path}: version must be 1")
+    events = manifest.get("events")
+    if not isinstance(events, dict):
+        errors.append(f"{manifest_path}: events must be an object")
+        return errors
+
+    system_root = Path(__file__).resolve().parents[3]
+    try:
+        catalog = json.loads((system_root / "system.json").read_text(encoding="utf-8"))
+        supported_events = set(catalog["hookEvents"])
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return [*errors, f"{system_root / 'system.json'}: invalid hook catalog: {exc}"]
     skill_dir = skill.real.parent.resolve()
     for event, entries in events.items():
         if not isinstance(event, str) or not isinstance(entries, list):
             errors.append(f"{manifest_path}: each event must map to a list")
             continue
+        if event not in supported_events:
+            errors.append(f"{manifest_path}: unsupported hook event {event!r}")
+        if not entries:
+            errors.append(f"{manifest_path}: {event} must contain at least one hook")
         for index, entry in enumerate(entries):
             command = entry.get("command") if isinstance(entry, dict) else None
+            if isinstance(entry, dict):
+                unknown_entry = sorted(set(entry) - {"command", "timeoutSeconds"})
+                if unknown_entry:
+                    errors.append(
+                        f"{manifest_path}: {event}[{index}] unknown keys: {', '.join(unknown_entry)}"
+                    )
             if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
                 errors.append(f"{manifest_path}: {event}[{index}] command must be a non-empty string list")
                 continue
@@ -226,9 +256,32 @@ def validate_hooks(skill: Skill) -> list[str]:
             elif not os.access(resolved, os.X_OK):
                 errors.append(f"{manifest_path}: {event}[{index}] executable is not executable: {executable}")
             timeout = entry.get("timeoutSeconds", 300) if isinstance(entry, dict) else 300
-            if not isinstance(timeout, int) or timeout <= 0:
-                errors.append(f"{manifest_path}: {event}[{index}] timeoutSeconds must be positive")
+            if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+                errors.append(f"{manifest_path}: {event}[{index}] timeoutSeconds must be a positive integer")
+            elif timeout > MAX_HOOK_TIMEOUT_SECONDS:
+                errors.append(
+                    f"{manifest_path}: {event}[{index}] timeoutSeconds exceeds "
+                    f"{MAX_HOOK_TIMEOUT_SECONDS}"
+                )
     return errors
+
+
+def model_pin_warnings(skill: Skill) -> list[str]:
+    warnings: list[str] = []
+    auditor = Path(__file__).resolve()
+    for path in sorted(skill.real.parent.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        if path.resolve() == auditor:
+            continue
+        try:
+            lowered = path.read_text(encoding="utf-8").lower()
+        except (OSError, UnicodeError):
+            continue
+        for marker, pattern in MODEL_PATTERNS.items():
+            if pattern.search(lowered):
+                warnings.append(f"{path}: possible model pin marker {marker!r}")
+    return warnings
 
 
 def normalized(value: str) -> str:
@@ -368,10 +421,7 @@ def main() -> int:
     skills.sort(key=lambda item: (item.name, str(item.source)))
     if args.model_neutral:
         for skill in skills:
-            lowered = skill.text.lower()
-            for marker, pattern in MODEL_PATTERNS.items():
-                if pattern.search(lowered):
-                    warnings.append(f"{skill.source}: possible model pin marker {marker!r}")
+            warnings.extend(model_pin_warnings(skill))
     warnings.extend(duplicate_warnings(skills))
 
     metadata_bytes = sum(

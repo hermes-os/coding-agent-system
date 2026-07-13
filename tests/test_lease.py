@@ -55,6 +55,24 @@ def load_lease_module():
 
 
 class LeaseTests(unittest.TestCase):
+    def test_uses_persisted_coordination_repository(self):
+        module = load_lease_module()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            coordination = root / "coordination"
+            coordination.mkdir()
+            git(coordination, "init")
+            config = home / ".agents" / "config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps({"coordinationRepo": str(coordination)}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                os.environ.pop("AGENT_COORDINATION_REPO_DIR", None)
+                self.assertEqual(module.coordination_repo(), coordination.resolve())
+
     def test_remote_ref_serializes_two_hosts_and_reaps_expired_owner(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

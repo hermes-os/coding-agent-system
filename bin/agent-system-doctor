@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Validate installed global agent wiring and optional repository pointers."""
+"""Validate the installed global system and optional repository wiring."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -20,39 +22,36 @@ CLAUDE_MODEL_ENV_KEYS = {
     "CLAUDE_CODE_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
 }
-
-REQUIRED_SKILLS = {
-    "behavior-validator",
-    "capabilities",
-    "delegate",
-    "fix-issue",
-    "handoff",
-    "land",
-    "maintain-skills",
-    "pickup",
-    "portfolio",
-    "release",
-    "review",
-}
-
-COMMAND_SKILLS = REQUIRED_SKILLS - {"behavior-validator"}
-
-REQUIRED_BINARIES = {
-    "agent-autoreview",
-    "agent-capabilities",
-    "agent-claude",
-    "agent-codex",
-    "agent-docs-list",
-    "agent-lease",
-    "agent-repo-inventory",
-    "agent-session-recover",
-    "agent-skill-audit",
-    "agent-system-doctor",
-    "agent-trash",
-    "committer",
-}
-
 SHELL_BLOCK_MARKER = "# >>> global agent invocation defaults >>>"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path.home())
+    parser.add_argument("--repo", type=Path)
+    parser.add_argument("--strict-catalog", action="store_true")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    return parser.parse_args()
+
+
+def read_json(path: Path, errors: list[str]) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"invalid JSON {path}: {exc}")
+        return {}
+    if not isinstance(value, dict):
+        errors.append(f"expected JSON object in {path}")
+        return {}
+    return value
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def codex_model_pins(path: Path) -> list[str]:
@@ -73,94 +72,226 @@ def codex_model_pins(path: Path) -> list[str]:
     return pins
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--home", type=Path, default=Path.home())
-    parser.add_argument("--repo", type=Path)
-    return parser.parse_args()
+def expected_claude_hooks() -> dict:
+    return {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": '"$HOME/.agents/hooks/dispatch.py" --host claude Stop',
+                        "timeout": 330,
+                    }
+                ],
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": '"$HOME/.agents/hooks/dispatch.py" --host claude PreToolUse',
+                        "timeout": 630,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def expected_codex_hooks() -> dict:
+    return {"hooks": expected_claude_hooks_for("codex")}
+
+
+def expected_claude_hooks_for(host: str) -> dict:
+    hooks = expected_claude_hooks()
+    encoded = json.dumps(hooks).replace("--host claude", f"--host {host}")
+    return json.loads(encoded)
+
+
+def expected_cursor_hooks() -> dict:
+    return {
+        "version": 1,
+        "hooks": {
+            "stop": [
+                {
+                    "command": '"$HOME/.agents/hooks/dispatch.py" --host cursor Stop',
+                    "timeout": 330,
+                }
+            ],
+            "preToolUse": [
+                {
+                    "matcher": "Shell",
+                    "command": '"$HOME/.agents/hooks/dispatch.py" --host cursor PreToolUse',
+                    "timeout": 630,
+                }
+            ],
+        },
+    }
+
+
+def validate_catalog(system_root: Path, errors: list[str]) -> dict:
+    catalog_path = system_root / "system.json"
+    catalog = read_json(catalog_path, errors)
+    if catalog.get("schemaVersion") != 1:
+        errors.append(f"unsupported catalog schema in {catalog_path}")
+
+    skills = catalog.get("skills")
+    if not isinstance(skills, list) or not skills:
+        errors.append(f"catalog skills must be a non-empty list: {catalog_path}")
+        skills = []
+    skill_names: list[str] = []
+    for entry in skills:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            errors.append(f"invalid skill entry in {catalog_path}")
+            continue
+        if not isinstance(entry.get("command"), bool):
+            errors.append(f"skill command flag must be boolean: {entry.get('name')}")
+        skill_names.append(entry["name"])
+    if skill_names != sorted(set(skill_names)):
+        errors.append("catalog skill names must be unique and sorted")
+    source_skills = sorted(
+        path.name
+        for path in (system_root / "skills").iterdir()
+        if path.is_dir() and (path / "SKILL.md").is_file()
+    ) if (system_root / "skills").is_dir() else []
+    if source_skills != skill_names:
+        errors.append("system.json skill catalog does not match source directories")
+
+    binaries = catalog.get("binaries")
+    if not isinstance(binaries, list) or not binaries:
+        errors.append(f"catalog binaries must be a non-empty list: {catalog_path}")
+        binaries = []
+    binary_names: list[str] = []
+    for entry in binaries:
+        if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in ("name", "source")):
+            errors.append(f"invalid binary entry in {catalog_path}")
+            continue
+        binary_names.append(entry["name"])
+        source = system_root / entry["source"]
+        if not source.is_file() or not os.access(source, os.X_OK):
+            errors.append(f"missing executable catalog source: {source}")
+    if binary_names != sorted(set(binary_names)):
+        errors.append("catalog binary names must be unique and sorted")
+
+    events = catalog.get("hookEvents")
+    if events != ["Stop", "PreToolUse"]:
+        errors.append("catalog hookEvents must be Stop and PreToolUse")
+    return catalog
+
+
+def exact_symlink(path: Path, target: Path) -> bool:
+    return path.is_symlink() and path.resolve(strict=False) == target.resolve(strict=False)
+
+
+def git_root(path: Path) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0 and Path(result.stdout.strip()).resolve() == path.resolve()
 
 
 def main() -> int:
     args = parse_args()
     home = args.home.expanduser().resolve()
-    agents = home / ".agents"
+    agents = Path(os.environ.get("AGENTS_HOME", home / ".agents")).expanduser().resolve()
     errors: list[str] = []
+    warnings: list[str] = []
 
     canonical = agents / "AGENTS.md"
-    if not canonical.is_file():
-        errors.append(f"missing {canonical}")
+    if not canonical.is_symlink():
+        errors.append(f"canonical policy is not a managed symlink: {canonical}")
+        system_root = Path(__file__).resolve().parent.parent
+    else:
+        system_root = canonical.resolve().parent
+    catalog = validate_catalog(system_root, errors)
+    policy = system_root / str(catalog.get("policy", "AGENTS.md"))
+    if not exact_symlink(canonical, policy):
+        errors.append(f"bad canonical policy link: {canonical}")
 
     for adapter in (
         home / ".codex" / "AGENTS.md",
         home / ".claude" / "CLAUDE.md",
         home / ".claude" / "AGENTS.md",
     ):
-        if not adapter.is_symlink() or adapter.resolve() != canonical.resolve():
-            errors.append(f"bad policy adapter {adapter}")
+        if not exact_symlink(adapter, policy):
+            errors.append(f"bad policy adapter: {adapter}")
 
-    skills = sorted(
+    dispatch = system_root / "hooks" / "dispatch.py"
+    if not exact_symlink(agents / "hooks" / "dispatch.py", dispatch):
+        errors.append("global hook dispatcher is not linked to the canonical source")
+    launch_defaults = system_root / "shell" / "default-invocations.sh"
+    if not exact_symlink(agents / "shell" / "default-invocations.sh", launch_defaults):
+        errors.append("default invocation adapter is not linked to the canonical source")
+
+    catalog_skills = {entry["name"]: entry for entry in catalog.get("skills", []) if isinstance(entry, dict)}
+    installed_skills = {
         path.name
         for path in (agents / "skills").iterdir()
         if path.is_dir() and (path / "SKILL.md").is_file()
-    ) if (agents / "skills").is_dir() else []
-    missing = sorted(REQUIRED_SKILLS - set(skills))
-    if missing:
-        errors.append(f"missing global skills: {', '.join(missing)}")
+    } if (agents / "skills").is_dir() else set()
+    extensions = sorted(installed_skills - set(catalog_skills))
+    if extensions:
+        warnings.append(f"unmanaged skill extensions: {', '.join(extensions)}")
+    for name, entry in catalog_skills.items():
+        source = system_root / "skills" / name
+        for adapter in (agents / "skills" / name, home / ".claude" / "skills" / name):
+            if not exact_symlink(adapter, source):
+                errors.append(f"bad skill adapter: {adapter}")
+        if entry.get("command") is True:
+            source_file = source / "SKILL.md"
+            for command in (
+                home / ".codex" / "prompts" / f"{name}.md",
+                home / ".claude" / "commands" / f"{name}.md",
+            ):
+                if not exact_symlink(command, source_file):
+                    errors.append(f"bad skill command adapter: {command}")
+            cursor = home / ".cursor" / "commands" / f"{name}.md"
+            try:
+                if cursor.read_bytes() != source_file.read_bytes():
+                    errors.append(f"stale Cursor command: {cursor}")
+            except OSError as exc:
+                errors.append(f"missing Cursor command {cursor}: {exc}")
 
-    for name in REQUIRED_SKILLS & set(skills):
-        skill = agents / "skills" / name / "SKILL.md"
-        text = skill.read_text(encoding="utf-8")
-        frontmatter = text.split("---", 2)[1] if text.startswith("---\n") else ""
-        if f"name: {name}\n" not in frontmatter or "description:" not in frontmatter:
-            errors.append(f"invalid skill frontmatter {skill}")
-
-    for binary in REQUIRED_BINARIES:
-        path = home / ".local" / "bin" / binary
-        if not path.is_file() or not os.access(path, os.X_OK):
-            errors.append(f"missing executable helper {path}")
-
-    for name in COMMAND_SKILLS:
-        codex = home / ".codex" / "prompts" / f"{name}.md"
-        claude = home / ".claude" / "commands" / f"{name}.md"
-        cursor = home / ".cursor" / "commands" / f"{name}.md"
-        if not codex.is_file():
-            errors.append(f"missing Codex command {codex}")
-        if not claude.is_file():
-            errors.append(f"missing Claude command {claude}")
-        if not cursor.is_file():
-            errors.append(f"missing Cursor command {cursor}")
-
-    for config in (
-        home / ".codex" / "hooks.json",
-        home / ".claude" / "settings.json",
-        home / ".cursor" / "hooks.json",
-    ):
-        try:
-            value = json.loads(config.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            errors.append(f"invalid host config {config}: {exc}")
+    for entry in catalog.get("binaries", []):
+        if not isinstance(entry, dict) or "name" not in entry or "source" not in entry:
             continue
-        if "dispatch.py" not in json.dumps(value):
-            errors.append(f"dispatcher missing from {config}")
+        source = system_root / entry["source"]
+        for binary in (agents / "bin" / entry["name"], home / ".local" / "bin" / entry["name"]):
+            if not exact_symlink(binary, source) or not os.access(binary, os.X_OK):
+                errors.append(f"bad executable helper: {binary}")
 
-    claude_settings = home / ".claude" / "settings.json"
-    try:
-        claude_value = json.loads(claude_settings.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        claude_value = {}
-    claude_env = claude_value.get("env", {}) if isinstance(claude_value, dict) else {}
-    if not isinstance(claude_env, dict):
-        claude_env = {}
-    claude_pins = sorted(CLAUDE_MODEL_ENV_KEYS & set(claude_env))
-    if isinstance(claude_value, dict) and "model" in claude_value:
-        claude_pins.insert(0, "model")
-    if claude_pins:
-        errors.append(f"Claude model pins remain: {', '.join(claude_pins)}")
-    permissions = claude_value.get("permissions", {}) if isinstance(claude_value, dict) else {}
-    if not isinstance(permissions, dict) or permissions.get("defaultMode") != "bypassPermissions":
+    claude_path = home / ".claude" / "settings.json"
+    claude = read_json(claude_path, errors)
+    if claude.get("hooks") != expected_claude_hooks():
+        errors.append(f"unexpected Claude hook configuration: {claude_path}")
+    claude_env = claude.get("env") if isinstance(claude.get("env"), dict) else {}
+    pins = sorted(CLAUDE_MODEL_ENV_KEYS & set(claude_env))
+    if "model" in claude:
+        pins.insert(0, "model")
+    if pins:
+        errors.append(f"Claude model pins remain: {', '.join(pins)}")
+    if claude_env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") != "1":
+        errors.append("Claude auto-memory is not disabled")
+    if claude.get("autoMemoryEnabled") is not False or claude.get("autoDreamEnabled") is not False:
+        errors.append("Claude memory settings are not disabled")
+    permissions = claude.get("permissions") if isinstance(claude.get("permissions"), dict) else {}
+    if permissions.get("defaultMode") != "bypassPermissions":
         errors.append("Claude bypassPermissions is not the default")
-    if not isinstance(claude_value, dict) or claude_value.get("skipDangerousModePermissionPrompt") is not True:
+    if claude.get("skipDangerousModePermissionPrompt") is not True:
         errors.append("Claude dangerous-mode acknowledgement is not persisted")
+
+    codex_hooks_path = home / ".codex" / "hooks.json"
+    if read_json(codex_hooks_path, errors) != expected_codex_hooks():
+        errors.append(f"unexpected Codex hook configuration: {codex_hooks_path}")
+    cursor_hooks_path = home / ".cursor" / "hooks.json"
+    if read_json(cursor_hooks_path, errors) != expected_cursor_hooks():
+        errors.append(f"unexpected Cursor hook configuration: {cursor_hooks_path}")
 
     codex_config = home / ".codex" / "config.toml"
     codex_pins = codex_model_pins(codex_config)
@@ -170,46 +301,89 @@ def main() -> int:
         codex_text = codex_config.read_text(encoding="utf-8")
     except OSError:
         codex_text = ""
-    if not re.search(r'^sandbox_mode\s*=\s*"danger-full-access"\s*$', codex_text, re.MULTILINE):
-        errors.append("Codex danger-full-access sandbox is not the default")
-    if not re.search(r'^approval_policy\s*=\s*"never"\s*$', codex_text, re.MULTILINE):
-        errors.append("Codex never-ask approval policy is not the default")
+    for pattern, message in (
+        (r'^sandbox_mode\s*=\s*"danger-full-access"\s*$', "Codex danger-full-access sandbox is not the default"),
+        (r'^approval_policy\s*=\s*"never"\s*$', "Codex never-ask approval policy is not the default"),
+        (r'^memories\s*=\s*false\s*$', "Codex memories are not disabled"),
+    ):
+        if not re.search(pattern, codex_text, re.MULTILINE):
+            errors.append(message)
 
-    launch_defaults = agents / "shell" / "default-invocations.sh"
-    if not launch_defaults.is_file():
-        errors.append(f"missing invocation defaults {launch_defaults}")
-    for rc_name in (".zshrc", ".bashrc"):
+    for rc_name in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
         rc_path = home / rc_name
         try:
-            rc_text = rc_path.read_text(encoding="utf-8")
+            count = rc_path.read_text(encoding="utf-8").count(SHELL_BLOCK_MARKER)
         except OSError:
-            rc_text = ""
-        if SHELL_BLOCK_MARKER not in rc_text:
-            errors.append(f"missing invocation source block {rc_path}")
+            count = 0
+        if count != 1:
+            errors.append(f"invocation source block count is {count}: {rc_path}")
 
     cursor_rule = home / ".cursor" / "rules" / "global-engineering.mdc"
-    if not cursor_rule.is_file() or "# Global Engineering System" not in cursor_rule.read_text(encoding="utf-8"):
-        errors.append(f"missing Cursor global rule {cursor_rule}")
+    expected_rule = (
+        "---\n"
+        "description: Canonical global engineering policy\n"
+        "alwaysApply: true\n"
+        "---\n\n"
+        "Generated from the canonical agent system. Edit the source, then rerun the installer.\n\n"
+        + policy.read_text(encoding="utf-8").rstrip()
+        + "\n"
+    ) if policy.is_file() else ""
+    try:
+        if cursor_rule.read_text(encoding="utf-8") != expected_rule:
+            errors.append(f"stale Cursor global rule: {cursor_rule}")
+    except OSError as exc:
+        errors.append(f"missing Cursor global rule {cursor_rule}: {exc}")
+
+    config = read_json(agents / "config.json", errors)
+    coordination_raw = config.get("coordinationRepo")
+    if not isinstance(coordination_raw, str) or not git_root(Path(coordination_raw).expanduser()):
+        errors.append("agent coordination repository is not a valid Git root")
+    managed = read_json(agents / "managed-install.json", errors)
+    if managed.get("sourceRoot") != str(system_root):
+        errors.append("managed install source root is stale")
+    if managed.get("catalogSha256") != sha256_file(system_root / "system.json"):
+        errors.append("managed install catalog hash is stale")
+    orphaned = managed.get("orphanedPaths")
+    if not isinstance(orphaned, list):
+        errors.append("managed install orphan list is invalid")
+    elif orphaned:
+        errors.append(f"modified retired managed paths remain: {', '.join(orphaned)}")
 
     if args.repo:
-        repo = args.repo.expanduser().resolve()
-        repo_agents = repo / "AGENTS.md"
-        if not repo_agents.is_file():
-            errors.append(f"missing repository AGENTS.md: {repo_agents}")
-        elif "READ ~/.agents/AGENTS.md BEFORE ANYTHING" not in repo_agents.read_text(encoding="utf-8"):
-            errors.append(f"repository global pointer missing: {repo_agents}")
-        claude = repo / "CLAUDE.md"
-        if not claude.is_symlink() or claude.resolve() != repo_agents.resolve():
-            errors.append(f"repository CLAUDE.md is not a pointer to AGENTS.md: {claude}")
+        result = subprocess.run(
+            [str(system_root / "bin" / "agent-repo-check"), "--repo", str(args.repo), "--strict"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            errors.append(f"repository check failed: {detail.splitlines()[-1] if detail else result.returncode}")
 
-    if errors:
+    if args.strict_catalog and extensions:
+        errors.append("strict catalog rejects unmanaged skill extensions")
+
+    report = {
+        "systemRoot": str(system_root),
+        "managedSkills": sorted(catalog_skills),
+        "extensions": extensions,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    elif errors:
         print("Agent system doctor: FAIL", file=sys.stderr)
         for error in errors:
             print(f"- {error}", file=sys.stderr)
-        return 1
-    print("Agent system doctor: PASS")
-    print(f"Global skills: {', '.join(skills)}")
-    return 0
+        for warning in warnings:
+            print(f"- warning: {warning}", file=sys.stderr)
+    else:
+        print("Agent system doctor: PASS")
+        print(f"Managed skills: {', '.join(sorted(catalog_skills))}")
+        if extensions:
+            print(f"Extensions: {', '.join(extensions)}")
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

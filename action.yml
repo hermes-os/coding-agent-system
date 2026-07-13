@@ -1,0 +1,7 @@
+name: Agent repository check
+description: Validate global instruction wiring, local skills, plans, and high-signal repository hygiene.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/bin/agent-repo-check" --repo "$GITHUB_WORKSPACE" --strict

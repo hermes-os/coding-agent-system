@@ -4,6 +4,40 @@ set -euo pipefail
 
 SYSTEM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENTS_HOME="${AGENTS_HOME:-$HOME/.agents}"
+COORDINATION_REPO="${AGENT_COORDINATION_REPO_DIR:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --coordination-repo)
+      [[ $# -ge 2 ]] || { echo "Error: --coordination-repo requires a path." >&2; exit 2; }
+      COORDINATION_REPO=$2
+      shift 2
+      ;;
+    *)
+      printf 'Error: unknown argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+catalog_rows() {
+  local section=$1
+  python3 - "$SYSTEM_ROOT/system.json" "$section" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+catalog = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if sys.argv[2] == "skills":
+    for skill in catalog["skills"]:
+        print(f'{skill["name"]}\t{int(skill["command"])}')
+elif sys.argv[2] == "binaries":
+    for binary in catalog["binaries"]:
+        print(f'{binary["name"]}\t{binary["source"]}')
+else:
+    raise SystemExit(f"unknown catalog section: {sys.argv[2]}")
+PY
+}
 
 remove_managed_path() {
   local path=$1
@@ -38,138 +72,34 @@ mkdir -p \
 
 link_managed "$SYSTEM_ROOT/AGENTS.md" "$AGENTS_HOME/AGENTS.md"
 link_managed "$SYSTEM_ROOT/hooks/dispatch.py" "$AGENTS_HOME/hooks/dispatch.py"
-link_managed "$SYSTEM_ROOT/bin/docs-list" "$AGENTS_HOME/bin/docs-list"
-link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$AGENTS_HOME/bin/agent-system-doctor"
-link_managed "$SYSTEM_ROOT/bin/committer" "$AGENTS_HOME/bin/committer"
-link_managed "$SYSTEM_ROOT/bin/agent-trash" "$AGENTS_HOME/bin/agent-trash"
-link_managed "$SYSTEM_ROOT/bin/agent-claude" "$AGENTS_HOME/bin/agent-claude"
-link_managed "$SYSTEM_ROOT/bin/agent-codex" "$AGENTS_HOME/bin/agent-codex"
 link_managed "$SYSTEM_ROOT/shell/default-invocations.sh" "$AGENTS_HOME/shell/default-invocations.sh"
-link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/docs-list"
-link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/agent-docs-list"
-link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$HOME/.local/bin/agent-system-doctor"
-link_managed "$SYSTEM_ROOT/bin/committer" "$HOME/.local/bin/committer"
-link_managed "$SYSTEM_ROOT/bin/agent-trash" "$HOME/.local/bin/agent-trash"
-link_managed "$SYSTEM_ROOT/bin/agent-claude" "$HOME/.local/bin/agent-claude"
-link_managed "$SYSTEM_ROOT/bin/agent-codex" "$HOME/.local/bin/agent-codex"
-link_managed \
-  "$SYSTEM_ROOT/skills/maintain-skills/scripts/skill-audit.py" \
-  "$AGENTS_HOME/bin/agent-skill-audit"
-link_managed \
-  "$SYSTEM_ROOT/skills/maintain-skills/scripts/skill-audit.py" \
-  "$HOME/.local/bin/agent-skill-audit"
-link_managed \
-  "$SYSTEM_ROOT/skills/capabilities/scripts/agent-capabilities.py" \
-  "$AGENTS_HOME/bin/agent-capabilities"
-link_managed \
-  "$SYSTEM_ROOT/skills/capabilities/scripts/agent-capabilities.py" \
-  "$HOME/.local/bin/agent-capabilities"
-link_managed \
-  "$SYSTEM_ROOT/skills/portfolio/scripts/repo-inventory.py" \
-  "$AGENTS_HOME/bin/agent-repo-inventory"
-link_managed \
-  "$SYSTEM_ROOT/skills/portfolio/scripts/repo-inventory.py" \
-  "$HOME/.local/bin/agent-repo-inventory"
-link_managed \
-  "$SYSTEM_ROOT/skills/portfolio/scripts/agent-lease.py" \
-  "$AGENTS_HOME/bin/agent-lease"
-link_managed \
-  "$SYSTEM_ROOT/skills/portfolio/scripts/agent-lease.py" \
-  "$HOME/.local/bin/agent-lease"
-link_managed \
-  "$SYSTEM_ROOT/skills/review/scripts/agent-autoreview.py" \
-  "$AGENTS_HOME/bin/agent-autoreview"
-link_managed \
-  "$SYSTEM_ROOT/skills/review/scripts/agent-autoreview.py" \
-  "$HOME/.local/bin/agent-autoreview"
-link_managed \
-  "$SYSTEM_ROOT/skills/pickup/scripts/agent-session-recover.py" \
-  "$AGENTS_HOME/bin/agent-session-recover"
-link_managed \
-  "$SYSTEM_ROOT/skills/pickup/scripts/agent-session-recover.py" \
-  "$HOME/.local/bin/agent-session-recover"
 
-for skill in "$SYSTEM_ROOT"/skills/*; do
-  [[ -f "$skill/SKILL.md" ]] || continue
-  name="$(basename "$skill")"
+while IFS=$'\t' read -r name source; do
+  link_managed "$SYSTEM_ROOT/$source" "$AGENTS_HOME/bin/$name"
+  link_managed "$SYSTEM_ROOT/$source" "$HOME/.local/bin/$name"
+done < <(catalog_rows binaries)
+
+while IFS=$'\t' read -r name is_command; do
+  skill="$SYSTEM_ROOT/skills/$name"
+  [[ -f "$skill/SKILL.md" ]] || { printf 'Missing catalog skill: %s\n' "$name" >&2; exit 1; }
   link_managed "$skill" "$AGENTS_HOME/skills/$name"
   link_managed "$skill" "$HOME/.claude/skills/$name"
-done
+  if [[ "$is_command" == "1" ]]; then
+    source="$skill/SKILL.md"
+    link_managed "$source" "$HOME/.codex/prompts/$name.md"
+    link_managed "$source" "$HOME/.claude/commands/$name.md"
+    install -m 0644 "$source" "$HOME/.cursor/commands/$name.md"
+  fi
+done < <(catalog_rows skills)
 
 link_managed "$SYSTEM_ROOT/AGENTS.md" "$HOME/.codex/AGENTS.md"
 link_managed "$SYSTEM_ROOT/AGENTS.md" "$HOME/.claude/CLAUDE.md"
 link_managed "$SYSTEM_ROOT/AGENTS.md" "$HOME/.claude/AGENTS.md"
 
-command_skills=(
-  capabilities
-  delegate
-  fix-issue
-  handoff
-  land
-  maintain-skills
-  pickup
-  portfolio
-  release
-  review
-)
-
-for name in "${command_skills[@]}"; do
-  source="$SYSTEM_ROOT/skills/$name/SKILL.md"
-  link_managed "$source" "$HOME/.codex/prompts/$name.md"
-  link_managed "$source" "$HOME/.claude/commands/$name.md"
-  install -m 0644 "$source" "$HOME/.cursor/commands/$name.md"
-done
-
-python3 "$SYSTEM_ROOT/configure-hosts.py" --system-root "$SYSTEM_ROOT"
-
-if [[ "${AGENT_SYSTEM_PRUNE_LEGACY:-0}" == "1" ]]; then
-  legacy_paths=(
-    "$HOME/.ai"
-    "$HOME/ClaudeVault/personas/Cal"
-    "$HOME/.claude/.git"
-    "$HOME/.claude/scripts/tc-hook.log"
-    "$HOME/.claude/settings.json.orig"
-    "$HOME/.codex/CODEX_OPERATING_MANUAL.md"
-    "$HOME/.agents/skills/drive"
-    "$HOME/.agents/skills/steer"
-    "$HOME/.codex/skills/pregen"
-    "$HOME/.codex/agents"
-    "$HOME/.claude/agents"
-    "$HOME/.claude/blueprints"
-    "$HOME/.claude/specs"
-    "$HOME/.claude/commands/hello-cal.md"
-    "$HOME/.claude/hooks/cal-journal-rollup-gate.py"
-    "$HOME/.claude/hooks/cal-journal-tick.sh"
-    "$HOME/.claude/hooks/codex-session-baseline.sh"
-    "$HOME/.claude/hooks/codex-stop-verification.py"
-    "$HOME/.claude/plugins/cache/claude-plugins-official/claude-code-setup"
-    "$HOME/.claude/plugins/cache/claude-plugins-official/claude-md-management"
-    "$HOME/.claude/plugins/cache/claude-plugins-official/code-review"
-    "$HOME/.claude/plugins/cache/claude-plugins-official/code-simplifier"
-    "$HOME/.claude/plugins/cache/claude-plugins-official/coderabbit"
-    "$HOME/.claude/plugins/cache/claude-plugins-official/ralph-loop"
-    "$HOME/.claude/plugins/cache/claude-plugins-official/superpowers"
-    "$HOME/.claude/plugins/cache/karpathy-skills"
-    "$HOME/.codex/plugins/cache/claude-plugins-official/claude-code-setup"
-    "$HOME/.codex/plugins/cache/claude-plugins-official/claude-md-management"
-    "$HOME/.codex/plugins/cache/claude-plugins-official/code-review"
-    "$HOME/.codex/plugins/cache/claude-plugins-official/code-simplifier"
-    "$HOME/.codex/plugins/cache/claude-plugins-official/superpowers"
-    "$HOME/.codex/plugins/cache/karpathy-skills"
-    "$HOME/.codex/plugins/.marketplace-plugin-source-staging"
-  )
-  for path in "${legacy_paths[@]}"; do
-    remove_managed_path "$path"
-  done
-  for path in "$HOME"/.claude/settings.json.bak.*; do
-    remove_managed_path "$path"
-  done
-  for path in \
-    "$HOME"/.codex/plugins/cache/claude-plugins-official/plugin-backup-* \
-    "$HOME"/.codex/plugins/cache/claude-plugins-official/plugin-install-*; do
-    remove_managed_path "$path"
-  done
-  rmdir "$HOME/.claude/scripts" "$HOME/.claude/hooks" 2>/dev/null || true
+configure_args=(--system-root "$SYSTEM_ROOT")
+if [[ -n "$COORDINATION_REPO" ]]; then
+  configure_args+=(--coordination-repo "$COORDINATION_REPO")
 fi
+python3 "$SYSTEM_ROOT/configure-hosts.py" "${configure_args[@]}"
 
 echo "Agent system installed from $SYSTEM_ROOT"

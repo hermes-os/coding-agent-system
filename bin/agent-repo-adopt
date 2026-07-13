@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Wire a repository to the exact current global-system revision."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+GLOBAL_POINTER = "READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing)."
+MANAGED_MARKER = "# Managed by coding-agent-system."
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--system-ref")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--allow-unpublished", action="store_true", help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout.strip()
+
+
+def first_content_line(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp = Path(raw_temp)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def workflow(repository: str, revision: str) -> str:
+    return f"""{MANAGED_MARKER}
+name: Agent repository check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repository-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: {repository}@{revision}
+"""
+
+
+def require_published(system_root: Path, revision: str) -> None:
+    git(system_root, "remote", "get-url", "origin")
+    git(system_root, "fetch", "--quiet", "origin")
+    containing = git(system_root, "branch", "--remotes", "--contains", revision)
+    if not containing:
+        raise ValueError(f"global system revision is not published on origin: {revision}")
+
+
+def main() -> int:
+    args = parse_args()
+    repo = args.repo.expanduser().resolve()
+    system_root = Path(__file__).resolve().parent.parent
+    errors: list[str] = []
+
+    try:
+        if Path(git(repo, "rev-parse", "--show-toplevel")).resolve() != repo:
+            errors.append(f"--repo must be a Git root: {repo}")
+        catalog = json.loads((system_root / "system.json").read_text(encoding="utf-8"))
+        repository = catalog["repository"]
+        revision = args.system_ref or git(system_root, "rev-parse", "HEAD")
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        print(f"agent-repo-adopt: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        errors.append("system catalog repository is invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        errors.append("--system-ref must be a full 40-character Git SHA")
+    elif not args.allow_unpublished:
+        try:
+            require_published(system_root, revision)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    agents = repo / "AGENTS.md"
+    if not agents.is_file() or first_content_line(agents) != GLOBAL_POINTER:
+        errors.append("AGENTS.md must already begin with the canonical global pointer")
+    claude = repo / "CLAUDE.md"
+    if claude.exists() or claude.is_symlink():
+        if not claude.is_symlink() or claude.resolve() != agents.resolve():
+            errors.append("existing CLAUDE.md is not a symlink to AGENTS.md")
+
+    workflow_path = repo / ".github" / "workflows" / "agent-repository-check.yml"
+    expected = workflow(repository, revision)
+    if workflow_path.exists():
+        current = workflow_path.read_text(encoding="utf-8")
+        if not current.startswith(MANAGED_MARKER + "\n"):
+            errors.append(f"refusing to replace unmanaged workflow: {workflow_path}")
+        elif args.check and current != expected:
+            errors.append(f"managed workflow is not pinned to {revision}")
+    elif args.check:
+        errors.append(f"missing managed workflow: {workflow_path}")
+
+    if errors:
+        for error in errors:
+            print(f"agent-repo-adopt: {error}", file=sys.stderr)
+        return 1
+    if not args.check:
+        if not claude.is_symlink():
+            claude.symlink_to("AGENTS.md")
+        atomic_write(workflow_path, expected)
+
+    result = subprocess.run(
+        [str(system_root / "bin" / "agent-repo-check"), "--repo", str(repo), "--strict"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        print(detail, file=sys.stderr)
+        return result.returncode
+    action = "verified" if args.check else "adopted"
+    print(f"Repository {action}: {repo}")
+    print(f"Global system revision: {revision}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

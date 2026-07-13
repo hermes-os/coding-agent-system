@@ -94,6 +94,20 @@ def load_token(lease_id: str) -> dict:
 
 def coordination_repo(explicit: str | None = None) -> Path:
     configured = explicit or os.environ.get("AGENT_COORDINATION_REPO_DIR")
+    if not configured:
+        agents_home = Path(os.environ.get("AGENTS_HOME", Path.home() / ".agents")).expanduser()
+        config_path = agents_home / "config.json"
+        if config_path.is_file():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise LeaseError(f"invalid agent system config {config_path}: {exc}") from exc
+            if not isinstance(config, dict):
+                raise LeaseError(f"invalid agent system config {config_path}: expected object")
+            value = config.get("coordinationRepo")
+            if value is not None and not isinstance(value, str):
+                raise LeaseError(f"invalid coordinationRepo in {config_path}")
+            configured = value
     if configured:
         candidate = Path(configured).expanduser().resolve()
         if (candidate / ".git").exists():
@@ -101,6 +115,8 @@ def coordination_repo(explicit: str | None = None) -> Path:
         raise LeaseError(f"coordination repository is not a Git checkout: {candidate}")
 
     for candidate in Path(__file__).resolve().parents:
+        if (candidate / ".git").exists() and (candidate / "system.json").is_file():
+            return candidate
         if (candidate / ".git").exists() and (candidate / "agent-system").is_dir():
             return candidate
 

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,7 @@ SYSTEM_ROOT = Path(__file__).resolve().parents[1]
 
 class AgentSystemTests(unittest.TestCase):
     def test_skill_catalog_is_small_and_valid(self):
+        catalog = json.loads((SYSTEM_ROOT / "system.json").read_text(encoding="utf-8"))
         skills = sorted(path for path in (SYSTEM_ROOT / "skills").iterdir() if path.is_dir())
         self.assertEqual(
             [path.name for path in skills],
@@ -30,6 +32,7 @@ class AgentSystemTests(unittest.TestCase):
                 "review",
             ],
         )
+        self.assertEqual([entry["name"] for entry in catalog["skills"]], [path.name for path in skills])
         for skill in skills:
             text = (skill / "SKILL.md").read_text(encoding="utf-8")
             self.assertTrue(text.startswith("---\n"), skill)
@@ -55,7 +58,7 @@ class AgentSystemTests(unittest.TestCase):
             )
             hook.chmod(0o755)
             (skill / "hooks.json").write_text(
-                json.dumps({"events": {"PreToolUse": [{"command": ["block.py"]}]}}),
+                json.dumps({"version": 1, "events": {"PreToolUse": [{"command": ["block.py"]}]}}),
                 encoding="utf-8",
             )
             payload = json.dumps({"cwd": str(root), "command": "echo ok"})
@@ -269,6 +272,13 @@ class AgentSystemTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            config = json.loads((home / ".agents" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(Path(config["coordinationRepo"]), SYSTEM_ROOT)
+            managed = json.loads(
+                (home / ".agents" / "managed-install.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(managed["sourceRoot"], str(SYSTEM_ROOT))
+            self.assertEqual(managed["orphanedPaths"], [])
 
     def test_standard_launchers_add_remote_control_only_to_interactive_work(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -322,59 +332,64 @@ class AgentSystemTests(unittest.TestCase):
                 ],
             )
 
-    def test_vm_codex_helpers_reuse_standalone_install_and_start_remote_control(self):
+    def test_installer_prunes_only_unchanged_retired_managed_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            log = home / "codex.log"
-            codex = home / ".codex" / "packages" / "standalone" / "current" / "bin" / "codex"
-            codex.parent.mkdir(parents=True)
-            codex.write_text(
-                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >>"$AGENT_TEST_LOG"\n',
-                encoding="utf-8",
-            )
-            codex.chmod(0o755)
-            env = {**os.environ, "HOME": str(home), "AGENT_TEST_LOG": str(log)}
-
-            install = subprocess.run(
-                [str(SYSTEM_ROOT.parent / "codex" / "install-standalone.sh")],
-                env=env,
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            self.assertIn("already present", install.stdout)
-            subprocess.run(
-                [str(SYSTEM_ROOT.parent / "codex" / "start-remote-control.sh")],
-                env=env,
-                check=True,
-            )
-            self.assertEqual(log.read_text(encoding="utf-8"), "remote-control start\n")
-
-    def test_prune_removes_known_legacy_memory_and_gate_paths(self):
-        with tempfile.TemporaryDirectory() as temp:
-            home = Path(temp)
-            legacy_files = [
-                home / ".ai" / "scripts" / "quality-gate.sh",
-                home / "ClaudeVault" / "personas" / "Cal" / "journal.md",
-                home / ".claude" / ".git" / "config",
-                home / ".claude" / "scripts" / "tc-hook.log",
-                home / ".claude" / "settings.json.bak.legacy",
-                home / ".claude" / "settings.json.orig",
-            ]
-            for path in legacy_files:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("legacy\n", encoding="utf-8")
-
             subprocess.run(
                 ["bash", str(SYSTEM_ROOT / "install.sh")],
-                env={**os.environ, "HOME": str(home), "AGENT_SYSTEM_PRUNE_LEGACY": "1"},
+                env={**os.environ, "HOME": str(home)},
                 text=True,
                 capture_output=True,
                 check=True,
             )
-
-            for path in legacy_files:
-                self.assertFalse(path.exists(), path)
+            manifest_path = home / ".agents" / "managed-install.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            retired_link = home / ".local" / "bin" / "retired-helper"
+            retired_link.symlink_to(SYSTEM_ROOT / "bin" / "docs-list")
+            retired_copy = home / ".cursor" / "commands" / "retired.md"
+            retired_copy.write_text("retired managed content\n", encoding="utf-8")
+            modified_copy = home / ".cursor" / "commands" / "modified-retired.md"
+            modified_copy.write_text("user changed this\n", encoding="utf-8")
+            outside_copy = home / "outside-managed-roots.md"
+            outside_copy.write_text("retired managed content\n", encoding="utf-8")
+            manifest["paths"].update(
+                {
+                    str(retired_link): {
+                        "kind": "symlink",
+                        "target": str(SYSTEM_ROOT / "bin" / "docs-list"),
+                    },
+                    str(retired_copy): {
+                        "kind": "copy",
+                        "sha256": hashlib.sha256(retired_copy.read_bytes()).hexdigest(),
+                    },
+                    str(modified_copy): {
+                        "kind": "copy",
+                        "sha256": hashlib.sha256(b"original managed content\n").hexdigest(),
+                    },
+                    str(outside_copy): {
+                        "kind": "copy",
+                        "sha256": hashlib.sha256(outside_copy.read_bytes()).hexdigest(),
+                    },
+                }
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            second_install = subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+            detail = f"{second_install.stderr}\n{json.dumps(updated, indent=2)}"
+            self.assertFalse(retired_link.exists(), detail)
+            self.assertFalse(retired_copy.exists(), detail)
+            self.assertTrue(modified_copy.exists())
+            self.assertTrue(outside_copy.exists())
+            self.assertEqual(
+                updated["orphanedPaths"],
+                sorted([str(modified_copy), str(outside_copy)]),
+            )
 
 
 if __name__ == "__main__":

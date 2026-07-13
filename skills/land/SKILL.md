@@ -13,8 +13,9 @@ and changelog conventions without asking for the same approval again.
 
 1. Inspect branch, upstream, working tree, unpushed commits, review state, and
    concurrent changes. Identify the exact files owned by this change.
-2. Review the final diff and run fresh focused checks plus the required gate.
-   Do not land known failures or present old evidence as current.
+2. Review the final diff, run `agent-repo-check --repo "$PWD"` when available,
+   then run fresh focused checks plus the required gate. Do not land known
+   failures or present old evidence as current.
 3. Commit only intended paths. Prefer `committer "<message>" <path>...` when
    available; it leaves unrelated staged work intact. Use the repository's
    commit style.

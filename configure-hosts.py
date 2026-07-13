@@ -2,11 +2,14 @@
 """Install generated host configuration without duplicating canonical policy."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import subprocess
+import sys
 import tempfile
 
 
@@ -69,6 +72,126 @@ def read_json(path):
 
 def write_json(path, value):
     atomic_write(path, json.dumps(value, indent=2, sort_keys=False) + "\n")
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_catalog(system_root):
+    path = system_root / "system.json"
+    catalog = read_json(path)
+    if catalog.get("schemaVersion") != 1:
+        raise SystemExit(f"Unsupported catalog schema in {path}")
+    return catalog
+
+
+def resolve_coordination_repo(system_root, explicit):
+    candidate = Path(explicit).expanduser().resolve() if explicit else system_root.resolve()
+    result = subprocess.run(
+        ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(f"Coordination repository is not a Git checkout: {candidate}")
+    root = Path(result.stdout.strip()).resolve()
+    if root != candidate:
+        raise SystemExit(f"Coordination repository must be a Git root: {candidate}")
+    return root
+
+
+def configure_agent_home(agents_home, coordination_repo):
+    path = agents_home / "config.json"
+    config = read_json(path)
+    config["coordinationRepo"] = str(coordination_repo)
+    write_json(path, config)
+
+
+def managed_entries(home, agents_home, system_root, catalog):
+    entries = {}
+
+    def symlink(path, target):
+        entries[str(path)] = {"kind": "symlink", "target": str(target)}
+
+    def copied(path, source):
+        entries[str(path)] = {"kind": "copy", "sha256": sha256_file(source)}
+
+    symlink(agents_home / "AGENTS.md", system_root / "AGENTS.md")
+    symlink(agents_home / "hooks" / "dispatch.py", system_root / "hooks" / "dispatch.py")
+    symlink(
+        agents_home / "shell" / "default-invocations.sh",
+        system_root / "shell" / "default-invocations.sh",
+    )
+    for adapter in (
+        home / ".codex" / "AGENTS.md",
+        home / ".claude" / "CLAUDE.md",
+        home / ".claude" / "AGENTS.md",
+    ):
+        symlink(adapter, system_root / "AGENTS.md")
+
+    for binary in catalog.get("binaries", []):
+        source = system_root / binary["source"]
+        for destination in (
+            agents_home / "bin" / binary["name"],
+            home / ".local" / "bin" / binary["name"],
+        ):
+            symlink(destination, source)
+
+    for skill in catalog.get("skills", []):
+        name = skill["name"]
+        source = system_root / "skills" / name
+        symlink(agents_home / "skills" / name, source)
+        symlink(home / ".claude" / "skills" / name, source)
+        if skill.get("command") is True:
+            skill_file = source / "SKILL.md"
+            symlink(home / ".codex" / "prompts" / f"{name}.md", skill_file)
+            symlink(home / ".claude" / "commands" / f"{name}.md", skill_file)
+            copied(home / ".cursor" / "commands" / f"{name}.md", skill_file)
+    return entries
+
+
+def matches_managed(path, entry):
+    if entry.get("kind") == "symlink":
+        return path.is_symlink() and str(path.resolve(strict=False)) == entry.get("target")
+    if entry.get("kind") == "copy":
+        return path.is_file() and not path.is_symlink() and sha256_file(path) == entry.get("sha256")
+    return False
+
+
+def contained_by(path, roots):
+    return any(path == root or root in path.parents for root in roots)
+
+
+def prune_stale_managed(manifest_path, desired, allowed_roots):
+    previous = read_json(manifest_path)
+    old_paths = previous.get("paths", {}) if isinstance(previous.get("paths"), dict) else {}
+    orphaned = [
+        path
+        for path in previous.get("orphanedPaths", [])
+        if isinstance(path, str) and Path(path).exists()
+    ]
+    for raw_path, entry in old_paths.items():
+        if raw_path in desired or not isinstance(entry, dict):
+            continue
+        path = Path(raw_path)
+        canonical_path = path.parent.resolve(strict=False) / path.name
+        if not path.is_absolute() or not contained_by(canonical_path, allowed_roots):
+            orphaned.append(raw_path)
+            print(f"Preserved retired path outside managed roots: {path}", file=sys.stderr)
+            continue
+        if matches_managed(path, entry):
+            path.unlink()
+            continue
+        if path.exists() or path.is_symlink():
+            orphaned.append(raw_path)
+            print(f"Preserved modified retired managed path: {path}", file=sys.stderr)
+    return sorted(set(orphaned))
 
 
 def configure_claude(home):
@@ -311,15 +434,44 @@ def configure_cursor(home, policy):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system-root", required=True, type=Path)
+    parser.add_argument("--coordination-repo", type=Path)
     args = parser.parse_args()
     home = Path(os.environ.get("HOME", "~")).expanduser().resolve()
-    policy = (args.system_root / "AGENTS.md").read_text(encoding="utf-8")
+    system_root = args.system_root.expanduser().resolve()
+    agents_home = Path(os.environ.get("AGENTS_HOME", home / ".agents")).expanduser().resolve()
+    catalog = load_catalog(system_root)
+    coordination_repo = resolve_coordination_repo(system_root, args.coordination_repo)
+    policy = (system_root / "AGENTS.md").read_text(encoding="utf-8")
     configure_claude(home)
     configure_codex_hooks(home)
     configure_codex_toml(home)
     configure_cursor(home, policy)
     for name in (".zshrc", ".bashrc", ".bash_profile", ".profile"):
         configure_shell_rc(home / name)
+    configure_agent_home(agents_home, coordination_repo)
+    manifest_path = agents_home / "managed-install.json"
+    entries = managed_entries(home, agents_home, system_root, catalog)
+    allowed_roots = tuple(
+        path.resolve()
+        for path in (
+            agents_home,
+            home / ".codex",
+            home / ".claude",
+            home / ".cursor",
+            home / ".local" / "bin",
+        )
+    )
+    orphaned = prune_stale_managed(manifest_path, entries, allowed_roots)
+    write_json(
+        manifest_path,
+        {
+            "version": 1,
+            "sourceRoot": str(system_root),
+            "catalogSha256": sha256_file(system_root / "system.json"),
+            "paths": entries,
+            "orphanedPaths": orphaned,
+        },
+    )
     return 0
 
 

@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Validate repository wiring and high-signal engineering hygiene."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path, PurePosixPath
+import subprocess
+import sys
+
+
+GLOBAL_POINTER = "READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing)."
+PLAN_SECTIONS = (
+    "Status",
+    "Problem",
+    "Goals",
+    "Non-Goals",
+    "Milestones",
+    "Verification",
+    "Open Questions",
+)
+GENERATED_NAMES = {
+    ".DS_Store",
+    ".coverage",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "coverage.xml",
+}
+SECRET_NAMES = {
+    ".credentials.json",
+    "auth.json",
+    "id_dsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_rsa",
+}
+SECRET_SUFFIXES = {".b64", ".p12", ".pfx", ".secret"}
+HOST_INSTRUCTION_PATHS = {
+    ".cursorrules",
+    ".github/copilot-instructions.md",
+    "CODEX.md",
+}
+LEGACY_PREFIXES = (
+    ".ai/",
+    ".agents/journals/",
+    ".agents/personas/",
+    ".claude/agents/",
+    ".codex/agents/",
+    "docs/handoffs/",
+    "docs/journals/",
+    "docs/sessions/",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--strict", action="store_true", help="fail on warnings too")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    return parser.parse_args()
+
+
+def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def git_paths(repo: Path, *args: str) -> list[str]:
+    result = git(repo, *args, "-z")
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "git path query failed")
+    return [value for value in result.stdout.split("\0") if value]
+
+
+def first_content_line(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def is_env_secret(name: str) -> bool:
+    if name in {".env.example", ".env.sample", ".env.template"}:
+        return False
+    return name == ".env" or name.startswith(".env.")
+
+
+def path_errors(path: str) -> list[str]:
+    pure = PurePosixPath(path)
+    name = pure.name
+    errors: list[str] = []
+    if any(part in GENERATED_NAMES for part in pure.parts):
+        errors.append(f"tracked generated artifact: {path}")
+    if name in SECRET_NAMES or pure.suffix.lower() in SECRET_SUFFIXES or is_env_secret(name):
+        errors.append(f"tracked credential-shaped file: {path}")
+    if path in HOST_INSTRUCTION_PATHS or path.startswith(".cursor/rules/"):
+        errors.append(f"host-specific instruction file duplicates AGENTS.md: {path}")
+    if path == "MEMORY.md" or any(path.startswith(prefix) for prefix in LEGACY_PREFIXES):
+        errors.append(f"legacy persistent context path: {path}")
+    return errors
+
+
+def check_plan(path: Path) -> list[str]:
+    headings = [
+        line[3:].strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("## ")
+    ]
+    missing = [section for section in PLAN_SECTIONS if section not in headings]
+    decision_headings = [
+        heading
+        for heading in headings
+        if "Decision" in heading or heading.startswith("Architecture")
+    ]
+    if not decision_headings:
+        missing.append("Decisions or Architecture Decisions")
+    allowed = set(PLAN_SECTIONS) | set(decision_headings)
+    unexpected = [section for section in headings if section not in allowed]
+    errors: list[str] = []
+    if missing:
+        errors.append(f"{path}: missing plan sections: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"{path}: unexpected plan sections: {', '.join(unexpected)}")
+    return errors
+
+
+def run_check(command: list[str], label: str) -> str | None:
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode == 0:
+        return None
+    detail = result.stderr.strip() or result.stdout.strip()
+    final = detail.splitlines()[-1] if detail else f"exit {result.returncode}"
+    return f"{label} failed: {final}"
+
+
+def main() -> int:
+    args = parse_args()
+    repo = args.repo.expanduser().resolve()
+    system_root = Path(__file__).resolve().parent.parent
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    top = git(repo, "rev-parse", "--show-toplevel")
+    if top.returncode:
+        errors.append(f"not a Git repository: {repo}")
+    elif Path(top.stdout.strip()).resolve() != repo:
+        errors.append(f"--repo must be the Git root: {repo}")
+
+    agents = repo / "AGENTS.md"
+    is_system_repo = repo == system_root
+    if not agents.is_file():
+        errors.append(f"missing repository guide: {agents}")
+    elif is_system_repo:
+        if first_content_line(agents) != "# Global Engineering System":
+            errors.append("canonical system AGENTS.md has an unexpected heading")
+    elif first_content_line(agents) != GLOBAL_POINTER:
+        errors.append("AGENTS.md must begin with the canonical global pointer")
+    if agents.is_file() and agents.stat().st_size > 12_000:
+        warnings.append(f"repository guide exceeds 12 KB: {agents}")
+
+    claude = repo / "CLAUDE.md"
+    if not claude.is_symlink() or claude.resolve() != agents.resolve():
+        errors.append("CLAUDE.md must be a symlink to AGENTS.md")
+
+    try:
+        tracked = git_paths(repo, "ls-files")
+        untracked = git_paths(repo, "ls-files", "--others", "--exclude-standard")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        tracked = []
+        untracked = []
+    for path in tracked:
+        candidate = repo / path
+        if candidate.exists() or candidate.is_symlink():
+            errors.extend(path_errors(path))
+    for path in untracked:
+        for problem in path_errors(path):
+            warnings.append(problem.replace("tracked ", "untracked ", 1))
+
+    docs = repo / "docs"
+    if docs.is_dir():
+        problem = run_check(
+            [str(system_root / "bin" / "docs-list"), "--check", str(repo)],
+            "documentation metadata check",
+        )
+        if problem:
+            errors.append(problem)
+    plan_root = docs / "plan"
+    if plan_root.is_dir():
+        for plan in sorted(plan_root.glob("*.md")):
+            errors.extend(check_plan(plan))
+
+    skill_root = repo / ".agents" / "skills"
+    if skill_root.is_dir():
+        problem = run_check(
+            [
+                str(system_root / "skills" / "maintain-skills" / "scripts" / "skill-audit.py"),
+                "--root",
+                str(skill_root),
+                "--check",
+                "--strict",
+                "--model-neutral",
+            ],
+            "repository skill audit",
+        )
+        if problem:
+            errors.append(problem)
+
+    report = {
+        "repo": str(repo),
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        outcome = "PASS" if not errors and not (args.strict and warnings) else "FAIL"
+        print(f"Repository check: {outcome} ({repo})")
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+
+    return 1 if errors or (args.strict and warnings) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "repository": "hermes-os/coding-agent-system",
+  "policy": "AGENTS.md",
+  "hookEvents": [
+    "Stop",
+    "PreToolUse"
+  ],
+  "skills": [
+    {"name": "behavior-validator", "command": false},
+    {"name": "capabilities", "command": true},
+    {"name": "delegate", "command": true},
+    {"name": "fix-issue", "command": true},
+    {"name": "handoff", "command": true},
+    {"name": "land", "command": true},
+    {"name": "maintain-skills", "command": true},
+    {"name": "pickup", "command": true},
+    {"name": "portfolio", "command": true},
+    {"name": "release", "command": true},
+    {"name": "review", "command": true}
+  ],
+  "binaries": [
+    {"name": "agent-autoreview", "source": "skills/review/scripts/agent-autoreview.py"},
+    {"name": "agent-capabilities", "source": "skills/capabilities/scripts/agent-capabilities.py"},
+    {"name": "agent-claude", "source": "bin/agent-claude"},
+    {"name": "agent-codex", "source": "bin/agent-codex"},
+    {"name": "agent-docs-list", "source": "bin/docs-list"},
+    {"name": "agent-lease", "source": "skills/portfolio/scripts/agent-lease.py"},
+    {"name": "agent-repo-adopt", "source": "bin/agent-repo-adopt"},
+    {"name": "agent-repo-check", "source": "bin/agent-repo-check"},
+    {"name": "agent-repo-inventory", "source": "skills/portfolio/scripts/repo-inventory.py"},
+    {"name": "agent-session-recover", "source": "skills/pickup/scripts/agent-session-recover.py"},
+    {"name": "agent-skill-audit", "source": "skills/maintain-skills/scripts/skill-audit.py"},
+    {"name": "agent-system-doctor", "source": "bin/agent-system-doctor"},
+    {"name": "agent-trash", "source": "bin/agent-trash"},
+    {"name": "committer", "source": "bin/committer"},
+    {"name": "docs-list", "source": "bin/docs-list"}
+  ]
+}

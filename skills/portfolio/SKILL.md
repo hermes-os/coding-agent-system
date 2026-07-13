@@ -33,8 +33,10 @@ Add other roots explicitly. The helper reports Git state and active
 
 ## Leases And Public Gate
 
-The shared coordination repository is the installed agent-system checkout. Its
-temporary remote lock refs provide atomic cross-host ownership without a diary.
+The installer records one shared coordination repository in
+`~/.agents/config.json`. A standalone install defaults to this system checkout;
+an integration layer such as the VM setup may select its own Git repository.
+Temporary remote lock refs provide atomic cross-host ownership without a diary.
 
 ```bash
 head=$(git rev-parse HEAD)

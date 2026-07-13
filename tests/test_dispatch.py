@@ -22,7 +22,15 @@ class DispatchTests(unittest.TestCase):
         )
         hook.chmod(0o755)
         (skill / "hooks.json").write_text(
-            json.dumps({"events": {"PreToolUse": [{"command": ["block.py"]}], "Stop": [{"command": ["block.py"]}]}}),
+            json.dumps(
+                {
+                    "version": 1,
+                    "events": {
+                        "PreToolUse": [{"command": ["block.py"]}],
+                        "Stop": [{"command": ["block.py"]}],
+                    },
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -33,12 +41,14 @@ class DispatchTests(unittest.TestCase):
         event: str,
         home: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        effective_home = home or root / "home"
+        effective_home.mkdir(parents=True, exist_ok=True)
         return subprocess.run(
             [str(DISPATCH), "--host", host, event],
             input=json.dumps({"cwd": str(root)}),
             text=True,
             capture_output=True,
-            env={**os.environ, "HOME": str(home)} if home else None,
+            env={**os.environ, "HOME": str(effective_home)},
             check=False,
         )
 
@@ -75,6 +85,33 @@ class DispatchTests(unittest.TestCase):
             result = self.run_dispatch(root, "claude", "PreToolUse", home=home)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    def test_duplicate_hook_skill_names_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            home = Path(temp) / "home"
+            root.mkdir()
+            self.repo_with_blocking_hook(root)
+            self.repo_with_blocking_hook(home)
+            result = self.run_dispatch(root, "claude", "PreToolUse", home=home)
+        self.assertEqual(result.returncode, 0)
+        response = json.loads(result.stdout)
+        self.assertEqual(response["decision"], "block")
+        self.assertIn("duplicate hook skill name", response["reason"])
+
+    def test_invalid_inactive_event_entry_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.repo_with_blocking_hook(root)
+            manifest = root / ".agents" / "skills" / "example" / "hooks.json"
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+            value["events"]["Stop"][0]["unexpected"] = True
+            manifest.write_text(json.dumps(value), encoding="utf-8")
+            result = self.run_dispatch(root, "claude", "PreToolUse")
+        self.assertEqual(result.returncode, 0)
+        response = json.loads(result.stdout)
+        self.assertEqual(response["decision"], "block")
+        self.assertIn("unknown keys", response["reason"])
 
 
 if __name__ == "__main__":

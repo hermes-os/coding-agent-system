@@ -32,6 +32,9 @@ skills add job workflows.
 - Define observable success criteria before substantial edits.
 - Add or update focused tests for changed behavior when practical.
 - Run narrow checks first, then the repository's required gate.
+- Before delivery, run `agent-repo-check --repo "$PWD"` when available. It
+  validates instruction, skill, hook, plan, and clutter hygiene; it does not
+  replace the repository's project-specific gate.
 - Use `review` for non-trivial or risky diffs. Freeze the exact candidate,
   validate its structured result, and verify each finding against real code.
 - Use `behavior-validator` when user-visible behavior needs source-blind proof.

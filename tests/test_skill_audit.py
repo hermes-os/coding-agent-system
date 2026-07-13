@@ -34,7 +34,7 @@ class SkillAuditTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (skill / "hooks.json").write_text(
-                json.dumps({"events": {"Stop": [{"command": ["../escape.sh"]}]}}),
+                json.dumps({"version": 1, "events": {"Stop": [{"command": ["../escape.sh"]}]}}),
                 encoding="utf-8",
             )
             result = subprocess.run(
@@ -48,6 +48,47 @@ class SkillAuditTests(unittest.TestCase):
             self.assertTrue(any("TODO" in error for error in report["errors"]))
             self.assertTrue(any("escapes the skill" in error for error in report["errors"]))
             self.assertTrue(any("differs from canonical folder" in warning for warning in report["warnings"]))
+
+    def test_rejects_unknown_hook_schema_and_model_pin_in_owned_script(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "skills"
+            skill = root / "fixture"
+            script = skill / "hooks" / "check.py"
+            script.parent.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: fixture\ndescription: Fixture skill.\n---\n# Fixture\n",
+                encoding="utf-8",
+            )
+            script.write_text("#!/usr/bin/env python3\nMODEL = 'Grok 4.5'\n", encoding="utf-8")
+            script.chmod(0o755)
+            (skill / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "events": {"AfterEverything": [{"command": ["hooks/check.py"], "extra": True}]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    str(AUDIT),
+                    "--root",
+                    str(root),
+                    "--check",
+                    "--strict",
+                    "--model-neutral",
+                    "--json",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            report = json.loads(result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(any("unsupported hook event" in error for error in report["errors"]))
+            self.assertTrue(any("unknown keys" in error for error in report["errors"]))
+            self.assertTrue(any("versioned-model" in warning for warning in report["warnings"]))
 
     def test_live_mode_does_not_assume_plugin_caches_are_loaded(self):
         with tempfile.TemporaryDirectory() as temp:
