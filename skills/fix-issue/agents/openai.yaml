@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fix Issue"
+  short_description: "Resolve an issue with proof and complete authorized delivery"
+  default_prompt: "Use $fix-issue to investigate and resolve this issue end to end."

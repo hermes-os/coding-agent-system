@@ -50,6 +50,8 @@ skills add job workflows.
   questions. Update it in place; never create parallel trackers.
 - Milestones must be small and independently landable. Delivery follows the
   repository's branch and review convention.
+- Use `portfolio` for cross-repository coordination. Reconstruct status from
+  repositories and active plans instead of maintaining a global diary.
 - Use `handoff` when pausing and `pickup` when resuming. Handoffs report current
   evidence; they are not an append-only memory store.
 - On completion, move durable product facts into canonical docs and user-facing
@@ -60,6 +62,8 @@ skills add job workflows.
 
 - Safe inspection commands are always allowed.
 - Never discard, overwrite, or revert unrelated work.
+- Prefer `committer` with explicit paths when creating a commit in a dirty or
+  concurrently edited repository.
 - A request to implement authorizes local edits and tests. A request to land,
   ship, publish, or deploy authorizes the matching commit/push/deploy sequence.
 - Destructive commands and irreversible production or data actions must remain
@@ -79,6 +83,8 @@ skills add job workflows.
   workflow policy.
 - Skill hooks live with the skill. Global hook configuration only dispatches
   to active global and repository skill manifests.
+- Use `maintain-skills` for catalog hygiene and `capabilities` when the current
+  host's available tooling is unclear.
 
 ## Repository Adapters
 

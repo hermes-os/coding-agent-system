@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -15,7 +16,19 @@ class AgentSystemTests(unittest.TestCase):
         skills = sorted(path for path in (SYSTEM_ROOT / "skills").iterdir() if path.is_dir())
         self.assertEqual(
             [path.name for path in skills],
-            ["behavior-validator", "delegate", "handoff", "pickup", "review"],
+            [
+                "behavior-validator",
+                "capabilities",
+                "delegate",
+                "fix-issue",
+                "handoff",
+                "land",
+                "maintain-skills",
+                "pickup",
+                "portfolio",
+                "release",
+                "review",
+            ],
         )
         for skill in skills:
             text = (skill / "SKILL.md").read_text(encoding="utf-8")
@@ -26,7 +39,8 @@ class AgentSystemTests(unittest.TestCase):
     def test_policy_and_skills_do_not_pin_model_identities(self):
         files = [SYSTEM_ROOT / "AGENTS.md", *(SYSTEM_ROOT / "skills").glob("*/SKILL.md")]
         text = "\n".join(path.read_text(encoding="utf-8") for path in files)
-        for marker in ("--model", "CLAUDE_CODE_SUBAGENT_MODEL", "claude-opus", "claude-sonnet", "gpt-"):
+        self.assertIsNone(re.search(r"(?<![\w-])--model(?:\s|=)", text.lower()))
+        for marker in ("CLAUDE_CODE_SUBAGENT_MODEL", "claude-opus", "claude-sonnet", "gpt-"):
             self.assertNotIn(marker, text.lower())
 
     def test_dispatcher_translates_blocks_for_each_host(self):
@@ -196,6 +210,23 @@ class AgentSystemTests(unittest.TestCase):
             )
             self.assertTrue((home / ".cursor" / "commands" / "pickup.md").is_file())
             self.assertTrue((home / ".cursor" / "commands" / "delegate.md").is_file())
+            self.assertTrue((home / ".cursor" / "commands" / "land.md").is_file())
+            self.assertEqual(
+                (home / ".local" / "bin" / "committer").resolve(),
+                SYSTEM_ROOT / "bin" / "committer",
+            )
+            self.assertEqual(
+                (home / ".local" / "bin" / "agent-skill-audit").resolve(),
+                SYSTEM_ROOT / "skills" / "maintain-skills" / "scripts" / "skill-audit.py",
+            )
+            self.assertEqual(
+                (home / ".local" / "bin" / "agent-capabilities").resolve(),
+                SYSTEM_ROOT / "skills" / "capabilities" / "scripts" / "agent-capabilities.py",
+            )
+            self.assertEqual(
+                (home / ".local" / "bin" / "agent-repo-inventory").resolve(),
+                SYSTEM_ROOT / "skills" / "portfolio" / "scripts" / "repo-inventory.py",
+            )
             cursor_hooks = json.loads((home / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
             self.assertEqual(cursor_hooks["version"], 1)
             doctor = subprocess.run(

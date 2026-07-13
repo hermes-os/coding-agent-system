@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Project"
+  short_description: "Prepare publish and verify a project release"
+  default_prompt: "Use $release to run this project release through verification."

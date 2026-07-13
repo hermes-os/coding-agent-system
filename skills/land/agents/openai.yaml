@@ -1,0 +1,4 @@
+interface:
+  display_name: "Land Change"
+  short_description: "Verify and land a completed change safely"
+  default_prompt: "Use $land to verify and land the current change."

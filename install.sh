@@ -39,9 +39,29 @@ link_managed "$SYSTEM_ROOT/AGENTS.md" "$AGENTS_HOME/AGENTS.md"
 link_managed "$SYSTEM_ROOT/hooks/dispatch.py" "$AGENTS_HOME/hooks/dispatch.py"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$AGENTS_HOME/bin/docs-list"
 link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$AGENTS_HOME/bin/agent-system-doctor"
+link_managed "$SYSTEM_ROOT/bin/committer" "$AGENTS_HOME/bin/committer"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/docs-list"
 link_managed "$SYSTEM_ROOT/bin/docs-list" "$HOME/.local/bin/agent-docs-list"
 link_managed "$SYSTEM_ROOT/bin/agent-system-doctor" "$HOME/.local/bin/agent-system-doctor"
+link_managed "$SYSTEM_ROOT/bin/committer" "$HOME/.local/bin/committer"
+link_managed \
+  "$SYSTEM_ROOT/skills/maintain-skills/scripts/skill-audit.py" \
+  "$AGENTS_HOME/bin/agent-skill-audit"
+link_managed \
+  "$SYSTEM_ROOT/skills/maintain-skills/scripts/skill-audit.py" \
+  "$HOME/.local/bin/agent-skill-audit"
+link_managed \
+  "$SYSTEM_ROOT/skills/capabilities/scripts/agent-capabilities.py" \
+  "$AGENTS_HOME/bin/agent-capabilities"
+link_managed \
+  "$SYSTEM_ROOT/skills/capabilities/scripts/agent-capabilities.py" \
+  "$HOME/.local/bin/agent-capabilities"
+link_managed \
+  "$SYSTEM_ROOT/skills/portfolio/scripts/repo-inventory.py" \
+  "$AGENTS_HOME/bin/agent-repo-inventory"
+link_managed \
+  "$SYSTEM_ROOT/skills/portfolio/scripts/repo-inventory.py" \
+  "$HOME/.local/bin/agent-repo-inventory"
 
 for skill in "$SYSTEM_ROOT"/skills/*; do
   [[ -f "$skill/SKILL.md" ]] || continue
@@ -54,7 +74,20 @@ link_managed "$SYSTEM_ROOT/AGENTS.md" "$HOME/.codex/AGENTS.md"
 link_managed "$SYSTEM_ROOT/AGENTS.md" "$HOME/.claude/CLAUDE.md"
 link_managed "$SYSTEM_ROOT/AGENTS.md" "$HOME/.claude/AGENTS.md"
 
-for name in handoff pickup delegate review; do
+command_skills=(
+  capabilities
+  delegate
+  fix-issue
+  handoff
+  land
+  maintain-skills
+  pickup
+  portfolio
+  release
+  review
+)
+
+for name in "${command_skills[@]}"; do
   source="$SYSTEM_ROOT/skills/$name/SKILL.md"
   link_managed "$source" "$HOME/.codex/prompts/$name.md"
   link_managed "$source" "$HOME/.claude/commands/$name.md"
@@ -103,6 +136,11 @@ if [[ "${AGENT_SYSTEM_PRUNE_LEGACY:-0}" == "1" ]]; then
     remove_managed_path "$path"
   done
   for path in "$HOME"/.claude/settings.json.bak.*; do
+    remove_managed_path "$path"
+  done
+  for path in \
+    "$HOME"/.codex/plugins/cache/claude-plugins-official/plugin-backup-* \
+    "$HOME"/.codex/plugins/cache/claude-plugins-official/plugin-install-*; do
     remove_managed_path "$path"
   done
   rmdir "$HOME/.claude/scripts" "$HOME/.claude/hooks" 2>/dev/null || true

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -18,6 +19,31 @@ CLAUDE_MODEL_ENV_KEYS = {
     "CLAUDE_MODEL",
     "CLAUDE_CODE_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
+}
+
+REQUIRED_SKILLS = {
+    "behavior-validator",
+    "capabilities",
+    "delegate",
+    "fix-issue",
+    "handoff",
+    "land",
+    "maintain-skills",
+    "pickup",
+    "portfolio",
+    "release",
+    "review",
+}
+
+COMMAND_SKILLS = REQUIRED_SKILLS - {"behavior-validator"}
+
+REQUIRED_BINARIES = {
+    "agent-capabilities",
+    "agent-docs-list",
+    "agent-repo-inventory",
+    "agent-skill-audit",
+    "agent-system-doctor",
+    "committer",
 }
 
 
@@ -69,17 +95,32 @@ def main() -> int:
         for path in (agents / "skills").iterdir()
         if path.is_dir() and (path / "SKILL.md").is_file()
     ) if (agents / "skills").is_dir() else []
-    required = {"behavior-validator", "delegate", "handoff", "pickup", "review"}
-    missing = sorted(required - set(skills))
+    missing = sorted(REQUIRED_SKILLS - set(skills))
     if missing:
         errors.append(f"missing global skills: {', '.join(missing)}")
 
-    for name in required & set(skills):
+    for name in REQUIRED_SKILLS & set(skills):
         skill = agents / "skills" / name / "SKILL.md"
         text = skill.read_text(encoding="utf-8")
         frontmatter = text.split("---", 2)[1] if text.startswith("---\n") else ""
         if f"name: {name}\n" not in frontmatter or "description:" not in frontmatter:
             errors.append(f"invalid skill frontmatter {skill}")
+
+    for binary in REQUIRED_BINARIES:
+        path = home / ".local" / "bin" / binary
+        if not path.is_file() or not os.access(path, os.X_OK):
+            errors.append(f"missing executable helper {path}")
+
+    for name in COMMAND_SKILLS:
+        codex = home / ".codex" / "prompts" / f"{name}.md"
+        claude = home / ".claude" / "commands" / f"{name}.md"
+        cursor = home / ".cursor" / "commands" / f"{name}.md"
+        if not codex.is_file():
+            errors.append(f"missing Codex command {codex}")
+        if not claude.is_file():
+            errors.append(f"missing Claude command {claude}")
+        if not cursor.is_file():
+            errors.append(f"missing Cursor command {cursor}")
 
     for config in (
         home / ".codex" / "hooks.json",
@@ -133,7 +174,7 @@ def main() -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
     print("Agent system doctor: PASS")
-    print(f"Global skills: {', '.join(sorted(required))}")
+    print(f"Global skills: {', '.join(skills)}")
     return 0
 
 

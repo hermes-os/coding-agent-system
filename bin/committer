@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Path-scoped commit helper adapted from steipete/agent-scripts.
+set -euo pipefail
+set -f
+
+usage() {
+  printf 'Usage: %s "commit message" <path> [path ...]\n' "$(basename "$0")" >&2
+  exit 2
+}
+
+[[ $# -ge 2 ]] || usage
+
+message=$1
+shift
+[[ "$message" == *[![:space:]]* ]] || {
+  echo "Error: commit message must not be empty." >&2
+  exit 1
+}
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "Error: not inside a Git repository." >&2
+  exit 1
+}
+cd "$root"
+
+paths=("$@")
+for path in "${paths[@]}"; do
+  case "$path" in
+    . | ./ | "$root" | "$root"/)
+      echo 'Error: repository-wide path is not allowed; list owned paths explicitly.' >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ -e "$path" || -L "$path" ]]; then
+    # Intent-to-add discovers new files below tracked directories while
+    # leaving tracked content and unrelated staged entries untouched.
+    git add --intent-to-add -- "$path"
+  elif ! git ls-files --error-unmatch -- "$path" >/dev/null 2>&1 \
+    && ! git cat-file -e "HEAD:$path" 2>/dev/null; then
+    printf 'Error: path is neither present nor tracked: %s\n' "$path" >&2
+    exit 1
+  fi
+done
+
+if [[ -z "$(git status --porcelain=v1 --untracked-files=all -- "${paths[@]}")" ]]; then
+  printf 'Error: no changes found for: %s\n' "${paths[*]}" >&2
+  exit 1
+fi
+
+git diff --check -- "${paths[@]}"
+git commit --only -m "$message" -- "${paths[@]}"
+printf 'Committed %d path(s) without changing unrelated staged entries.\n' "${#paths[@]}"

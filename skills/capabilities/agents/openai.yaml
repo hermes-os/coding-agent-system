@@ -1,0 +1,4 @@
+interface:
+  display_name: "Host Capabilities"
+  short_description: "Discover available tools hosts and scoped skills"
+  default_prompt: "Use $capabilities to inventory the tools and skills available for this task."
