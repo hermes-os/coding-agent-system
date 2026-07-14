@@ -361,6 +361,71 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("does not contain working directory", response["reason"])
         self.assertNotIn("retry this", response["reason"])
 
+    def test_git_config_cannot_redirect_repository_hooks_to_ancestor_worktree(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            worktree = base / "worktree"
+            metadata = worktree / "metadata"
+            metadata.mkdir(parents=True)
+            self.init_repository(metadata)
+            self.repo_with_blocking_hook(worktree)
+            subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(metadata / ".git"),
+                    "config",
+                    "core.worktree",
+                    str(worktree),
+                ],
+                text=True,
+                capture_output=True,
+                env=self.clean_git_environment(),
+                check=True,
+            )
+            result = self.run_dispatch(
+                metadata,
+                "claude",
+                "PreToolUse",
+                repository=None,
+            )
+        self.assertEqual(result.returncode, 0)
+        response = json.loads(result.stdout)
+        self.assertEqual(response["decision"], "block")
+        self.assertIn("does not match resolved root", response["reason"])
+        self.assertNotIn("retry this", response["reason"])
+
+    def test_separate_git_directory_keeps_repository_hooks_active(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            repository = base / "repository"
+            git_directory = base / "git-directory"
+            subprocess.run(
+                [
+                    "git",
+                    "init",
+                    "--quiet",
+                    "--separate-git-dir",
+                    str(git_directory),
+                    str(repository),
+                ],
+                text=True,
+                capture_output=True,
+                env=self.clean_git_environment(),
+                check=True,
+            )
+            self.repo_with_blocking_hook(repository)
+            result = self.run_dispatch(
+                repository,
+                "claude",
+                "PreToolUse",
+                repository=None,
+            )
+        self.assertEqual(result.returncode, 0)
+        response = json.loads(result.stdout)
+        self.assertEqual(response["decision"], "block")
+        self.assertEqual(response["reason"], "retry this")
+
     def test_home_workspace_case_alias_does_not_rediscover_global_skills(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp) / "home"

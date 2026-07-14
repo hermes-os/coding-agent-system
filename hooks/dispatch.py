@@ -161,6 +161,15 @@ def project_context(payload: dict, timeout: float | None = None) -> ProjectConte
             raise ValueError(
                 f"Git repository root {repository_root} does not contain working directory {start}"
             )
+        marker = git_repository_marker(start)
+        if marker is None or not same_non_symlink_location(
+            marker,
+            repository_root / ".git",
+        ):
+            raise ValueError(
+                f"Git repository marker {marker or '<missing>'} does not match resolved root "
+                f"{repository_root}"
+            )
         return ProjectContext(start, repository_root)
 
     marker = git_repository_marker(start)
