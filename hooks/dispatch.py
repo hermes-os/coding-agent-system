@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -30,6 +31,16 @@ MAX_RUNTIME_SKILLS = 256
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_HOOK_OUTPUT_BYTES = 256 * 1024
 PROCESS_GROUP_GRACE_SECONDS = 0.2
+GIT_DISCOVERY_ENVIRONMENT = (
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +48,12 @@ class HookOwner:
     manifest: Path
     boundary: Path
     reject_symlinks: bool
+
+
+@dataclass(frozen=True)
+class ProjectContext:
+    workdir: Path
+    repository_root: Path | None
 
 
 class HookOutputLimitError(ValueError):
@@ -80,22 +97,72 @@ def payload_cwd(payload: dict) -> Path:
     return Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
-def project_root(payload: dict, timeout: float | None = None) -> Path:
-    start = payload_cwd(payload).resolve()
+def git_repository_marker(start: Path) -> Path | None:
+    try:
+        device = start.stat().st_dev
+    except OSError as exc:
+        raise ValueError(f"cannot inspect hook working directory {start}: {exc}") from exc
+    for directory in (start, *start.parents):
+        try:
+            if directory.stat().st_dev != device:
+                break
+        except OSError as exc:
+            raise ValueError(f"cannot inspect Git discovery path {directory}: {exc}") from exc
+        marker = directory / ".git"
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(f"cannot inspect Git repository marker {marker}: {exc}") from exc
+        return marker
+    return None
+
+
+def project_context(payload: dict, timeout: float | None = None) -> ProjectContext:
+    try:
+        start = payload_cwd(payload).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"cannot resolve hook working directory: {exc}") from exc
+    environment = os.environ.copy()
+    for name in GIT_DISCOVERY_ENVIRONMENT:
+        environment.pop(name, None)
     try:
         result = subprocess.run(
             ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            env=environment,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=timeout,
             check=False,
         )
-        return Path(result.stdout.strip()).resolve() if result.returncode == 0 else start
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError("event-wide hook budget exhausted during project discovery") from exc
     except OSError:
-        return start
+        result = None
+
+    if result is not None and result.returncode == 0:
+        repository = result.stdout.strip()
+        if not repository:
+            raise ValueError("Git returned an empty repository root")
+        try:
+            repository_root = Path(repository).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"cannot resolve Git repository root {repository}: {exc}") from exc
+        if not any(
+            same_non_symlink_location(repository_root, candidate)
+            for candidate in (start, *start.parents)
+        ):
+            raise ValueError(
+                f"Git repository root {repository_root} does not contain working directory {start}"
+            )
+        return ProjectContext(start, repository_root)
+
+    marker = git_repository_marker(start)
+    if marker is not None:
+        raise ValueError(f"cannot resolve Git repository containing {marker}")
+    return ProjectContext(start, None)
 
 
 def emit(host: str, event: str, reason: str | None = None) -> int:
@@ -245,14 +312,51 @@ def repository_hook_owners(root: Path) -> list[HookOwner]:
     return owners
 
 
-def hook_manifests(root: Path) -> list[HookOwner]:
+def path_location(path: Path) -> Path:
+    """Normalize a path without following its final symlink component."""
+    return path.parent.resolve(strict=False) / path.name
+
+
+def same_non_symlink_location(left: Path, right: Path) -> bool:
+    """Compare filesystem identity without accepting final-component symlink aliases."""
+    if path_location(left) == path_location(right):
+        return True
+    try:
+        left_stat = left.lstat()
+        right_stat = right.lstat()
+    except OSError:
+        left_stat = None
+        right_stat = None
+    if left_stat is not None and right_stat is not None:
+        left_is_symlink = stat.S_ISLNK(left_stat.st_mode)
+        right_is_symlink = stat.S_ISLNK(right_stat.st_mode)
+        if left_is_symlink or right_is_symlink:
+            return (
+                left_is_symlink
+                and right_is_symlink
+                and os.path.samestat(left_stat, right_stat)
+            )
+    try:
+        return left.samefile(right)
+    except OSError:
+        return path_location(left) == path_location(right)
+
+
+def hook_manifests(repository_root: Path | None) -> list[HookOwner]:
     agents_home = Path(os.environ.get("AGENTS_HOME", Path.home() / ".agents")).expanduser()
+    global_owners = global_hook_owners(agents_home)
+    repository_owners = (
+        []
+        if repository_root is None
+        or same_non_symlink_location(repository_root / ".agents", agents_home)
+        else repository_hook_owners(repository_root)
+    )
     manifests: list[HookOwner] = []
     seen: set[Path] = set()
     owners: dict[str, Path] = {}
     for discovered in (
-        global_hook_owners(agents_home),
-        repository_hook_owners(root),
+        global_owners,
+        repository_owners,
     ):
         for owner in discovered:
             resolved = owner.manifest.resolve()
@@ -331,14 +435,14 @@ def require_time(deadline: float, phase: str) -> float:
 
 
 def scheduled_hooks(
-    root: Path,
+    repository_root: Path | None,
     event: str,
     allowed_events: set[str],
     budgets: dict[str, int],
     deadline: float,
 ) -> list[tuple[HookOwner, dict]]:
     require_time(deadline, "skill discovery")
-    owners = hook_manifests(root)
+    owners = hook_manifests(repository_root)
     require_time(deadline, "skill discovery")
     scheduled: list[tuple[HookOwner, dict]] = []
     for owner in owners:
@@ -506,12 +610,19 @@ def main() -> int:
             raise ValueError(f"unsupported hook event {event!r}")
         deadline = started + budgets[event]
         remaining = require_time(deadline, "project discovery")
-        root = project_root(payload, remaining)
+        context = project_context(payload, remaining)
         require_time(deadline, "project discovery")
-        scheduled = scheduled_hooks(root, event, allowed_events, budgets, deadline)
+        scheduled = scheduled_hooks(
+            context.repository_root,
+            event,
+            allowed_events,
+            budgets,
+            deadline,
+        )
     except (TimeoutError, ValueError) as exc:
         return emit(args.host, event, f"Invalid skill hook configuration: {exc}")
 
+    root = context.repository_root or context.workdir
     declared_total = sum(entry.get("timeoutSeconds", 300) for _, entry in scheduled)
     if declared_total > budgets[event]:
         return emit(

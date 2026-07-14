@@ -43,6 +43,15 @@ Remote Control and bypass-permission invocation behavior. Integrations such as
 the VM setup call `install.sh --host-integration /path/to/integration`; the
 shared catalog never owns those launchers.
 
+Global skill hooks remain available from any working directory. Repository
+skill hooks are discovered only after Git resolves the working directory to a
+repository root, so a home directory, scratch directory, or cross-repository
+launcher cannot accidentally reinterpret its `.agents` tree as project policy.
+A directory with a broken or inaccessible `.git` marker still fails closed;
+inside a valid repository, all repository hook validation remains strict. Start
+the agent in the target repository when that repository's local hooks should
+apply.
+
 Use `install.sh --coordination-repo /path/to/git-root` when a host integration
 should keep cross-host lease refs in a different repository. The chosen path is
 recorded locally in `~/.agents/config.json`; it is host state, not project

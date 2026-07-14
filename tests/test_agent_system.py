@@ -12,6 +12,16 @@ import unittest
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]
+GIT_DISCOVERY_ENVIRONMENT = (
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+)
 
 
 class AgentSystemTests(unittest.TestCase):
@@ -54,6 +64,16 @@ class AgentSystemTests(unittest.TestCase):
     def test_dispatcher_translates_blocks_for_each_host(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            git_env = os.environ.copy()
+            for name in GIT_DISCOVERY_ENVIRONMENT:
+                git_env.pop(name, None)
+            subprocess.run(
+                ["git", "init", "--quiet", str(root)],
+                text=True,
+                capture_output=True,
+                env=git_env,
+                check=True,
+            )
             skill = root / ".agents" / "skills" / "fixture"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text(
@@ -71,7 +91,8 @@ class AgentSystemTests(unittest.TestCase):
                 encoding="utf-8",
             )
             payload = json.dumps({"cwd": str(root), "command": "echo ok"})
-            env = {**os.environ, "HOME": str(root / "home")}
+            env = {**git_env, "HOME": str(root / "home")}
+            env.pop("AGENTS_HOME", None)
             for host, expected in (("claude", "decision"), ("codex", "decision")):
                 result = subprocess.run(
                     [str(SYSTEM_ROOT / "hooks" / "dispatch.py"), "--host", host, "PreToolUse"],
