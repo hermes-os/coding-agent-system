@@ -292,6 +292,40 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
 
+    def test_hook_git_commands_share_sanitized_repository_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            repository = base / "repository"
+            redirected = base / "redirected"
+            repository.mkdir()
+            redirected.mkdir()
+            self.repo_with_blocking_hook(repository)
+            self.init_repository(redirected)
+            hook = repository / ".agents" / "skills" / "example" / "block.py"
+            hook.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, subprocess\n"
+                "root = subprocess.run(\n"
+                "    ['git', 'rev-parse', '--show-toplevel'],\n"
+                "    check=True, capture_output=True, text=True,\n"
+                ").stdout.strip()\n"
+                "print(json.dumps({'decision': 'block', 'reason': root}))\n",
+                encoding="utf-8",
+            )
+            result = self.run_dispatch(
+                repository,
+                "claude",
+                "PreToolUse",
+                extra_env={
+                    "GIT_DIR": str(redirected / ".git"),
+                    "GIT_WORK_TREE": str(redirected),
+                },
+            )
+        self.assertEqual(result.returncode, 0)
+        response = json.loads(result.stdout)
+        self.assertEqual(response["decision"], "block")
+        self.assertEqual(response["reason"], str(repository.resolve()))
+
     def test_git_config_cannot_redirect_repository_hooks_outside_working_directory(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)

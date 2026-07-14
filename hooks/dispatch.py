@@ -119,18 +119,22 @@ def git_repository_marker(start: Path) -> Path | None:
     return None
 
 
+def sanitized_git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in GIT_DISCOVERY_ENVIRONMENT:
+        environment.pop(name, None)
+    return environment
+
+
 def project_context(payload: dict, timeout: float | None = None) -> ProjectContext:
     try:
         start = payload_cwd(payload).resolve()
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"cannot resolve hook working directory: {exc}") from exc
-    environment = os.environ.copy()
-    for name in GIT_DISCOVERY_ENVIRONMENT:
-        environment.pop(name, None)
     try:
         result = subprocess.run(
             ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
-            env=environment,
+            env=sanitized_git_environment(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -643,7 +647,7 @@ def main() -> int:
             argv = safe_command(owner, command)
             remaining = require_time(deadline, "hook execution")
             timeout = min(entry.get("timeoutSeconds", 300), remaining)
-            env = os.environ.copy()
+            env = sanitized_git_environment()
             env.update({
                 "AGENT_HOOK_EVENT": event,
                 "AGENT_HOOK_HOST": args.host,
