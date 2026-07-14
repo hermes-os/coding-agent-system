@@ -12,14 +12,26 @@ from unittest import mock
 
 
 DISPATCH = Path(__file__).parents[1] / "hooks" / "dispatch.py"
-GIT_DISCOVERY_ENVIRONMENT = (
+GIT_REPOSITORY_ENVIRONMENT = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES",
     "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
     "GIT_DIR",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GRAFT_FILE",
     "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
     "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
     "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
     "GIT_WORK_TREE",
 )
 
@@ -27,7 +39,7 @@ GIT_DISCOVERY_ENVIRONMENT = (
 class DispatchTests(unittest.TestCase):
     def clean_git_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
-        for name in GIT_DISCOVERY_ENVIRONMENT:
+        for name in GIT_REPOSITORY_ENVIRONMENT:
             environment.pop(name, None)
         return environment
 
@@ -292,6 +304,24 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
 
+    def test_git_sanitizer_covers_reported_repository_local_environment(self):
+        functions = runpy.run_path(str(DISPATCH))
+        configured = set(functions["GIT_REPOSITORY_ENVIRONMENT"])
+        reported = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(DISPATCH.parents[1]),
+                "rev-parse",
+                "--local-env-vars",
+            ],
+            text=True,
+            capture_output=True,
+            env=self.clean_git_environment(),
+            check=True,
+        )
+        self.assertLessEqual(set(reported.stdout.splitlines()), configured)
+
     def test_hook_git_commands_share_sanitized_repository_context(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -305,11 +335,16 @@ class DispatchTests(unittest.TestCase):
             hook.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, subprocess\n"
-                "root = subprocess.run(\n"
-                "    ['git', 'rev-parse', '--show-toplevel'],\n"
-                "    check=True, capture_output=True, text=True,\n"
-                ").stdout.strip()\n"
-                "print(json.dumps({'decision': 'block', 'reason': root}))\n",
+                "def git_path(*arguments):\n"
+                "    return subprocess.run(\n"
+                "        ['git', *arguments], check=True, capture_output=True, text=True,\n"
+                "    ).stdout.strip()\n"
+                "paths = [\n"
+                "    git_path('rev-parse', '--show-toplevel'),\n"
+                "    git_path('rev-parse', '--git-path', 'index'),\n"
+                "    git_path('rev-parse', '--git-path', 'objects'),\n"
+                "]\n"
+                "print(json.dumps({'decision': 'block', 'reason': '|'.join(paths)}))\n",
                 encoding="utf-8",
             )
             result = self.run_dispatch(
@@ -319,12 +354,17 @@ class DispatchTests(unittest.TestCase):
                 extra_env={
                     "GIT_DIR": str(redirected / ".git"),
                     "GIT_WORK_TREE": str(redirected),
+                    "GIT_INDEX_FILE": str(redirected / ".git" / "index"),
+                    "GIT_OBJECT_DIRECTORY": str(redirected / ".git" / "objects"),
                 },
             )
         self.assertEqual(result.returncode, 0)
         response = json.loads(result.stdout)
         self.assertEqual(response["decision"], "block")
-        self.assertEqual(response["reason"], str(repository.resolve()))
+        self.assertEqual(
+            response["reason"],
+            f"{repository.resolve()}|.git/index|.git/objects",
+        )
 
     def test_git_config_cannot_redirect_repository_hooks_outside_working_directory(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -12,14 +12,26 @@ import unittest
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]
-GIT_DISCOVERY_ENVIRONMENT = (
+GIT_REPOSITORY_ENVIRONMENT = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES",
     "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
     "GIT_DIR",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GRAFT_FILE",
     "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
     "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
     "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
     "GIT_WORK_TREE",
 )
 
@@ -65,7 +77,7 @@ class AgentSystemTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             git_env = os.environ.copy()
-            for name in GIT_DISCOVERY_ENVIRONMENT:
+            for name in GIT_REPOSITORY_ENVIRONMENT:
                 git_env.pop(name, None)
             subprocess.run(
                 ["git", "init", "--quiet", str(root)],
