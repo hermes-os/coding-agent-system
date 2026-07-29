@@ -12,6 +12,9 @@ import sys
 
 
 GLOBAL_POINTER = "READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing)."
+REPOSITORY_POLICY_PATH = ".agents/repository.json"
+ASSISTANT_WORKSPACE_KIND = "assistant-workspace"
+REGULAR_GIT_MODES = {"100644", "100755"}
 PLAN_SECTIONS = (
     "Status",
     "Problem",
@@ -65,10 +68,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     return subprocess.run(
         ["git", "-C", str(repo), *args],
         text=True,
         capture_output=True,
+        env=env,
         check=False,
     )
 
@@ -78,6 +84,76 @@ def git_paths(repo: Path, *args: str) -> list[str]:
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "git path query failed")
     return [value for value in result.stdout.split("\0") if value]
+
+
+def git_index_entry(repo: Path, path: str) -> tuple[str, str] | None:
+    result = git(repo, "ls-files", "--stage", "--", path)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"git index query failed: {path}")
+    lines = [line for line in result.stdout.splitlines() if line]
+    if not lines:
+        return None
+    if len(lines) != 1 or "\t" not in lines[0]:
+        raise RuntimeError(f"ambiguous git index entry: {path}")
+    metadata, indexed_path = lines[0].split("\t", 1)
+    fields = metadata.split()
+    if len(fields) != 3 or indexed_path != path or fields[2] != "0":
+        raise RuntimeError(f"ambiguous git index entry: {path}")
+    return fields[0], fields[1]
+
+
+class DuplicateJsonKeyError(ValueError):
+    pass
+
+
+def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKeyError(f"duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def git_head_commit(repo: Path) -> str | None:
+    result = git(repo, "rev-parse", "--verify", "HEAD^{commit}")
+    if result.returncode:
+        return None
+    values = result.stdout.splitlines()
+    if len(values) != 1 or not values[0]:
+        raise RuntimeError("ambiguous HEAD commit")
+    return values[0]
+
+
+def git_head_entry(repo: Path, head_commit: str, path: str) -> tuple[str, str] | None:
+    result = git(repo, "ls-tree", head_commit, "--", path)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"git tree query failed: {path}")
+    lines = [line for line in result.stdout.splitlines() if line]
+    if not lines:
+        return None
+    if len(lines) != 1 or "\t" not in lines[0]:
+        raise RuntimeError(f"ambiguous git tree entry: {path}")
+    metadata, committed_path = lines[0].split("\t", 1)
+    fields = metadata.split()
+    if len(fields) != 3 or committed_path != path:
+        raise RuntimeError(f"ambiguous git tree entry: {path}")
+    return fields[0], fields[2]
+
+
+def git_blob(repo: Path, revision: str, path: str) -> bytes:
+    env = os.environ.copy()
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    result = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{revision}:{path}"],
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or f"git blob query failed: {revision}:{path}")
+    return result.stdout
 
 
 def first_content_line(path: Path) -> str:
@@ -93,7 +169,190 @@ def is_env_secret(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
-def path_errors(path: str) -> list[str]:
+def committed_regular_file(
+    repo: Path,
+    head_commit: str,
+    path: str,
+    index_entry: tuple[str, str],
+    errors: list[str],
+    subject: str,
+) -> bytes | None:
+    try:
+        head_entry = git_head_entry(repo, head_commit, path)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return None
+    if head_entry is None:
+        errors.append(f"{subject} must be committed: {path}")
+        return None
+    if head_entry[0] not in REGULAR_GIT_MODES:
+        errors.append(f"{subject} must be a committed regular file: {path}")
+        return None
+    if index_entry != head_entry:
+        errors.append(f"{subject} must match its committed contents: {path}")
+        return None
+    working_path = repo / path
+    if (
+        symlinked_ancestor(repo, working_path) is not None
+        or not working_path.is_file()
+    ):
+        errors.append(f"{subject} must be a regular file: {working_path}")
+        return None
+    try:
+        committed_bytes = git_blob(repo, head_commit, path)
+        working_bytes = working_path.read_bytes()
+        working_mode = working_path.stat().st_mode
+    except (OSError, RuntimeError) as exc:
+        errors.append(f"invalid {subject} {working_path}: {exc}")
+        return None
+    working_executable = bool(working_mode & 0o100)
+    committed_executable = head_entry[0] == "100755"
+    if working_executable != committed_executable:
+        errors.append(f"{subject} mode must match its committed contents: {path}")
+        return None
+    if working_bytes != committed_bytes:
+        errors.append(f"{subject} must match its committed contents: {path}")
+        return None
+    return committed_bytes
+
+
+def repository_kind(repo: Path, errors: list[str]) -> str:
+    policy_path = repo / REPOSITORY_POLICY_PATH
+    try:
+        policy_entry = git_index_entry(repo, REPOSITORY_POLICY_PATH)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return "code"
+    if policy_entry is None:
+        try:
+            head_commit = git_head_commit(repo)
+            committed_policy_entry = (
+                git_head_entry(repo, head_commit, REPOSITORY_POLICY_PATH)
+                if head_commit is not None
+                else None
+            )
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            return "code"
+        if committed_policy_entry is not None:
+            errors.append(
+                f"repository policy must match its committed contents: "
+                f"{REPOSITORY_POLICY_PATH}"
+            )
+            return "code"
+        if policy_path.exists() or policy_path.is_symlink():
+            errors.append(f"repository policy must be tracked: {REPOSITORY_POLICY_PATH}")
+        return "code"
+    try:
+        head_commit = git_head_commit(repo)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return "code"
+    if head_commit is None:
+        errors.append("repository HEAD must resolve to a commit")
+        return "code"
+    committed_policy = committed_regular_file(
+        repo,
+        head_commit,
+        REPOSITORY_POLICY_PATH,
+        policy_entry,
+        errors,
+        "repository policy",
+    )
+    if committed_policy is None:
+        return "code"
+    try:
+        policy = json.loads(
+            committed_policy.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_json_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateJsonKeyError) as exc:
+        errors.append(f"invalid repository policy {policy_path}: {exc}")
+        return "code"
+    if not isinstance(policy, dict) or set(policy) != {"schemaVersion", "kind"}:
+        errors.append(
+            f"repository policy must contain only schemaVersion and kind: {policy_path}"
+        )
+        return "code"
+    schema_version = policy.get("schemaVersion")
+    if type(schema_version) is not int or schema_version != 1:
+        errors.append(f"unsupported repository policy schema: {policy_path}")
+        return "code"
+    kind = policy.get("kind")
+    if kind != ASSISTANT_WORKSPACE_KIND:
+        errors.append(f"unsupported repository kind in {policy_path}: {kind!r}")
+        return "code"
+    try:
+        memory_policy_entry = git_index_entry(repo, "MEMORY_POLICY.md")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return "code"
+    if memory_policy_entry is None:
+        errors.append(
+            f"{ASSISTANT_WORKSPACE_KIND} requires tracked MEMORY_POLICY.md"
+        )
+        return "code"
+    memory_policy = committed_regular_file(
+        repo,
+        head_commit,
+        "MEMORY_POLICY.md",
+        memory_policy_entry,
+        errors,
+        f"{ASSISTANT_WORKSPACE_KIND} memory policy",
+    )
+    if memory_policy is None:
+        return "code"
+    try:
+        decoded_memory_policy = memory_policy.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        errors.append(f"invalid MEMORY_POLICY.md: {exc}")
+        return "code"
+    if not decoded_memory_policy.strip():
+        errors.append("MEMORY_POLICY.md must not be empty")
+        return "code"
+
+    memory_path = repo / "MEMORY.md"
+    try:
+        memory_entry = git_index_entry(repo, "MEMORY.md")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return "code"
+    if memory_entry is None:
+        try:
+            committed_memory_entry = git_head_entry(repo, head_commit, "MEMORY.md")
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            return "code"
+        if (
+            committed_memory_entry is not None
+            or memory_path.exists()
+            or memory_path.is_symlink()
+        ):
+            errors.append(
+                f"{ASSISTANT_WORKSPACE_KIND} memory must match its committed contents: "
+                "MEMORY.md"
+            )
+            return "code"
+        return ASSISTANT_WORKSPACE_KIND
+    memory = committed_regular_file(
+        repo,
+        head_commit,
+        "MEMORY.md",
+        memory_entry,
+        errors,
+        f"{ASSISTANT_WORKSPACE_KIND} memory",
+    )
+    if memory is None:
+        return "code"
+    try:
+        memory.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        errors.append(f"invalid MEMORY.md: {exc}")
+        return "code"
+    return ASSISTANT_WORKSPACE_KIND
+
+
+def path_errors(path: str, kind: str = "code") -> list[str]:
     pure = PurePosixPath(path)
     name = pure.name
     errors: list[str] = []
@@ -103,7 +362,9 @@ def path_errors(path: str) -> list[str]:
         errors.append(f"tracked credential-shaped file: {path}")
     if path in HOST_INSTRUCTION_PATHS or path.startswith(".cursor/rules/"):
         errors.append(f"host-specific instruction file duplicates AGENTS.md: {path}")
-    if path == "MEMORY.md" or any(path.startswith(prefix) for prefix in LEGACY_PREFIXES):
+    if (path == "MEMORY.md" and kind != ASSISTANT_WORKSPACE_KIND) or any(
+        path.startswith(prefix) for prefix in LEGACY_PREFIXES
+    ):
         errors.append(f"legacy persistent context path: {path}")
     return errors
 
@@ -134,6 +395,7 @@ def check_plan(path: Path) -> list[str]:
 
 def run_check(command: list[str], label: str) -> str | None:
     env = os.environ.copy()
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run(
         command,
@@ -213,10 +475,11 @@ def main() -> int:
         errors.append(str(exc))
         tracked = []
         untracked = []
+    kind = repository_kind(repo, errors)
     for path in tracked:
-        errors.extend(path_errors(path))
+        errors.extend(path_errors(path, kind))
     for path in untracked:
-        for problem in path_errors(path):
+        for problem in path_errors(path, kind):
             warnings.append(problem.replace("tracked ", "untracked ", 1))
 
     docs = repo / "docs"
@@ -260,6 +523,7 @@ def main() -> int:
 
     report = {
         "repo": str(repo),
+        "repositoryKind": kind,
         "errors": errors,
         "warnings": warnings,
     }

@@ -27,6 +27,23 @@ class RepositoryCheckTests(unittest.TestCase):
         )
         return result, json.loads(result.stdout)
 
+    def commit_index(self, root: Path, message: str = "fixture") -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-qm",
+                message,
+            ],
+            check=True,
+        )
+
     def test_valid_repository_contract_passes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -168,6 +185,717 @@ class RepositoryCheckTests(unittest.TestCase):
             self.assertTrue(
                 any("tracked credential-shaped file: .env.production" in error for error in report["errors"])
             )
+
+    def test_assistant_workspace_policy_allows_only_governed_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "kind": "assistant-workspace",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-A"],
+                check=True,
+            )
+            self.commit_index(root, "workspace without memory policy")
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "assistant-workspace requires tracked MEMORY_POLICY.md",
+                report["errors"],
+            )
+
+            (root / "MEMORY_POLICY.md").write_text(
+                "# Memory Policy\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", "MEMORY_POLICY.md"],
+                check=True,
+            )
+            self.commit_index(root, "add memory policy")
+            result, report = self.run_check(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(report["repositoryKind"], "assistant-workspace")
+
+            journal = root / "docs" / "journals" / "session.md"
+            journal.parent.mkdir(parents=True)
+            journal.write_text("Legacy session journal.\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(root), "add", "docs/journals/session.md"],
+                check=True,
+            )
+            secret = root / ".env.production"
+            secret.write_text("SECRET=value\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-f", ".env.production"], check=True)
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "legacy persistent context path: docs/journals/session.md",
+                report["errors"],
+            )
+            self.assertIn(
+                "tracked credential-shaped file: .env.production",
+                report["errors"],
+            )
+
+    def test_untracked_repository_policy_cannot_bypass_memory_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_text(
+                "# Memory Policy\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-A"],
+                check=True,
+            )
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "repository policy must be tracked: .agents/repository.json",
+                report["errors"],
+            )
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_staged_only_workspace_declaration_cannot_authorize_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_text("# Memory Policy\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "repository HEAD must resolve to a commit",
+                report["errors"],
+            )
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_uncommitted_repository_policy_replacement_cannot_authorize_memory(self):
+        for staged in (False, True):
+            with self.subTest(staged=staged), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self.init_repo(root)
+                policy = root / ".agents" / "repository.json"
+                policy.parent.mkdir(parents=True)
+                policy.write_text(
+                    '{"schemaVersion": 999, "kind": "assistant-workspace"}\n',
+                    encoding="utf-8",
+                )
+                (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+                (root / "MEMORY_POLICY.md").write_text(
+                    "# Memory Policy\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+                self.commit_index(root, "invalid workspace policy")
+                policy.write_text(
+                    '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                    encoding="utf-8",
+                )
+                if staged:
+                    subprocess.run(
+                        ["git", "-C", str(root), "add", ".agents/repository.json"],
+                        check=True,
+                    )
+
+                result, report = self.run_check(root)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "repository policy must match its committed contents: "
+                    ".agents/repository.json",
+                    report["errors"],
+                )
+                self.assertIn(
+                    "legacy persistent context path: MEMORY.md",
+                    report["errors"],
+                )
+
+    def test_git_replacement_ref_cannot_authorize_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            self.commit_index(root, "base")
+
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_text("# Memory Policy\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            tree = subprocess.run(
+                ["git", "-C", str(root), "write-tree"],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            replacement = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    "HEAD",
+                    "-m",
+                    "replacement",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", str(root), "replace", "HEAD", replacement],
+                check=True,
+            )
+            replaced_paths = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "ls-tree",
+                    "--name-only",
+                    "HEAD",
+                    "--",
+                    ".agents/repository.json",
+                    "MEMORY_POLICY.md",
+                    "MEMORY.md",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.splitlines()
+            true_paths = subprocess.run(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "-C",
+                    str(root),
+                    "ls-tree",
+                    "--name-only",
+                    "HEAD",
+                    "--",
+                    ".agents/repository.json",
+                    "MEMORY_POLICY.md",
+                    "MEMORY.md",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.splitlines()
+            self.assertEqual(
+                replaced_paths,
+                [".agents/repository.json", "MEMORY.md", "MEMORY_POLICY.md"],
+            )
+            self.assertEqual(true_paths, [])
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "repository policy must be committed: .agents/repository.json",
+                report["errors"],
+            )
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_tree_valued_head_cannot_authorize_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_text("# Memory Policy\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            tree = subprocess.run(
+                ["git", "-C", str(root), "write-tree"],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", str(root), "update-ref", "refs/tags/treehead", tree],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "symbolic-ref", "HEAD", "refs/tags/treehead"],
+                check=True,
+            )
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "repository HEAD must resolve to a commit",
+                report["errors"],
+            )
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_repository_policy_rejects_duplicate_keys(self):
+        policies = (
+            '{"schemaVersion": 1, "kind": "code", "kind": "assistant-workspace"}\n',
+            '{"schemaVersion": 999, "schemaVersion": 1, '
+            '"kind": "assistant-workspace"}\n',
+        )
+        for policy_text in policies:
+            with self.subTest(policy=policy_text), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self.init_repo(root)
+                policy = root / ".agents" / "repository.json"
+                policy.parent.mkdir(parents=True)
+                policy.write_text(policy_text, encoding="utf-8")
+                (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+                (root / "MEMORY_POLICY.md").write_text(
+                    "# Memory Policy\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+                self.commit_index(root, "duplicate policy key")
+
+                result, report = self.run_check(root)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(
+                    any("duplicate key" in error for error in report["errors"])
+                )
+                self.assertIn(
+                    "legacy persistent context path: MEMORY.md",
+                    report["errors"],
+                )
+
+    def test_repository_policy_requires_integer_schema_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": true, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_text("# Memory Policy\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            self.commit_index(root, "boolean schema")
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(
+                any("unsupported repository policy schema" in error for error in report["errors"])
+            )
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_invalid_utf8_repository_policy_returns_json_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_bytes(b"\xff\xfe")
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_text("# Memory Policy\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            self.commit_index(root, "invalid encoding")
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(report["repositoryKind"], "code")
+            self.assertTrue(
+                any("invalid repository policy" in error for error in report["errors"])
+            )
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_memory_policy_must_be_a_tracked_regular_file(self):
+        for gitlink in (False, True):
+            with self.subTest(gitlink=gitlink), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self.init_repo(root)
+                policy = root / ".agents" / "repository.json"
+                policy.parent.mkdir(parents=True)
+                policy.write_text(
+                    '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                    encoding="utf-8",
+                )
+                (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+                if gitlink:
+                    memory_policy = root / "MEMORY_POLICY.md"
+                    memory_policy.mkdir()
+                    subprocess.run(["git", "init", "-q", str(memory_policy)], check=True)
+                    (memory_policy / "README.md").write_text("Fixture.\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "-C", str(memory_policy), "add", "README.md"],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(memory_policy),
+                            "-c",
+                            "user.name=Fixture",
+                            "-c",
+                            "user.email=fixture@example.com",
+                            "commit",
+                            "-qm",
+                            "fixture",
+                        ],
+                        check=True,
+                    )
+                else:
+                    (root / "outside-policy.md").write_text("External.\n", encoding="utf-8")
+                    (root / "MEMORY_POLICY.md").symlink_to("outside-policy.md")
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "add",
+                        ".agents/repository.json",
+                        "MEMORY.md",
+                        "MEMORY_POLICY.md",
+                    ],
+                    capture_output=True,
+                    check=True,
+                    text=True,
+                )
+                self.commit_index(root, "non-regular memory policy")
+
+                result, report = self.run_check(root)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(
+                    any(
+                        "assistant-workspace memory policy must be a committed regular file: "
+                        "MEMORY_POLICY.md" in error
+                        for error in report["errors"]
+                    )
+                )
+                self.assertIn(
+                    "legacy persistent context path: MEMORY.md",
+                    report["errors"],
+                )
+
+    def test_memory_policy_must_be_valid_utf8(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_bytes(b"\xff\xfe")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            self.commit_index(root, "invalid memory policy encoding")
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(
+                any("invalid MEMORY_POLICY.md" in error for error in report["errors"])
+            )
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_governed_memory_files_must_match_committed_bytes(self):
+        for path, staged in (
+            ("MEMORY_POLICY.md", False),
+            ("MEMORY_POLICY.md", True),
+            ("MEMORY.md", False),
+            ("MEMORY.md", True),
+        ):
+            with (
+                self.subTest(path=path, staged=staged),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                self.init_repo(root)
+                policy = root / ".agents" / "repository.json"
+                policy.parent.mkdir(parents=True)
+                policy.write_text(
+                    '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                    encoding="utf-8",
+                )
+                (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+                (root / "MEMORY_POLICY.md").write_text(
+                    "# Memory Policy\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+                self.commit_index(root, "valid workspace")
+                (root / path).write_text("Changed.\n", encoding="utf-8")
+                if staged:
+                    subprocess.run(["git", "-C", str(root), "add", path], check=True)
+
+                result, report = self.run_check(root)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(
+                    any("must match its committed contents" in error for error in report["errors"])
+                )
+                self.assertIn(
+                    "legacy persistent context path: MEMORY.md",
+                    report["errors"],
+                )
+
+    def test_staged_memory_deletion_cannot_authorize_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("Curated memory.\n", encoding="utf-8")
+            (root / "MEMORY_POLICY.md").write_text("# Memory Policy\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            self.commit_index(root, "valid workspace")
+            subprocess.run(
+                ["git", "-C", str(root), "rm", "-q", "MEMORY.md"],
+                check=True,
+            )
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "assistant-workspace memory must match its committed contents: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_staged_workspace_declaration_deletion_cannot_pass_as_code(self):
+        for governed_memory in (False, True):
+            with (
+                self.subTest(governed_memory=governed_memory),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                self.init_repo(root)
+                policy = root / ".agents" / "repository.json"
+                policy.parent.mkdir(parents=True)
+                policy.write_text(
+                    '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                    encoding="utf-8",
+                )
+                (root / "MEMORY_POLICY.md").write_text(
+                    "# Memory Policy\n",
+                    encoding="utf-8",
+                )
+                governed_paths = [".agents/repository.json", "MEMORY_POLICY.md"]
+                if governed_memory:
+                    (root / "MEMORY.md").write_text(
+                        "Curated memory.\n",
+                        encoding="utf-8",
+                    )
+                    governed_paths.append("MEMORY.md")
+                subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+                self.commit_index(root, "valid workspace")
+                subprocess.run(
+                    ["git", "-C", str(root), "rm", "-q", *governed_paths],
+                    check=True,
+                )
+
+                result, report = self.run_check(root)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "repository policy must match its committed contents: "
+                    ".agents/repository.json",
+                    report["errors"],
+                )
+
+    def test_governed_file_modes_must_match_committed_state(self):
+        governed_paths = (".agents/repository.json", "MEMORY_POLICY.md", "MEMORY.md")
+        for path in governed_paths:
+            for committed_mode in (0o644, 0o755):
+                with (
+                    self.subTest(path=path, committed_mode=oct(committed_mode)),
+                    tempfile.TemporaryDirectory() as temp,
+                ):
+                    root = Path(temp)
+                    self.init_repo(root)
+                    policy = root / ".agents" / "repository.json"
+                    policy.parent.mkdir(parents=True)
+                    policy.write_text(
+                        '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                        encoding="utf-8",
+                    )
+                    (root / "MEMORY_POLICY.md").write_text(
+                        "# Memory Policy\n",
+                        encoding="utf-8",
+                    )
+                    (root / "MEMORY.md").write_text(
+                        "Curated memory.\n",
+                        encoding="utf-8",
+                    )
+                    for governed_path in governed_paths:
+                        (root / governed_path).chmod(committed_mode)
+                    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+                    self.commit_index(root, "valid workspace")
+                    changed_mode = 0o755 if committed_mode == 0o644 else 0o654
+                    (root / path).chmod(changed_mode)
+
+                    result, report = self.run_check(root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(
+                        any(
+                            "mode must match its committed contents" in error
+                            for error in report["errors"]
+                        )
+                    )
+
+    def test_workspace_memory_must_be_valid_utf8(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.init_repo(root)
+            policy = root / ".agents" / "repository.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(
+                '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_bytes(b"\xff\xfe")
+            (root / "MEMORY_POLICY.md").write_text("# Memory Policy\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            self.commit_index(root, "invalid memory encoding")
+
+            result, report = self.run_check(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(any("invalid MEMORY.md" in error for error in report["errors"]))
+            self.assertIn(
+                "legacy persistent context path: MEMORY.md",
+                report["errors"],
+            )
+
+    def test_workspace_memory_must_be_a_committed_regular_file(self):
+        for gitlink in (False, True):
+            with self.subTest(gitlink=gitlink), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self.init_repo(root)
+                policy = root / ".agents" / "repository.json"
+                policy.parent.mkdir(parents=True)
+                policy.write_text(
+                    '{"schemaVersion": 1, "kind": "assistant-workspace"}\n',
+                    encoding="utf-8",
+                )
+                (root / "MEMORY_POLICY.md").write_text(
+                    "# Memory Policy\n",
+                    encoding="utf-8",
+                )
+                if gitlink:
+                    memory = root / "MEMORY.md"
+                    memory.mkdir()
+                    subprocess.run(["git", "init", "-q", str(memory)], check=True)
+                    (memory / "README.md").write_text("Fixture.\n", encoding="utf-8")
+                    subprocess.run(
+                        ["git", "-C", str(memory), "add", "README.md"],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(memory),
+                            "-c",
+                            "user.name=Fixture",
+                            "-c",
+                            "user.email=fixture@example.com",
+                            "commit",
+                            "-qm",
+                            "fixture",
+                        ],
+                        check=True,
+                    )
+                else:
+                    (root / "outside-memory.md").write_text("External.\n", encoding="utf-8")
+                    (root / "MEMORY.md").symlink_to("outside-memory.md")
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "add",
+                        ".agents/repository.json",
+                        "MEMORY_POLICY.md",
+                        "MEMORY.md",
+                    ],
+                    capture_output=True,
+                    check=True,
+                    text=True,
+                )
+                self.commit_index(root, "non-regular memory")
+
+                result, report = self.run_check(root)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(
+                    any(
+                        "assistant-workspace memory must be a committed regular file: "
+                        "MEMORY.md" in error
+                        for error in report["errors"]
+                    )
+                )
+                self.assertIn(
+                    "legacy persistent context path: MEMORY.md",
+                    report["errors"],
+                )
 
 
 if __name__ == "__main__":
