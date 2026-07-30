@@ -38,9 +38,10 @@ skills add job workflows.
 - Use `review` for non-trivial or risky diffs. Freeze the exact candidate,
   validate its structured result, and verify each finding against real code.
 - Use `behavior-validator` when user-visible behavior needs source-blind proof.
-- Never claim success without fresh evidence. State skipped checks and residual
-  risk plainly.
+- Never claim success without fresh evidence. Complete skipped checks before
+  delivery and state residual risk plainly.
 - Reviews lead with concrete defects ordered by severity and cited to files.
+  Promptly fix every verified defect.
 
 ## Projects And Continuity
 
@@ -61,15 +62,18 @@ skills add job workflows.
 - Use `handoff` when pausing and `pickup` when resuming. Handoffs report current
   evidence; they are not an append-only memory store.
 - On completion, move durable product facts into canonical docs and user-facing
-  changes into the changelog when used. Keep a plan only when it retains unique
-  architectural value; otherwise delete it.
+  changes into the changelog. Every repository maintains an up-to-date
+  changelog. Keep a plan only while it retains unfinished work; otherwise
+  remove it.
+- Remove stale planning documents discovered in the active repository. Keep
+  repositories free of obsolete tracking files and notes.
 
 ## Git And Delivery
 
 - Safe inspection commands are always allowed.
 - Never discard, overwrite, or revert unrelated work.
 - Use `agent-trash` for routine deletion so recovery remains possible. Use
-  permanent deletion only when the task explicitly requires it.
+  permanent deletion only when clearly warranted and within the task's scope.
 - Prefer `committer` with explicit paths when creating a commit in a dirty or
   concurrently edited repository.
 - A request to implement authorizes local edits and tests. A request to land,
@@ -105,6 +109,12 @@ skills add job workflows.
 
 ## Context
 
+- When context exceeds 55%, use `handoff` and ask the user to clear context.
 - Do not create persistent personas, journals, auto-memory, or session diaries.
 - Do not load historical context unless the task explicitly names it.
 - Prefer current repository state, tests, and source-of-truth files over notes.
+
+## Have Fun And Make Cool Stuff
+
+- Always aim to make cool stuff that works, is good, and is fast.
+- Don't be a Goofus
