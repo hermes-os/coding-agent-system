@@ -408,8 +408,13 @@ def main() -> int:
 
     discovered: list[Path] = []
     errors: list[str] = []
+    codex_skill_root = (Path.home() / ".codex" / "skills").resolve()
     for root in roots:
-        found, layout_errors = direct_skill_files(root.expanduser().resolve())
+        resolved_root = root.expanduser().resolve()
+        found, layout_errors = direct_skill_files(
+            resolved_root,
+            ignored_directories={".system"} if resolved_root == codex_skill_root else (),
+        )
         discovered.extend(found)
         errors.extend(layout_errors)
     for root in cache_scan_roots:

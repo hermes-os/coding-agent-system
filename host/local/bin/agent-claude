@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Local Claude invocation: remote-controllable interactive sessions with
-# permissions bypassed. Administrative and noninteractive commands pass through.
+# Local Claude invocation: Remote Control pinned for interactive sessions with
+# the global write-bypass/read-only access contract.
 set -euo pipefail
 
 resolve_claude() {
@@ -26,11 +26,452 @@ if [[ -z "$claude_bin" ]]; then
   exit 127
 fi
 
+staging_dir=""
+staged_config_value=""
+declare -a staged_config_files=()
+declare -a claude_child_args=()
+
+cleanup_staged_configs() {
+  local candidate="${staging_dir:-}"
+  if [[ "$candidate" == /tmp/agent-claude.* && -d "$candidate" && ! -L "$candidate" ]]; then
+    /usr/bin/rm -rf -- "$candidate"
+  fi
+  staging_dir=""
+  staged_config_files=()
+}
+
+fail_config_path() {
+  local option="$1"
+  local value="$2"
+  local reason="$3"
+  echo "agent-claude: unsafe $option value '$value': $reason" >&2
+  return 78
+}
+
+ensure_staging_dir() {
+  if [[ -n "$staging_dir" ]]; then
+    return 0
+  fi
+
+  if ! staging_dir="$(umask 077 && /usr/bin/mktemp -d /tmp/agent-claude.XXXXXXXXXX)"; then
+    echo "agent-claude: could not create a private config staging directory" >&2
+    return 78
+  fi
+  trap cleanup_staged_configs EXIT
+}
+
+stage_config_value() {
+  local option="$1"
+  local value="$2"
+  local allow_inline_json="${3:-1}"
+  local trimmed="$value"
+  local source_state=""
+  local copied_state=""
+  local source_uid=""
+  local source_mode=""
+  local source_mode_value=0
+  local destination=""
+
+  trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+  if [[ ! -e "$value" && ! -L "$value" ]]; then
+    if [[ "$allow_inline_json" == "1" ]]; then
+      case "$trimmed" in
+        \{*|\[*)
+          staged_config_value="$value"
+          return 0
+          ;;
+      esac
+    fi
+    fail_config_path "$option" "$value" "path does not exist"
+    return
+  fi
+  if [[ -L "$value" ]]; then
+    fail_config_path "$option" "$value" "symbolic links are not allowed"
+    return
+  fi
+  if [[ ! -f "$value" ]]; then
+    fail_config_path "$option" "$value" "path is not a regular file"
+    return
+  fi
+  if ! source_state="$(/usr/bin/stat -c '%d:%i:%u:%a:%s:%y' -- "$value")"; then
+    fail_config_path "$option" "$value" "path could not be inspected"
+    return
+  fi
+  if ! read -r source_uid source_mode < <(/usr/bin/stat -c '%u %a' -- "$value"); then
+    fail_config_path "$option" "$value" "path ownership could not be inspected"
+    return
+  fi
+  if [[ "$source_uid" != "0" ]]; then
+    fail_config_path "$option" "$value" "file is not owned by root"
+    return
+  fi
+  if [[ ! "$source_mode" =~ ^[0-7]+$ ]]; then
+    fail_config_path "$option" "$value" "file mode could not be inspected"
+    return
+  fi
+  source_mode_value=$((8#$source_mode))
+  if (( (source_mode_value & 0022) != 0 )); then
+    fail_config_path "$option" "$value" "file is writable by another user"
+    return
+  fi
+
+  ensure_staging_dir || return
+  destination="$staging_dir/config-${#staged_config_files[@]}.json"
+  if ! (umask 077 && /usr/bin/dd \
+    "if=$value" \
+    "of=$destination" \
+    conv=excl \
+    iflag=nofollow \
+    status=none); then
+    fail_config_path "$option" "$value" "file could not be staged"
+    return
+  fi
+  if [[ -L "$value" || ! -f "$value" ]]; then
+    fail_config_path "$option" "$value" "path changed while it was staged"
+    return
+  fi
+  if ! copied_state="$(/usr/bin/stat -c '%d:%i:%u:%a:%s:%y' -- "$value")"; then
+    fail_config_path "$option" "$value" "path changed while it was staged"
+    return
+  fi
+  if [[ "$source_state" != "$copied_state" ]]; then
+    fail_config_path "$option" "$value" "path changed while it was staged"
+    return
+  fi
+
+  staged_config_files+=("$destination")
+  staged_config_value="$destination"
+}
+
+rewrite_config_arguments() {
+  local option=""
+  local value=""
+  local value_count=0
+  claude_child_args=()
+
+  while (( $# )); do
+    option="$1"
+    case "$option" in
+      --)
+        claude_child_args+=("$@")
+        break
+        ;;
+      --mcp-config)
+        claude_child_args+=("$option")
+        shift
+        value_count=0
+        while (( $# )) && [[ "$1" != -* ]]; do
+          value="$1"
+          stage_config_value "$option" "$value" || return
+          claude_child_args+=("$staged_config_value")
+          value_count=$((value_count + 1))
+          shift
+        done
+        if (( value_count == 0 )); then
+          fail_config_path "$option" "" "option requires a file path or inline JSON"
+          return
+        fi
+        ;;
+      --mcp-config=*)
+        value="${option#*=}"
+        if [[ -z "$value" ]]; then
+          fail_config_path "--mcp-config" "$value" "option requires a file path or inline JSON"
+          return
+        fi
+        stage_config_value "--mcp-config" "$value" || return
+        claude_child_args+=("--mcp-config=$staged_config_value")
+        shift
+        ;;
+      --settings)
+        claude_child_args+=("$option")
+        shift
+        if (( $# == 0 )) || [[ "$1" == -* ]]; then
+          fail_config_path "$option" "" "option requires a file path or inline JSON"
+          return
+        fi
+        value="$1"
+        stage_config_value "$option" "$value" || return
+        claude_child_args+=("$staged_config_value")
+        shift
+        ;;
+      --settings=*)
+        value="${option#*=}"
+        if [[ -z "$value" ]]; then
+          fail_config_path "--settings" "$value" "option requires a file path or inline JSON"
+          return
+        fi
+        stage_config_value "--settings" "$value" || return
+        claude_child_args+=("--settings=$staged_config_value")
+        shift
+        ;;
+      --append-system-prompt-file|--system-prompt-file)
+        claude_child_args+=("$option")
+        shift
+        if (( $# == 0 )) || [[ "$1" == -* ]]; then
+          fail_config_path "$option" "" "option requires a file path"
+          return
+        fi
+        value="$1"
+        stage_config_value "$option" "$value" 0 || return
+        claude_child_args+=("$staged_config_value")
+        shift
+        ;;
+      --append-system-prompt-file=*|--system-prompt-file=*)
+        value="${option#*=}"
+        if [[ -z "$value" ]]; then
+          fail_config_path "${option%%=*}" "$value" "option requires a file path"
+          return
+        fi
+        stage_config_value "${option%%=*}" "$value" 0 || return
+        claude_child_args+=("${option%%=*}=$staged_config_value")
+        shift
+        ;;
+      *)
+        claude_child_args+=("$option")
+        shift
+        ;;
+    esac
+  done
+}
+
+run_claude() {
+  local run_as="${AGENT_CLAUDE_RUN_AS:-claude-agent}"
+  local host_admin="${AGENT_CLAUDE_HOST_ADMIN:-0}"
+  local openclaw_state_dir="${OPENCLAW_STATE_DIR:-}"
+
+  case "$host_admin" in
+    0|1)
+      ;;
+    *)
+      echo "agent-claude: AGENT_CLAUDE_HOST_ADMIN must be '0' or '1'" >&2
+      exit 78
+      ;;
+  esac
+
+  if [[ "$(/usr/bin/id -u)" != "0" || "$run_as" == "current" ]]; then
+    exec "$claude_bin" "$@"
+  fi
+
+  local passwd_entry
+  passwd_entry="$(/usr/bin/getent passwd "$run_as" || true)"
+  if [[ -z "$passwd_entry" ]]; then
+    echo "agent-claude: execution user '$run_as' does not exist" >&2
+    echo "agent-claude: provision the unprivileged Claude runner before using bypass mode" >&2
+    exit 78
+  fi
+
+  local _name _password uid gid _gecos runner_home _shell
+  IFS=: read -r _name _password uid gid _gecos runner_home _shell <<<"$passwd_entry"
+  if [[ "$uid" == "0" ]]; then
+    echo "agent-claude: execution user '$run_as' must be unprivileged" >&2
+    exit 78
+  fi
+  if [[ "$host_admin" == "1" ]]; then
+    if [[ "$run_as" != "claude-agent" ]]; then
+      echo "agent-claude: host-admin mode is reserved for claude-agent" >&2
+      exit 78
+    fi
+    if [[ "${access_mode:-${AGENT_ACCESS_MODE:-write}}" != "write" ]]; then
+      echo "agent-claude: host-admin mode is unavailable for read access" >&2
+      exit 64
+    fi
+    if [[ -z "$openclaw_state_dir" ]]; then
+      openclaw_state_dir=/root/.openclaw
+    fi
+  fi
+  local config_dir="${AGENT_CLAUDE_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+  local setpriv_bin="${AGENT_SETPRIV_BIN:-/usr/bin/setpriv}"
+  if [[ ! -x "$setpriv_bin" ]]; then
+    echo "agent-claude: setpriv is required to drop root privileges" >&2
+    exit 78
+  fi
+
+  if [[ "$run_as" == "claude-agent" && "$config_dir" == "/root/.claude" ]]; then
+    if [[ ! -x /usr/bin/setfacl ]]; then
+      echo "agent-claude: setfacl is required for persistent Claude state access" >&2
+      exit 78
+    fi
+    if [[ -d "$config_dir/sessions" ]]; then
+      if ! /usr/bin/chown "$uid:$gid" -- "$config_dir/sessions"; then
+        echo "agent-claude: could not restore Claude session-directory ownership" >&2
+        exit 78
+      fi
+    fi
+    local state_dir
+    for state_dir in \
+      "$config_dir" \
+      "$config_dir/sessions" \
+      "$config_dir/projects" \
+      "$config_dir/jobs" \
+      "$config_dir/daemon" \
+      "$config_dir/session-env" \
+      "$config_dir/shell-snapshots" \
+      "$config_dir/cache" \
+      "$config_dir/plugins"; do
+      if [[ ! -d "$state_dir" ]]; then
+        continue
+      fi
+      if ! /usr/bin/setfacl \
+        -m "u:${run_as}:rwx,m::rwx,d:u:${run_as}:rwx,d:m::rwx" \
+        -- "$state_dir"; then
+        echo "agent-claude: could not restore persistent state access at '$state_dir'" >&2
+        exit 78
+      fi
+    done
+  fi
+
+  # OpenClaw normalizes its state directory to 0700 after config writes. Let Cal
+  # list the state root while keeping protected children governed by their own
+  # permissions.
+  if [[ "$run_as" == "claude-agent" && -d /root/.openclaw/workspace ]]; then
+    if [[ ! -x /usr/bin/setfacl ]]; then
+      echo "agent-claude: setfacl is required for OpenClaw workspace access" >&2
+      exit 78
+    fi
+    if ! /usr/bin/setfacl \
+      -m "u:${run_as}:r-x,m::r-x" \
+      -- /root/.openclaw; then
+      echo "agent-claude: could not restore OpenClaw workspace access" >&2
+      exit 78
+    fi
+
+    local workspace_state_path
+    for workspace_state_path in \
+      /root/.openclaw/workspace/state \
+      /root/.openclaw/workspace/memory; do
+      if [[ -L "$workspace_state_path" ]]; then
+        echo "agent-claude: refusing symlinked OpenClaw state path '$workspace_state_path'" >&2
+        exit 78
+      fi
+      if [[ ! -d "$workspace_state_path" ]]; then
+        continue
+      fi
+      if ! /usr/bin/setfacl \
+        -R -P \
+        -m "u:${run_as}:rwX,m::rwX" \
+        -- "$workspace_state_path"; then
+        echo "agent-claude: could not restore persistent workspace state access at '$workspace_state_path'" >&2
+        exit 78
+      fi
+    done
+
+    local workspace_memory_file=/root/.openclaw/workspace/MEMORY.md
+    if [[ -L "$workspace_memory_file" ]]; then
+      echo "agent-claude: refusing symlinked OpenClaw memory file '$workspace_memory_file'" >&2
+      exit 78
+    fi
+    if [[ -f "$workspace_memory_file" ]] && ! /usr/bin/setfacl \
+      -m "u:${run_as}:rw-,m::rw-" \
+      -- "$workspace_memory_file"; then
+      echo "agent-claude: could not restore persistent workspace memory access" >&2
+      exit 78
+    fi
+  fi
+
+  rewrite_config_arguments "$@" || exit $?
+  if [[ -n "$staging_dir" ]]; then
+    if ! /usr/bin/chown "$uid:$gid" -- "${staged_config_files[@]}" "$staging_dir"; then
+      echo "agent-claude: could not transfer staged configs to execution user '$run_as'" >&2
+      exit 78
+    fi
+  fi
+
+  local -a privilege_boundary=(
+    --inh-caps=-all
+    --ambient-caps=-all
+  )
+  if [[ "$host_admin" != "1" ]]; then
+    privilege_boundary+=(
+      --bounding-set=-all
+      --no-new-privs
+    )
+  fi
+  local -a openclaw_runtime_env=()
+  if [[ -n "$openclaw_state_dir" ]]; then
+    openclaw_runtime_env+=("OPENCLAW_STATE_DIR=$openclaw_state_dir")
+  fi
+
+  local -a privileged_command=(
+    "$setpriv_bin"
+    "--reuid=$uid"
+    "--regid=$gid"
+    --init-groups
+    "${privilege_boundary[@]}"
+    /usr/bin/env
+      --default-signal=INT
+      --default-signal=QUIT
+      -u BASH_ENV
+      -u CDPATH
+      -u ENV
+      -u GLOBIGNORE
+      -u LD_LIBRARY_PATH
+      -u LD_PRELOAD
+      -u NODE_OPTIONS
+      -u SUDO_COMMAND
+      -u SUDO_GID
+      -u SUDO_UID
+      -u SUDO_USER
+      "HOME=$runner_home"
+      "USER=$run_as"
+      "LOGNAME=$run_as"
+      SHELL=/bin/bash
+      "CLAUDE_CONFIG_DIR=$config_dir"
+      AGENT_CLAUDE_RUN_AS=current
+      "${openclaw_runtime_env[@]}"
+      "$claude_bin"
+      "${claude_child_args[@]}"
+  )
+
+  if [[ -z "$staging_dir" ]]; then
+    exec "${privileged_command[@]}"
+  fi
+
+  local child_pid=""
+  local child_status=0
+  "${privileged_command[@]}" <&0 &
+  child_pid=$!
+  trap 'kill -HUP "$child_pid" 2>/dev/null || true' HUP
+  trap 'kill -INT "$child_pid" 2>/dev/null || true' INT
+  trap 'kill -TERM "$child_pid" 2>/dev/null || true' TERM
+  while true; do
+    if wait "$child_pid"; then
+      child_status=0
+      break
+    else
+      child_status=$?
+    fi
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+      break
+    fi
+  done
+  trap - HUP INT TERM
+  cleanup_staged_configs
+  trap - EXIT
+  return "$child_status"
+}
+
+run_claude_and_exit() {
+  if run_claude "$@"; then
+    exit 0
+  else
+    local child_status=$?
+    exit "$child_status"
+  fi
+}
+
 passthrough=0
 remote_requested=0
+noninteractive=0
+safe_requested=0
 for arg in "$@"; do
   case "$arg" in
-    -p|--print|-h|--help|-v|--version|--bare|--safe-mode)
+    -p|--print|--bg|--background)
+      noninteractive=1
+      ;;
+    --safe-mode)
+      safe_requested=1
+      ;;
+    -h|--help|-v|--version)
       passthrough=1
       ;;
     --remote-control|--remote-control=*)
@@ -45,18 +486,100 @@ case "${1:-}" in
     ;;
 esac
 
-if [[ "${AGENT_REMOTE_CONTROL:-1}" == "0" || "${AGENT_CLAUDE_REMOTE_CONTROL:-1}" == "0" ]]; then
-  passthrough=1
+if (( passthrough )); then
+  run_claude_and_exit "$@"
 fi
 
-if (( passthrough )); then
-  exec "$claude_bin" "$@"
+fail_access_mode() {
+  echo "agent-claude: $1" >&2
+  exit 64
+}
+
+access_mode="${AGENT_ACCESS_MODE:-write}"
+if (( safe_requested )); then
+  access_mode="read"
+fi
+case "$access_mode" in
+  write|read)
+    ;;
+  *)
+    fail_access_mode "AGENT_ACCESS_MODE must be 'write' or 'read', got '$access_mode'"
+    ;;
+esac
+
+permission_mode=""
+dangerous_skip=0
+expect_permission_mode=0
+for argument in "$@"; do
+  if (( expect_permission_mode )); then
+    if [[ "$argument" == -* ]]; then
+      fail_access_mode "--permission-mode requires a value"
+    fi
+    if [[ -n "$permission_mode" ]]; then
+      fail_access_mode "--permission-mode may be specified only once"
+    fi
+    permission_mode="$argument"
+    expect_permission_mode=0
+    continue
+  fi
+  case "$argument" in
+    --)
+      break
+      ;;
+    --permission-mode)
+      expect_permission_mode=1
+      ;;
+    --permission-mode=*)
+      if [[ -n "$permission_mode" ]]; then
+        fail_access_mode "--permission-mode may be specified only once"
+      fi
+      permission_mode="${argument#*=}"
+      ;;
+    --dangerously-skip-permissions)
+      dangerous_skip=1
+      ;;
+  esac
+done
+if (( expect_permission_mode )); then
+  fail_access_mode "--permission-mode requires a value"
+fi
+
+if [[ "$access_mode" == "write" ]]; then
+  if [[ -n "$permission_mode" && "$permission_mode" != "bypassPermissions" ]]; then
+    fail_access_mode "write access requires Claude bypassPermissions; use AGENT_ACCESS_MODE=read for a restricted run"
+  fi
+else
+  if (( dangerous_skip )) || [[ "$permission_mode" == "bypassPermissions" ]]; then
+    fail_access_mode "read access cannot enable Claude permission bypass"
+  fi
+  if [[ -n "$permission_mode" && "$permission_mode" != "dontAsk" && "$permission_mode" != "plan" ]]; then
+    fail_access_mode "read access permits only Claude dontAsk or plan mode"
+  fi
+fi
+
+declare -a permission_args=()
+if [[ -z "$permission_mode" ]] && (( ! dangerous_skip )); then
+  if [[ "$access_mode" == "write" ]]; then
+    permission_args=(--permission-mode bypassPermissions)
+  else
+    permission_args=(--permission-mode dontAsk)
+  fi
+fi
+
+if (( noninteractive )); then
+  run_claude_and_exit "${permission_args[@]}" "$@"
 fi
 
 if (( remote_requested )); then
-  exec "$claude_bin" --permission-mode bypassPermissions "$@"
+  run_claude_and_exit "${permission_args[@]}" "$@"
+fi
+
+if [[ "$access_mode" == "write" ]]; then
+  remote_permission_args=(--permission-mode bypassPermissions)
+else
+  remote_permission_args=(--permission-mode dontAsk)
 fi
 
 # Keep another option immediately after --remote-control so its optional name
 # argument cannot consume the user's initial prompt.
-exec "$claude_bin" --remote-control --permission-mode bypassPermissions "$@"
+run_claude_and_exit --remote-control "${remote_permission_args[@]}" "$@"

@@ -20,7 +20,7 @@ sys.dont_write_bytecode = True
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SYSTEM_ROOT))
 
-from lib.host_contract import hook_budgets
+from lib.host_contract import HOST_TIMEOUT_MARGIN_SECONDS, hook_budgets
 
 EVENT_ALIASES = {
     "stop": "Stop",
@@ -74,7 +74,11 @@ class HookOutputLimitError(ValueError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", choices=("claude", "codex", "cursor"), default="claude")
+    parser.add_argument(
+        "--host",
+        choices=("claude", "codex", "cursor", "kimi"),
+        default="claude",
+    )
     parser.add_argument("event")
     return parser.parse_args()
 
@@ -191,6 +195,11 @@ def project_context(payload: dict, timeout: float | None = None) -> ProjectConte
 
 
 def emit(host: str, event: str, reason: str | None = None) -> int:
+    if host == "kimi":
+        if reason:
+            print(reason, file=sys.stderr)
+            return 2
+        return 0
     if host == "cursor":
         if reason and event == "Stop":
             print(json.dumps({"followup_message": reason}))
@@ -459,6 +468,13 @@ def require_time(deadline: float, phase: str) -> float:
     return remaining
 
 
+def effective_event_budget(host: str, event: str, budgets: dict[str, int]) -> int:
+    budget = budgets[event]
+    if host == "kimi":
+        return min(budget, 600 - HOST_TIMEOUT_MARGIN_SECONDS)
+    return budget
+
+
 def scheduled_hooks(
     repository_root: Path | None,
     event: str,
@@ -633,7 +649,8 @@ def main() -> int:
         allowed_events, budgets = system_hook_contract()
         if event not in allowed_events:
             raise ValueError(f"unsupported hook event {event!r}")
-        deadline = started + budgets[event]
+        event_budget = effective_event_budget(args.host, event, budgets)
+        deadline = started + event_budget
         remaining = require_time(deadline, "project discovery")
         context = project_context(payload, remaining)
         require_time(deadline, "project discovery")
@@ -649,12 +666,12 @@ def main() -> int:
 
     root = context.repository_root or context.workdir
     declared_total = sum(entry.get("timeoutSeconds", 300) for _, entry in scheduled)
-    if declared_total > budgets[event]:
+    if declared_total > event_budget:
         return emit(
             args.host,
             event,
             f"Invalid skill hook configuration: {event} declares {declared_total} seconds "
-            f"across active skills, exceeding the {budgets[event]}-second event budget",
+            f"across active skills, exceeding the {event_budget}-second {args.host} event budget",
         )
 
     for owner, entry in scheduled:

@@ -9,6 +9,7 @@ bash -n \
   "$ROOT/bin/committer" \
   "$ROOT/host/local/bin/agent-claude" \
   "$ROOT/host/local/bin/agent-codex" \
+  "$ROOT/host/local/bin/agent-kimi" \
   "$ROOT/host/local/shell/default-invocations.sh"
 while IFS= read -r -d '' script; do
   python3 - "$script" <<'PY'

@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import Path
 
 
-def direct_skill_files(root: Path) -> tuple[list[Path], list[str]]:
+def direct_skill_files(
+    root: Path,
+    *,
+    ignored_directories: Collection[str] = (),
+) -> tuple[list[Path], list[str]]:
     if not root.is_dir():
         return [], []
 
     found: list[Path] = []
     errors: list[str] = []
     try:
-        children = sorted((child for child in root.iterdir() if child.is_dir()), key=lambda child: child.name)
+        children = sorted(
+            (
+                child
+                for child in root.iterdir()
+                if child.is_dir() and child.name not in ignored_directories
+            ),
+            key=lambda child: child.name,
+        )
     except OSError as exc:
         return [], [f"{root}: cannot list skill root: {exc}"]
 

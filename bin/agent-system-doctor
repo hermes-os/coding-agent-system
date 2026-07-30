@@ -17,7 +17,14 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.codex_config import model_pin_paths
-from lib.host_contract import cursor_rule, expected_cursor_hooks, expected_grouped_hooks, hook_budgets
+from lib.host_contract import (
+    cursor_rule,
+    expected_cursor_hooks,
+    expected_grouped_hooks,
+    hook_budgets,
+    kimi_agent_spec,
+)
+from lib.kimi_config import contains_expected_kimi_hooks, has_managed_kimi_hooks
 
 
 CLAUDE_MODEL_ENV_KEYS = {
@@ -182,6 +189,19 @@ def main() -> int:
     else:
         errors.append("agent hostIntegrationRoot configuration is invalid")
         host_integration = system_root / "host" / "local"
+    host_launchers = config.get("hostLaunchers")
+    if (
+        not isinstance(host_launchers, list)
+        or len(host_launchers) != len(set(host_launchers))
+        or not all(
+            isinstance(name, str)
+            and name in {"agent-claude", "agent-codex", "agent-kimi"}
+            for name in host_launchers
+        )
+        or not {"agent-claude", "agent-codex"}.issubset(host_launchers)
+    ):
+        errors.append("agent hostLaunchers configuration is invalid")
+        host_launchers = ["agent-claude", "agent-codex"]
     launch_defaults = host_integration / "shell" / "default-invocations.sh"
     if (
         not exact_symlink(agents / "shell" / "default-invocations.sh", launch_defaults)
@@ -189,11 +209,45 @@ def main() -> int:
         or not os.access(launch_defaults, os.R_OK)
     ):
         errors.append("default invocation adapter is not linked to the canonical source")
-    for name in ("agent-claude", "agent-codex"):
+    for name in host_launchers:
         source = host_integration / "bin" / name
         for binary in (agents / "bin" / name, home / ".local" / "bin" / name):
             if not exact_symlink(binary, source) or not os.access(binary, os.X_OK):
                 errors.append(f"bad host invocation helper: {binary}")
+    if "agent-kimi" in host_launchers:
+        kimi_spec = agents / "kimi" / "agent.yaml"
+        try:
+            if kimi_spec.read_text(encoding="utf-8") != kimi_agent_spec(
+                policy.read_text(encoding="utf-8")
+            ):
+                errors.append(f"stale Kimi policy adapter: {kimi_spec}")
+        except OSError as exc:
+            errors.append(f"missing Kimi policy adapter {kimi_spec}: {exc}")
+        kimi_guard = agents / "kimi" / "session-guard.py"
+        expected_guard = system_root / "lib" / "kimi_session_guard.py"
+        if (
+            not exact_symlink(kimi_guard, expected_guard)
+            or not os.access(kimi_guard, os.X_OK)
+        ):
+            errors.append(f"bad Kimi session guard: {kimi_guard}")
+        kimi_config = home / ".kimi" / "config.toml"
+        try:
+            if not contains_expected_kimi_hooks(
+                kimi_config.read_text(encoding="utf-8"),
+                budgets,
+            ):
+                errors.append(f"unexpected Kimi hook configuration: {kimi_config}")
+        except OSError as exc:
+            errors.append(f"missing Kimi hook configuration {kimi_config}: {exc}")
+    else:
+        kimi_config = home / ".kimi" / "config.toml"
+        try:
+            if kimi_config.exists() and has_managed_kimi_hooks(
+                kimi_config.read_text(encoding="utf-8")
+            ):
+                errors.append(f"orphaned managed Kimi hooks: {kimi_config}")
+        except OSError as exc:
+            errors.append(f"cannot inspect retired Kimi hook configuration {kimi_config}: {exc}")
 
     catalog_skills = {entry["name"]: entry for entry in catalog.get("skills", []) if isinstance(entry, dict)}
     installed_skills = {

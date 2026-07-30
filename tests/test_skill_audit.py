@@ -20,7 +20,7 @@ class SkillAuditTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
-        self.assertEqual(report["uniqueSkillCount"], 11)
+        self.assertEqual(report["uniqueSkillCount"], 15)
         self.assertEqual(report["errors"], [])
         self.assertEqual(report["warnings"], [])
 
@@ -110,6 +110,30 @@ class SkillAuditTests(unittest.TestCase):
                 check=False,
             )
             report = json.loads(result.stdout)
+            self.assertEqual([skill["name"] for skill in report["skills"]], ["live"])
+
+    def test_live_mode_ignores_codex_owned_system_skill_container(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            live = home / ".agents" / "skills" / "live"
+            system = home / ".codex" / "skills" / ".system" / "builtin"
+            for path, name in ((live, "live"), (system, "builtin")):
+                path.mkdir(parents=True)
+                (path / "SKILL.md").write_text(
+                    f"---\nname: {name}\ndescription: Fixture {name}.\n---\n# {name}\n",
+                    encoding="utf-8",
+                )
+            result = subprocess.run(
+                [str(AUDIT), "--live", "--check", "--json"],
+                env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                cwd=home,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["errors"], [])
             self.assertEqual([skill["name"] for skill in report["skills"]], ["live"])
 
     def test_rejects_hooks_only_nested_skills_and_aggregate_timeout_overflow(self):
