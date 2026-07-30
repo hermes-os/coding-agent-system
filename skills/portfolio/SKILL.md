@@ -9,6 +9,21 @@ Use this as the lean root orchestrator for multi-repository, multi-phase, or
 continuously monitored work. The root coordinates; one repository worker owns
 implementation and delivery for that repository.
 
+## Control Plane
+
+- For a sustained queue, use exactly one root-owned persistent project session
+  per repository. Reuse it until the repository queue is complete.
+- A project session processes its queue serially and never creates another
+  mutation-owning worker, task session, or worktree.
+- Classify support work before delegation. Parallel support may inspect,
+  monitor, or independently analyze, but remains read-only and owns no
+  deliverable or public action.
+- The root owns prioritization, project-session lifecycle, owner questions,
+  cross-repository conflicts, and final admission to public actions.
+- Prompt text never changes a worker's real permissions. Verify the effective
+  profile before its first protected write or network action, then surface one
+  exact blocker instead of repeatedly retrying a denied operation.
+
 ## Inventory
 
 Run a read-only inventory over the roots relevant to the request:
@@ -30,6 +45,8 @@ Add other roots explicitly. The helper reports Git state and active
    Keep one heavy process per host and check headroom before broad work.
 4. Classify only as actionable, externally waiting, or needing one exact owner
    decision after every safe reversible step is complete.
+5. Refill an idle lane only with qualified in-scope work. Do not create work to
+   satisfy a concurrency target or duplicate an existing session.
 
 ## Leases And Public Gate
 
@@ -75,11 +92,22 @@ waits. A scheduled heartbeat only wakes the root to inspect workers, renew or
 reconcile leases, refill completed lanes, and surface prepared decisions. It is
 not project memory and does not replace a worker's active wait.
 
+When continuous orchestration is active, use one five-minute root watch. On
+every wake, reconcile the latest worker status and instruction before acting;
+never create duplicate watches. Keep it active while workers, external waits,
+owner decisions, or qualified refill work remain, and disable it when the
+portfolio is complete or the owner stops orchestration.
+
 Track only the current phase: `queued`, `implementing`, `validating`,
 `reviewing`, `ready`, `publishing`, `waiting`, `verified`, or `blocked`. Use the
 repository plan for durable multi-session decisions, `handoff` when pausing,
 and `pickup` when resuming. Never create a global append-only ledger.
 
+For an owner decision, present the exact repository and URL, current evidence,
+the smallest decision being asked, realistic options and tradeoffs, a
+recommendation, and what continues privately while the answer is pending.
+Other qualified private lanes stay active.
+
 Read `references/cursor-orchestration.md` only when configuring Cursor
 Automations. Re-run inventory after landings and report repository, exact head,
-phase, proof, next action, and blocker compactly.
+project session, phase, proof, next action, and blocker compactly.

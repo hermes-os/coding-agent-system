@@ -21,7 +21,9 @@ from lib.host_contract import (
     expected_grouped_hooks,
     hook_budgets,
     is_managed_dispatch_command,
+    kimi_agent_spec,
 )
+from lib.kimi_config import edit_kimi_config, remove_kimi_hooks
 
 
 CLAUDE_MODEL_ENV_KEYS = {
@@ -117,40 +119,76 @@ def resolve_coordination_repo(system_root, agents_home, explicit):
     return root
 
 
-def configure_agent_home(agents_home, coordination_repo, host_integration, shell_rc_paths):
+def configure_agent_home(
+    agents_home,
+    coordination_repo,
+    host_integration,
+    host_launchers,
+    shell_rc_paths,
+):
     path = agents_home / "config.json"
     config = read_json(path)
     config["coordinationRepo"] = str(coordination_repo)
     config["hostIntegrationRoot"] = str(host_integration)
+    config["hostLaunchers"] = list(host_launchers)
     config["shellRcPaths"] = [str(path) for path in shell_rc_paths]
     write_json(path, config)
 
 
 def resolve_host_integration(system_root, explicit):
     root = (explicit or system_root / "host" / "local").expanduser().resolve()
-    required = (
+    required_launchers = (
         root / "bin" / "agent-claude",
         root / "bin" / "agent-codex",
+    )
+    optional_launcher = root / "bin" / "agent-kimi"
+    launchers = (
+        *required_launchers,
+        *(
+            (optional_launcher,)
+            if optional_launcher.exists() or optional_launcher.is_symlink()
+            else ()
+        ),
+    )
+    required = (
+        *required_launchers,
         root / "shell" / "default-invocations.sh",
     )
     missing = [path for path in required if not path.is_file()]
-    symlinks = [path for path in required if path.is_symlink()]
-    non_executable = [path for path in required[:2] if path.is_file() and not os.access(path, os.X_OK)]
-    shell_adapter = required[2]
-    unreadable = (
-        [shell_adapter]
-        if shell_adapter.is_file() and not os.access(shell_adapter, os.R_OK)
+    invalid_optional = (
+        [optional_launcher]
+        if (optional_launcher.exists() or optional_launcher.is_symlink())
+        and not optional_launcher.is_file()
         else []
     )
-    if missing or symlinks or non_executable or unreadable:
+    validated_paths = (
+        *required,
+        *((optional_launcher,) if optional_launcher in launchers else ()),
+    )
+    symlinks = [path for path in validated_paths if path.is_symlink()]
+    non_executable = [
+        path for path in launchers if path.is_file() and not os.access(path, os.X_OK)
+    ]
+    shell_adapter = required[-1]
+    unreadable = (
+        [shell_adapter]
+        if shell_adapter.is_file()
+        and (
+            not os.access(shell_adapter, os.R_OK)
+            or stat.S_IMODE(shell_adapter.stat().st_mode) & 0o444 == 0
+        )
+        else []
+    )
+    if missing or invalid_optional or symlinks or non_executable or unreadable:
         problems = [
             *(f"missing {path}" for path in missing),
+            *(f"not a file {path}" for path in invalid_optional),
             *(f"symlinked source {path}" for path in symlinks),
             *(f"not executable {path}" for path in non_executable),
             *(f"not readable {path}" for path in unreadable),
         ]
         raise SystemExit("Invalid host integration:\n" + "\n".join(f"- {problem}" for problem in problems))
-    return root
+    return root, tuple(path.name for path in launchers)
 
 
 def legacy_catalog_sources(root, catalog):
@@ -281,7 +319,15 @@ def resolve_migration_root(explicit, system_root):
     return root, catalog
 
 
-def managed_entries(home, agents_home, system_root, host_integration, catalog, policy):
+def managed_entries(
+    home,
+    agents_home,
+    system_root,
+    host_integration,
+    host_launchers,
+    catalog,
+    policy,
+):
     entries = {}
 
     def symlink(path, target):
@@ -307,6 +353,12 @@ def managed_entries(home, agents_home, system_root, host_integration, catalog, p
         agents_home / "shell" / "default-invocations.sh",
         host_integration / "shell" / "default-invocations.sh",
     )
+    if "agent-kimi" in host_launchers:
+        generated(agents_home / "kimi" / "agent.yaml", kimi_agent_spec(policy))
+        symlink(
+            agents_home / "kimi" / "session-guard.py",
+            system_root / "lib" / "kimi_session_guard.py",
+        )
     for adapter in (
         home / ".codex" / "AGENTS.md",
         home / ".claude" / "CLAUDE.md",
@@ -322,7 +374,7 @@ def managed_entries(home, agents_home, system_root, host_integration, catalog, p
         ):
             symlink(destination, source)
 
-    for name in ("agent-claude", "agent-codex"):
+    for name in host_launchers:
         source = host_integration / "bin" / name
         for destination in (agents_home / "bin" / name, home / ".local" / "bin" / name):
             symlink(destination, source)
@@ -573,13 +625,23 @@ def preflight_configuration_paths(paths):
         )
 
 
-def preflight_host_documents(home, budgets, shell_paths):
+def preflight_host_documents(home, budgets, shell_paths, kimi_action):
     codex_config = home / ".codex" / "config.toml"
     text = codex_config.read_text(encoding="utf-8") if codex_config.exists() else ""
     try:
         edit_codex_config(text)
     except ValueError as exc:
         raise SystemExit(f"Cannot safely update {codex_config}: {exc}") from exc
+    if kimi_action is not None:
+        kimi_config = home / ".kimi" / "config.toml"
+        text = kimi_config.read_text(encoding="utf-8") if kimi_config.exists() else ""
+        try:
+            if kimi_action == "install":
+                edit_kimi_config(text, budgets)
+            else:
+                remove_kimi_hooks(text, budgets)
+        except ValueError as exc:
+            raise SystemExit(f"Cannot safely update {kimi_config}: {exc}") from exc
 
     claude = read_json(home / ".claude" / "settings.json")
     merge_grouped_hooks(
@@ -645,6 +707,20 @@ def configure_codex_toml(home):
     atomic_write(path, updated)
 
 
+def configure_kimi(home, budgets, action):
+    path = home / ".kimi" / "config.toml"
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    try:
+        updated = (
+            edit_kimi_config(text, budgets)
+            if action == "install"
+            else remove_kimi_hooks(text, budgets)
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Cannot safely update {path}: {exc}") from exc
+    atomic_write(path, updated)
+
+
 def configure_shell_rc(path):
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     pattern = re.compile(
@@ -689,7 +765,22 @@ def main():
     system_root = args.system_root.expanduser().resolve()
     agents_home = Path(os.environ.get("AGENTS_HOME", home / ".agents")).expanduser().resolve()
     catalog = load_catalog(system_root)
-    host_integration = resolve_host_integration(system_root, args.host_integration)
+    host_integration, host_launchers = resolve_host_integration(
+        system_root, args.host_integration
+    )
+    kimi_enabled = "agent-kimi" in host_launchers
+    previous_agent_config = read_json(agents_home / "config.json")
+    previous_manifest = read_json(agents_home / "managed-install.json")
+    previous_launchers = previous_agent_config.get("hostLaunchers", [])
+    previous_paths = previous_manifest.get("paths", {})
+    previous_kimi = (
+        isinstance(previous_launchers, list)
+        and "agent-kimi" in previous_launchers
+    ) or (
+        isinstance(previous_paths, dict)
+        and str(agents_home / "kimi" / "agent.yaml") in previous_paths
+    )
+    kimi_action = "install" if kimi_enabled else ("remove" if previous_kimi else None)
     migration_root, migration_catalog = resolve_migration_root(
         args.migrate_from_system_root, system_root
     )
@@ -706,13 +797,20 @@ def main():
         home / ".claude" / "settings.json",
         home / ".codex" / "hooks.json",
         home / ".cursor" / "hooks.json",
+        *((home / ".kimi" / "config.toml",) if kimi_action is not None else ()),
         agents_home / "config.json",
         manifest_path,
         *selected_shell_rc_paths,
     )
     preflight_configuration_paths(configuration_paths)
     entries = managed_entries(
-        home, agents_home, system_root, host_integration, catalog, policy
+        home,
+        agents_home,
+        system_root,
+        host_integration,
+        host_launchers,
+        catalog,
+        policy,
     )
     adopted = None
     if migration_root is not None:
@@ -722,6 +820,11 @@ def main():
             agents_home,
             migration_root,
             migration_root,
+            tuple(
+                name
+                for name in ("agent-claude", "agent-codex", "agent-kimi")
+                if (migration_root / "bin" / name).is_file()
+            ),
             migration_catalog,
             legacy_policy,
         )
@@ -733,18 +836,29 @@ def main():
         home / ".local" / "bin",
     )
     preflight_managed(manifest_path, entries, allowed_roots, adopted=adopted)
-    preflight_host_documents(home, budgets, selected_shell_rc_paths)
+    preflight_host_documents(
+        home,
+        budgets,
+        selected_shell_rc_paths,
+        kimi_action,
+    )
 
     configure_codex_toml(home)
     configure_claude(home, budgets)
     configure_codex_hooks(home, budgets)
     configure_cursor(home, budgets)
+    if kimi_action is not None:
+        configure_kimi(home, budgets, kimi_action)
     for path in selected_shell_rc_paths:
         configure_shell_rc(path)
     install_managed(entries)
     retire_adopted(adopted or {}, entries, allowed_roots)
     configure_agent_home(
-        agents_home, coordination_repo, host_integration, selected_shell_rc_paths
+        agents_home,
+        coordination_repo,
+        host_integration,
+        host_launchers,
+        selected_shell_rc_paths,
     )
     orphaned = prune_stale_managed(manifest_path, entries, allowed_roots)
     write_json(

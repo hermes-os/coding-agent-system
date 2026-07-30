@@ -1,6 +1,6 @@
 # Coding Agent System
 
-A portable, model-neutral engineering system for Codex, Claude Code, Cursor,
+A portable, model-neutral engineering system for Codex, Claude Code, Kimi CLI, Cursor,
 and other coding-agent hosts. It keeps policy terse, loads workflows as skills,
 dispatches skill-owned hooks, reconstructs work from repository evidence, and
 uses deterministic checks for the parts that should not depend on judgment.
@@ -17,8 +17,8 @@ This repository owns the portable layer:
 - `system.json`: the exact managed skill, command, binary, and hook catalog.
 - `install.sh` and `configure-hosts.py`: idempotent shared installation plus a
   caller-selected host integration.
-- `host/local/`: the local-machine invocation defaults for `claude` and
-  `codex`; these are not part of the shared binary catalog.
+- `host/local/`: the local-machine invocation defaults for `claude`, `codex`,
+  and `kimi`; these are not part of the shared binary catalog.
 - `tests/` and `validate.sh`: portable enforcement.
 
 Product facts and workflows remain in each product repository. VM credentials,
@@ -35,13 +35,41 @@ agent-system-doctor
 ```
 
 The installer wires the canonical policy and skills into `~/.agents`, Codex,
-Claude Code, and Cursor while preserving unrelated host configuration. Models
-remain task-prompt assignments. Persistent agent memory is disabled.
+Claude Code, Kimi CLI, and Cursor while preserving unrelated host
+configuration. Kimi receives the policy through a generated default-agent
+extension because it does not load a home-level `AGENTS.md` for repository
+work. That extension disables Kimi's inherited subagents so repository work
+stays inside its assigned worker boundary. Native `Stop` and shell-only
+`PreToolUse` hooks dispatch through the same skill-owned hook catalog, and a
+prompt guard rejects any resumed session whose persisted system prompt lacks
+the current policy digest. Policy updates therefore require a fresh Kimi
+session; unchanged managed sessions remain resumable.
 
-The default install selects `host/local`, which keeps the requested local
-Remote Control and bypass-permission invocation behavior. Integrations such as
-the VM setup call `install.sh --host-integration /path/to/integration`; the
-shared catalog never owns those launchers.
+The managed Kimi launcher covers noninteractive `--print` and `--quiet` work,
+including explicit policy-current session IDs. It rejects interactive picker,
+continue, wire/ACP, caller agent, config, and skill-directory overrides because
+those paths can restore or create an unverified system prompt in Kimi CLI
+1.47.0. The `acp`, `term`, and `web` subcommands are rejected for the same
+reason. Administrative Kimi subcommands pass through unchanged.
+
+The shared system does not author model assignments. A provider-required,
+operator-selected default may remain in local provider configuration as host
+state. Persistent agent memory is disabled.
+
+The default install selects `host/local`, which pins Claude Remote Control for
+every interactive session and enforces one access contract across providers.
+Agent invocations default to `AGENT_ACCESS_MODE=write`: Codex bypasses approval
+and sandbox prompts, Claude uses `bypassPermissions`, and Kimi uses `--yolo`.
+`AGENT_ACCESS_MODE=read` is the explicit exception for read-only inspection and
+review; it disables those bypasses. Orchestrators must pair read mode with an
+external read-only filesystem boundary. Administrative provider commands pass
+through unchanged.
+
+Integrations such as the VM setup call
+`install.sh --host-integration /path/to/integration`; the shared catalog never
+owns those launchers. Claude and Codex launchers are the base integration
+contract; a host may declare Kimi support by also supplying an executable
+`bin/agent-kimi`.
 
 Global skill hooks remain available from any working directory. Repository
 skill hooks are discovered only after Git resolves the working directory to a
