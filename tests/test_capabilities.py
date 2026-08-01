@@ -1,12 +1,22 @@
 import json
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "skills" / "capabilities" / "scripts" / "agent-capabilities.py"
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("agent_capabilities_fixture", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 class CapabilitiesTests(unittest.TestCase):
@@ -37,6 +47,23 @@ class CapabilitiesTests(unittest.TestCase):
             report = json.loads(result.stdout)
             self.assertEqual([skill["name"] for skill in report["globalSkills"]], ["global-demo"])
             self.assertEqual([skill["name"] for skill in report["repositorySkills"]], ["repo-demo"])
+
+    def test_reports_xcode_and_simulator_capability_through_xcrun(self):
+        module = load_module()
+        self.assertEqual(module.TOOL_GROUPS["macos"], ("xcodebuild", "xcrun"))
+        result = mock.Mock(returncode=0, stdout="/Applications/Xcode.app/usr/bin/simctl\n")
+        with mock.patch.object(module.subprocess, "run", return_value=result) as invoked:
+            self.assertEqual(
+                module.simctl_path({"macos": {"xcrun": "/usr/bin/xcrun"}}),
+                "/Applications/Xcode.app/usr/bin/simctl",
+            )
+        invoked.assert_called_once_with(
+            ["/usr/bin/xcrun", "--find", "simctl"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
 
 
 if __name__ == "__main__":

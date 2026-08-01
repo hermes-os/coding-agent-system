@@ -4,6 +4,10 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- Add constrained GitHub peer handoffs with exact-head request, acknowledge,
+  completion, and Darwin-only macOS validation statuses.
+- Report Xcode, `xcrun`, and simulator capabilities when available.
+
 ### Changed
 
 - Require fresh verification, prompt repair of verified review findings, and

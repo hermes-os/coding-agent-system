@@ -83,3 +83,20 @@ and `pickup` when resuming. Never create a global append-only ledger.
 Read `references/cursor-orchestration.md` only when configuring Cursor
 Automations. Re-run inventory after landings and report repository, exact head,
 phase, proof, next action, and blocker compactly.
+
+## GitHub Peer Handoff
+
+Use `agent-github-handoff` when enrolled hosts exchange implementation, review,
+or Mac-only validation through a pull request. Its comments are constrained,
+machine-addressed events tied to the current PR SHA; they never grant mutation,
+arbitrary-command, merge, or deployment authority. Mutating commands are
+dry-run by default and require an exact-head `public:mutation` lease with
+`--apply`.
+
+Use the bounded `discover` operation with the recipient's constant queue label
+for portfolio wake-ups. Lifecycle comments and queue-label signals are separate
+idempotent writes, each admitted under its own public lease.
+
+Read `references/github-peer-handoff.md` before configuring a peer watcher or
+publishing a handoff. Keep host polling and launch behavior in the owning host
+integration, not this portable skill.

@@ -685,6 +685,10 @@ class AgentSystemTests(unittest.TestCase):
                 SYSTEM_ROOT / "skills" / "portfolio" / "scripts" / "agent-lease.py",
             )
             self.assertEqual(
+                (home / ".local" / "bin" / "agent-github-handoff").resolve(),
+                SYSTEM_ROOT / "skills" / "portfolio" / "scripts" / "agent-github-handoff.py",
+            )
+            self.assertEqual(
                 (home / ".local" / "bin" / "agent-autoreview").resolve(),
                 SYSTEM_ROOT / "skills" / "review" / "scripts" / "agent-autoreview.py",
             )

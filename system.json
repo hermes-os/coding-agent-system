@@ -27,6 +27,7 @@
     {"name": "agent-autoreview", "source": "skills/review/scripts/agent-autoreview.py"},
     {"name": "agent-capabilities", "source": "skills/capabilities/scripts/agent-capabilities.py"},
     {"name": "agent-docs-list", "source": "bin/docs-list"},
+    {"name": "agent-github-handoff", "source": "skills/portfolio/scripts/agent-github-handoff.py"},
     {"name": "agent-lease", "source": "skills/portfolio/scripts/agent-lease.py"},
     {"name": "agent-repo-adopt", "source": "bin/agent-repo-adopt"},
     {"name": "agent-repo-check", "source": "bin/agent-repo-check"},

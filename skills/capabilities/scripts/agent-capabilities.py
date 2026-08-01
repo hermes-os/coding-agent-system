@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import subprocess
 
 
 TOOL_GROUPS = {
@@ -25,8 +26,27 @@ TOOL_GROUPS = {
         "agent-trash",
     ),
     "platforms": ("vercel", "wrangler", "prisma", "docker"),
+    "macos": ("xcodebuild", "xcrun"),
     "browser_gui": ("playwright", "agent-browser", "peekaboo"),
 }
+
+
+def simctl_path(tools: dict[str, dict[str, str]]) -> str | None:
+    xcrun = tools.get("macos", {}).get("xcrun")
+    if not xcrun:
+        return None
+    try:
+        result = subprocess.run(
+            [xcrun, "--find", "simctl"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    path = result.stdout.strip()
+    return path if result.returncode == 0 and Path(path).is_absolute() else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,6 +139,8 @@ def main() -> int:
         group: {name: path for name in names if (path := shutil.which(name))}
         for group, names in TOOL_GROUPS.items()
     }
+    if simulator := simctl_path(tools):
+        tools["macos"]["simctl"] = simulator
     report = {
         "system": {
             "platform": platform.system(),

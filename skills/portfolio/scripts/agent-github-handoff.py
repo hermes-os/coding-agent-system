@@ -1,0 +1,1190 @@
+#!/usr/bin/env python3
+"""Exchange constrained, exact-head engineering handoffs through GitHub PRs."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import subprocess
+import sys
+import time
+from typing import Any
+from urllib.parse import quote
+
+
+SCHEMA_VERSION = 1
+MARKER = "agent-system-handoff:v1"
+RECIPIENTS = {"mac-cal", "vm-cal"}
+ROLES = {"implementation", "review", "macos-validation"}
+CHECKS = {
+    "repo-gate",
+    "source-review",
+    "macos-build",
+    "macos-tests",
+    "macos-app-smoke",
+}
+MACOS_SUITES = {"macos-build", "macos-tests", "macos-app-smoke"}
+OUTCOMES = {"success", "failure", "blocked"}
+STATUS_STATES = {"success", "failure", "error"}
+WRITE_PERMISSIONS = {"admin", "write"}
+AUTHORITY = {
+    "arbitrary_commands": False,
+    "deploy": False,
+    "merge": False,
+    "repository_mutation": False,
+}
+SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}")
+REMOTE_RE = re.compile(r"github\.com(?::|/)([^/\s]+/[^/\s]+?)(?:\.git)?$")
+MAX_TEXT = 1_000
+COMMAND_TIMEOUT_SECONDS = 20.0
+_COMMAND_DEADLINE: float | None = None
+
+
+class HandoffError(RuntimeError):
+    pass
+
+
+class AuthorRejected(HandoffError):
+    pass
+
+
+def sanitized_error(value: str) -> str:
+    value = re.sub(r"https?://[^\s]+", "<remote>", value)
+    value = re.sub(r"(?:x-access-token:)?[A-Za-z0-9_=-]{24,}", "<redacted>", value)
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    return lines[-1][:240] if lines else "provider operation failed"
+
+
+def run(command: list[str], *, cwd: Path, input_text: str | None = None) -> subprocess.CompletedProcess:
+    timeout = COMMAND_TIMEOUT_SECONDS
+    if _COMMAND_DEADLINE is not None:
+        remaining = _COMMAND_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            raise HandoffError("provider operation exceeded its overall deadline")
+        timeout = min(timeout, remaining)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HandoffError(f"provider operation timed out: {command[0]}") from exc
+    except OSError as exc:
+        raise HandoffError(f"required executable is unavailable: {command[0]}") from exc
+    if result.returncode:
+        raise HandoffError(sanitized_error(result.stderr or result.stdout))
+    return result
+
+
+def git(root: Path, *args: str) -> str:
+    return run(["git", *args], cwd=root).stdout.strip()
+
+
+def repository_root(value: str | Path | None) -> Path:
+    candidate = Path(value or Path.cwd()).expanduser().resolve()
+    discovered = Path(git(candidate, "rev-parse", "--show-toplevel")).resolve()
+    if discovered != candidate:
+        raise HandoffError("--repo must be a Git repository root")
+    return candidate
+
+
+def repository_slug(root: Path) -> str:
+    remote = git(root, "remote", "get-url", "origin")
+    match = REMOTE_RE.search(remote)
+    if not match:
+        raise HandoffError("origin is not a recognizable GitHub repository")
+    slug = match.group(1).removesuffix(".git")
+    if not SLUG_RE.fullmatch(slug):
+        raise HandoffError("origin repository name is invalid")
+    return slug.lower()
+
+
+def config_path(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    agents_home = Path(os.environ.get("AGENTS_HOME", Path.home() / ".agents")).expanduser()
+    return agents_home / "config.json"
+
+
+def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
+    if not isinstance(value, list) or not value:
+        raise HandoffError(f"{label} must be a non-empty string list")
+    output: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not pattern.fullmatch(item):
+            raise HandoffError(f"{label} contains an invalid value")
+        output.add(item.lower())
+    return output
+
+
+def authorization(path: Path) -> dict[str, set[str]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HandoffError(f"invalid agent configuration: {path}") from exc
+    peer = value.get("githubPeer") if isinstance(value, dict) else None
+    if not isinstance(peer, dict):
+        raise HandoffError("agent configuration has no githubPeer authorization")
+    repositories = string_set(peer.get("repositories"), "githubPeer.repositories", SLUG_RE)
+    authors = string_set(
+        peer.get("trustedAuthors"),
+        "githubPeer.trustedAuthors",
+        re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})"),
+    )
+    return {"repositories": repositories, "authors": authors}
+
+
+def context(args: argparse.Namespace) -> tuple[Path, str, dict[str, set[str]]]:
+    root = repository_root(args.repo)
+    slug = repository_slug(root)
+    auth = authorization(config_path(args.config))
+    if slug not in auth["repositories"]:
+        raise HandoffError(f"repository is not enrolled for GitHub peer work: {slug}")
+    return root, slug, auth
+
+
+def gh_json(
+    root: Path,
+    endpoint: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    command = ["gh", "api"]
+    if method != "GET":
+        command.extend(["--method", method])
+    command.append(endpoint)
+    input_text = None
+    if payload is not None:
+        command.extend(["--input", "-"])
+        input_text = json.dumps(payload, sort_keys=True)
+    output = run(command, cwd=root, input_text=input_text).stdout
+    if not output.strip():
+        return None
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise HandoffError("GitHub returned invalid JSON") from exc
+
+
+def paginated(root: Path, endpoint: str) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    separator = "&" if "?" in endpoint else "?"
+    for page in range(1, 101):
+        response = gh_json(root, f"{endpoint}{separator}per_page=100&page={page}")
+        if not isinstance(response, list):
+            raise HandoffError("GitHub returned an invalid paginated response")
+        if not all(isinstance(item, dict) for item in response):
+            raise HandoffError("GitHub returned an invalid item")
+        values.extend(response)
+        if len(response) < 100:
+            return values
+    raise HandoffError("GitHub pagination exceeded the safety limit")
+
+
+def validate_text(value: object, label: str, *, required: bool = True) -> str:
+    if not isinstance(value, str):
+        raise HandoffError(f"{label} must be a string")
+    cleaned = value.strip()
+    if required and not cleaned:
+        raise HandoffError(f"{label} is required")
+    if len(cleaned) > MAX_TEXT:
+        raise HandoffError(f"{label} exceeds {MAX_TEXT} characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in cleaned):
+        raise HandoffError(f"{label} contains control characters")
+    if "<!--" in cleaned or "-->" in cleaned:
+        raise HandoffError(f"{label} contains a reserved marker")
+    return cleaned
+
+
+def validate_sha(value: str) -> str:
+    normalized = value.lower()
+    if not SHA_RE.fullmatch(normalized):
+        raise HandoffError("head SHA must be exactly 40 lowercase hexadecimal characters")
+    return normalized
+
+
+def validate_pr_data(value: object, slug: str, number: int, head: str | None = None) -> str:
+    if number < 1:
+        raise HandoffError("pull request number must be positive")
+    try:
+        actual_head = value["head"]["sha"]
+        actual_repository = value["base"]["repo"]["full_name"]
+        state = value["state"]
+    except (KeyError, TypeError) as exc:
+        raise HandoffError("GitHub returned invalid pull request data") from exc
+    if not isinstance(actual_repository, str) or actual_repository.lower() != slug:
+        raise HandoffError("pull request does not belong to the enrolled repository")
+    if state != "open":
+        raise HandoffError("pull request is not open")
+    if not isinstance(actual_head, str) or not SHA_RE.fullmatch(actual_head):
+        raise HandoffError("pull request head SHA is invalid")
+    if head is not None and actual_head != head:
+        raise HandoffError("pull request head has drifted from the handoff SHA")
+    return actual_head
+
+
+def validate_pr(root: Path, slug: str, number: int, head: str) -> dict[str, Any]:
+    value = gh_json(root, f"repos/{slug}/pulls/{number}")
+    validate_pr_data(value, slug, number, head)
+    return value
+
+
+def author_permission(root: Path, slug: str, author: str) -> str:
+    value = gh_json(root, f"repos/{slug}/collaborators/{author}/permission")
+    permission = value.get("permission") if isinstance(value, dict) else None
+    if permission not in WRITE_PERMISSIONS:
+        raise AuthorRejected("handoff author lacks repository write authority")
+    return permission
+
+
+def validate_author(
+    root: Path,
+    slug: str,
+    auth: dict[str, set[str]],
+    author: object,
+    cache: dict[str, str] | None = None,
+) -> str:
+    if not isinstance(author, str) or author.lower() not in auth["authors"]:
+        raise AuthorRejected("handoff author is not trusted")
+    normalized = author.lower()
+    if cache is not None and normalized in cache:
+        return normalized
+    permission = author_permission(root, slug, author)
+    if cache is not None:
+        cache[normalized] = permission
+    return normalized
+
+
+def authenticated_author(root: Path, slug: str, auth: dict[str, set[str]]) -> str:
+    value = gh_json(root, "user")
+    login = value.get("login") if isinstance(value, dict) else None
+    return validate_author(root, slug, auth, login)
+
+
+def request_id(packet: dict[str, Any]) -> str:
+    identity = {
+        key: packet[key]
+        for key in (
+            "repository",
+            "pull_request",
+            "head_sha",
+            "from",
+            "to",
+            "role",
+            "objective",
+            "checks",
+        )
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def request_packet(
+    *,
+    slug: str,
+    pull_request: int,
+    head: str,
+    sender: str,
+    recipient: str,
+    role: str,
+    objective: str,
+    checks: list[str],
+) -> dict[str, Any]:
+    if sender not in RECIPIENTS or recipient not in RECIPIENTS or sender == recipient:
+        raise HandoffError("from and to must be distinct known peer recipients")
+    if role not in ROLES:
+        raise HandoffError("role is not supported")
+    normalized_checks = sorted(set(checks))
+    if not normalized_checks or any(item not in CHECKS for item in normalized_checks):
+        raise HandoffError("checks must contain only supported symbolic check IDs")
+    if role == "macos-validation" and not set(normalized_checks).intersection(MACOS_SUITES):
+        raise HandoffError("macos-validation requires a macOS check")
+    packet = {
+        "schema_version": SCHEMA_VERSION,
+        "event": "request",
+        "repository": slug,
+        "pull_request": pull_request,
+        "head_sha": validate_sha(head),
+        "from": sender,
+        "to": recipient,
+        "role": role,
+        "objective": validate_text(objective, "objective"),
+        "checks": normalized_checks,
+        "authority": dict(AUTHORITY),
+    }
+    packet["request_id"] = request_id(packet)
+    return packet
+
+
+def transition_packet(request: dict[str, Any], event: str, actor: str, **values: Any) -> dict[str, Any]:
+    if actor != request["to"]:
+        raise HandoffError("only the addressed peer may acknowledge or complete a handoff")
+    packet: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "event": event,
+        "request_id": request["request_id"],
+        "repository": request["repository"],
+        "pull_request": request["pull_request"],
+        "head_sha": request["head_sha"],
+        "actor": actor,
+    }
+    packet.update(values)
+    validate_packet(packet)
+    return packet
+
+
+def validate_packet(packet: object) -> dict[str, Any]:
+    if not isinstance(packet, dict):
+        raise HandoffError("handoff packet must be an object")
+    event = packet.get("event")
+    common = {
+        "schema_version",
+        "event",
+        "request_id",
+        "repository",
+        "pull_request",
+        "head_sha",
+    }
+    if event == "request":
+        expected = common | {"from", "to", "role", "objective", "checks", "authority"}
+    elif event == "ack":
+        expected = common | {"actor"}
+    elif event == "complete":
+        expected = common | {"actor", "outcome", "summary"}
+    else:
+        raise HandoffError("handoff event is invalid")
+    if set(packet) != expected:
+        raise HandoffError("handoff packet fields do not match its event schema")
+    if packet.get("schema_version") != SCHEMA_VERSION:
+        raise HandoffError("handoff schema version is unsupported")
+    request_value = packet.get("request_id")
+    if not isinstance(request_value, str) or not REQUEST_ID_RE.fullmatch(request_value):
+        raise HandoffError("handoff request ID is invalid")
+    repository = packet.get("repository")
+    if not isinstance(repository, str) or not SLUG_RE.fullmatch(repository):
+        raise HandoffError("handoff repository is invalid")
+    if type(packet.get("pull_request")) is not int or packet["pull_request"] < 1:
+        raise HandoffError("handoff pull request is invalid")
+    if not isinstance(packet.get("head_sha"), str):
+        raise HandoffError("handoff head SHA is invalid")
+    validate_sha(packet["head_sha"])
+    if event == "request":
+        sender = packet.get("from")
+        recipient = packet.get("to")
+        role = packet.get("role")
+        if sender not in RECIPIENTS or recipient not in RECIPIENTS or sender == recipient:
+            raise HandoffError("handoff peer addresses are invalid")
+        if role not in ROLES:
+            raise HandoffError("handoff role is invalid")
+        checks = packet.get("checks")
+        if (
+            not isinstance(checks, list)
+            or not checks
+            or checks != sorted(set(checks))
+            or any(item not in CHECKS for item in checks)
+        ):
+            raise HandoffError("handoff checks are invalid")
+        if role == "macos-validation" and not set(checks).intersection(MACOS_SUITES):
+            raise HandoffError("macos-validation requires a macOS check")
+        validate_text(packet.get("objective"), "objective")
+        if packet.get("authority") != AUTHORITY:
+            raise HandoffError("handoff authority must remain fully constrained")
+        if request_id(packet) != request_value:
+            raise HandoffError("handoff request ID does not match its immutable request")
+    else:
+        if packet.get("actor") not in RECIPIENTS:
+            raise HandoffError("handoff actor is invalid")
+        if event == "complete":
+            if packet.get("outcome") not in OUTCOMES:
+                raise HandoffError("handoff outcome is invalid")
+            validate_text(packet.get("summary"), "summary")
+    return packet
+
+
+def encode_comment(packet: dict[str, Any]) -> str:
+    validate_packet(packet)
+    payload = json.dumps(packet, sort_keys=True, separators=(",", ":"))
+    return f"<!-- {MARKER}\n{payload}\n-->\n\nAgent peer handoff `{packet['request_id']}` ({packet['event']}).\n"
+
+
+def decode_comment(body: object) -> dict[str, Any] | None:
+    if not isinstance(body, str) or f"<!-- {MARKER}" not in body:
+        return None
+    if len(body.encode("utf-8")) > 32_000:
+        raise HandoffError("handoff comment exceeds the size limit")
+    pattern = re.compile(rf"<!-- {re.escape(MARKER)}\n(\{{.*?\}})\n-->", re.DOTALL)
+    matches = pattern.findall(body)
+    if len(matches) != 1:
+        raise HandoffError("handoff comment must contain exactly one packet")
+    try:
+        packet = json.loads(matches[0])
+    except json.JSONDecodeError as exc:
+        raise HandoffError("handoff comment contains invalid JSON") from exc
+    return validate_packet(packet)
+
+
+def issue_comments(root: Path, slug: str, pull_request: int | None = None) -> list[dict[str, Any]]:
+    endpoint = (
+        f"repos/{slug}/issues/{pull_request}/comments"
+        if pull_request is not None
+        else f"repos/{slug}/issues/comments?sort=created&direction=asc"
+    )
+    return paginated(root, endpoint)
+
+
+def trusted_events(
+    root: Path,
+    slug: str,
+    auth: dict[str, set[str]],
+    comments: list[dict[str, Any]],
+) -> tuple[list[tuple[int, dict[str, Any]]], int]:
+    output: list[tuple[int, dict[str, Any]]] = []
+    ignored = 0
+    permission_cache: dict[str, str] = {}
+    for comment in comments:
+        body = comment.get("body")
+        if not isinstance(body, str) or f"<!-- {MARKER}" not in body:
+            continue
+        try:
+            author = comment.get("user", {}).get("login")
+            validate_author(root, slug, auth, author, permission_cache)
+        except AuthorRejected:
+            ignored += 1
+            continue
+        try:
+            packet = decode_comment(body)
+            if packet is None:
+                continue
+            if packet["repository"].lower() != slug:
+                raise HandoffError("handoff targets another repository")
+            comment_id = comment.get("id")
+            if type(comment_id) is not int or comment_id < 1:
+                raise HandoffError("handoff comment ID is invalid")
+            output.append((comment_id, packet))
+        except HandoffError:
+            ignored += 1
+    return sorted(output), ignored
+
+
+def reconcile(events: list[tuple[int, dict[str, Any]]]) -> tuple[dict[str, dict[str, Any]], int]:
+    states: dict[str, dict[str, Any]] = {}
+    rejected = 0
+    for comment_id, event in events:
+        request_value = event["request_id"]
+        current = states.get(request_value)
+        if event["event"] == "request":
+            if current is None:
+                states[request_value] = {
+                    "request": event,
+                    "state": "requested",
+                    "outcome": None,
+                    "comment_ids": [comment_id],
+                }
+            elif current["request"] == event:
+                current["comment_ids"].append(comment_id)
+            else:
+                rejected += 1
+            continue
+        if current is None or event["actor"] != current["request"]["to"]:
+            rejected += 1
+            continue
+        if event["event"] == "ack":
+            if current["state"] == "requested":
+                current["state"] = "acknowledged"
+                current["comment_ids"].append(comment_id)
+            elif current["state"] != "acknowledged":
+                rejected += 1
+        elif event["event"] == "complete":
+            if current["state"] in {"requested", "acknowledged"}:
+                current["state"] = "completed"
+                current["outcome"] = event["outcome"]
+                current["summary"] = event["summary"]
+                current["comment_ids"].append(comment_id)
+            elif not (
+                current.get("outcome") == event["outcome"]
+                and current.get("summary") == event["summary"]
+            ):
+                rejected += 1
+    return states, rejected
+
+
+def load_states(
+    root: Path,
+    slug: str,
+    auth: dict[str, set[str]],
+    pull_request: int | None = None,
+) -> tuple[dict[str, dict[str, Any]], int, int]:
+    events, ignored = trusted_events(
+        root, slug, auth, issue_comments(root, slug, pull_request)
+    )
+    states, conflicts = reconcile(events)
+    return states, ignored, conflicts
+
+
+def require_request(
+    root: Path,
+    slug: str,
+    auth: dict[str, set[str]],
+    pull_request: int,
+    request_value: str,
+    head: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not REQUEST_ID_RE.fullmatch(request_value):
+        raise HandoffError("request ID is invalid")
+    states, _ignored, conflicts = load_states(root, slug, auth, pull_request)
+    if conflicts:
+        raise HandoffError("handoff thread contains conflicting trusted peer events")
+    current = states.get(request_value)
+    if current is None:
+        raise HandoffError("handoff request was not found")
+    request = current["request"]
+    if request["pull_request"] != pull_request or request["head_sha"] != head:
+        raise HandoffError("handoff request does not match the requested PR head")
+    validate_pr(root, slug, pull_request, head)
+    return request, current
+
+
+def verify_public_lease(root: Path, lease_id: str | None, head: str) -> None:
+    if not lease_id:
+        raise HandoffError("--lease-id is required with --apply")
+    result = run(
+        ["agent-lease", "verify", lease_id, "--repo", str(root), "--head", head],
+        cwd=root,
+    )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HandoffError("agent-lease returned invalid verification data") from exc
+    if value.get("scope") != "public:mutation" or value.get("head") != head:
+        raise HandoffError("lease is not the exact-head public mutation lease")
+
+
+def queue_label(recipient: str) -> str:
+    if recipient not in RECIPIENTS:
+        raise HandoffError("queue recipient is invalid")
+    return f"agent:{recipient.removesuffix('-cal')}-pending"
+
+
+def queue_instruction(packet: dict[str, Any]) -> dict[str, str]:
+    if packet["event"] == "request":
+        return {"queue_action": "add", "queue_label": queue_label(packet["to"])}
+    return {"queue_action": "remove", "queue_label": queue_label(packet["actor"])}
+
+
+def publish_comment(
+    root: Path,
+    slug: str,
+    pull_request: int,
+    packet: dict[str, Any],
+    *,
+    apply: bool,
+    lease_id: str | None,
+) -> dict[str, Any]:
+    output = {
+        "event": packet["event"],
+        "head_sha": packet["head_sha"],
+        "request_id": packet["request_id"],
+        "would_write": not apply,
+        **queue_instruction(packet),
+    }
+    if not apply:
+        return output
+    verify_public_lease(root, lease_id, packet["head_sha"])
+    value = gh_json(
+        root,
+        f"repos/{slug}/issues/{pull_request}/comments",
+        method="POST",
+        payload={"body": encode_comment(packet)},
+    )
+    comment_id = value.get("id") if isinstance(value, dict) else None
+    if type(comment_id) is not int:
+        raise HandoffError("GitHub did not return the created comment ID")
+    output.update({"comment_id": comment_id, "published": True, "would_write": False})
+    return output
+
+
+def request_command(args: argparse.Namespace) -> int:
+    root, slug, auth = context(args)
+    head = validate_sha(args.head)
+    validate_pr(root, slug, args.pr, head)
+    authenticated_author(root, slug, auth)
+    packet = request_packet(
+        slug=slug,
+        pull_request=args.pr,
+        head=head,
+        sender=args.sender,
+        recipient=args.recipient,
+        role=args.role,
+        objective=args.objective,
+        checks=args.check,
+    )
+    states, _ignored, conflicts = load_states(root, slug, auth, args.pr)
+    if conflicts:
+        raise HandoffError("handoff thread contains conflicting trusted peer events")
+    existing = states.get(packet["request_id"])
+    if existing:
+        if existing["request"] != packet:
+            raise HandoffError("request ID collides with a different handoff")
+        print(
+            json.dumps(
+                {
+                    "event": "request",
+                    "head_sha": head,
+                    "published": False,
+                    "queue_action": "add" if existing["state"] == "requested" else "remove",
+                    "queue_label": queue_label(packet["to"]),
+                    "reason": "already-current",
+                    "request_id": packet["request_id"],
+                    "state": existing["state"],
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    print(
+        json.dumps(
+            publish_comment(
+                root,
+                slug,
+                args.pr,
+                packet,
+                apply=args.apply,
+                lease_id=args.lease_id,
+            ),
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def list_command(args: argparse.Namespace) -> int:
+    root, slug, auth = context(args)
+    states, ignored, conflicts = load_states(root, slug, auth, args.pr)
+    items: list[dict[str, Any]] = []
+    for request_value, current in sorted(states.items()):
+        request = current["request"]
+        if request["to"] != args.recipient:
+            continue
+        if args.pr is not None and request["pull_request"] != args.pr:
+            continue
+        if current["state"] == "completed" and not args.include_complete:
+            continue
+        try:
+            validate_pr(root, slug, request["pull_request"], request["head_sha"])
+            current_head = True
+        except HandoffError:
+            current_head = False
+        item = {
+            "checks": request["checks"],
+            "current_head": current_head,
+            "from": request["from"],
+            "head_sha": request["head_sha"],
+            "outcome": current["outcome"],
+            "pull_request": request["pull_request"],
+            "request_id": request_value,
+            "role": request["role"],
+            "state": current["state"],
+            "to": request["to"],
+        }
+        if current["state"] == "completed":
+            item["summary"] = current.get("summary", "")
+        items.append(item)
+    print(
+        json.dumps(
+            {
+                "handoffs": items,
+                "conflicting_trusted_events": conflicts,
+                "ignored_invalid_or_untrusted_events": ignored,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def show_command(args: argparse.Namespace) -> int:
+    root, slug, auth = context(args)
+    head = validate_sha(args.head)
+    request, _current = require_request(
+        root, slug, auth, args.pr, args.request_id, head
+    )
+    authenticated_author(root, slug, auth)
+    if args.actor != request["to"]:
+        raise HandoffError("only the addressed peer may inspect the handoff objective")
+    print(json.dumps({"request": request}, sort_keys=True))
+    return 0
+
+
+def signal_command(args: argparse.Namespace) -> int:
+    root, slug, auth = context(args)
+    head = validate_sha(args.head)
+    request, current = require_request(root, slug, auth, args.pr, args.request_id, head)
+    authenticated_author(root, slug, auth)
+    if args.recipient != request["to"]:
+        raise HandoffError("queue recipient does not match the handoff")
+    if args.state == "present" and current["state"] != "requested":
+        raise HandoffError("only a requested handoff may enter the peer queue")
+    if args.state == "absent" and current["state"] == "requested":
+        raise HandoffError("acknowledge or complete the handoff before removing its queue signal")
+    label = queue_label(args.recipient)
+    values = paginated(root, f"repos/{slug}/issues/{args.pr}/labels")
+    present = any(item.get("name") == label for item in values)
+    desired = args.state == "present"
+    if present == desired:
+        print(
+            json.dumps(
+                {
+                    "head_sha": head,
+                    "label": label,
+                    "published": False,
+                    "reason": "already-current",
+                    "request_id": args.request_id,
+                    "state": args.state,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not args.apply:
+        print(
+            json.dumps(
+                {
+                    "head_sha": head,
+                    "label": label,
+                    "request_id": args.request_id,
+                    "state": args.state,
+                    "would_write": True,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    verify_public_lease(root, args.lease_id, head)
+    if desired:
+        gh_json(
+            root,
+            f"repos/{slug}/issues/{args.pr}/labels",
+            method="POST",
+            payload={"labels": [label]},
+        )
+    else:
+        gh_json(
+            root,
+            f"repos/{slug}/issues/{args.pr}/labels/{quote(label, safe='')}",
+            method="DELETE",
+        )
+    print(
+        json.dumps(
+            {
+                "head_sha": head,
+                "label": label,
+                "published": True,
+                "request_id": args.request_id,
+                "state": args.state,
+                "would_write": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def search_slug(item: dict[str, Any]) -> str | None:
+    repository = item.get("repository_url")
+    if not isinstance(repository, str):
+        return None
+    match = re.fullmatch(r"https://api\.github\.com/repos/([^/]+/[^/]+)", repository)
+    if not match or not SLUG_RE.fullmatch(match.group(1)):
+        return None
+    return match.group(1).lower()
+
+
+def discover_command(args: argparse.Namespace) -> int:
+    global _COMMAND_DEADLINE
+    root = repository_root(args.repo)
+    auth = authorization(config_path(args.config))
+    organization = args.organization.lower()
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,38})", organization):
+        raise HandoffError("organization is invalid")
+    enrolled_for_org = {
+        slug for slug in auth["repositories"] if slug.partition("/")[0] == organization
+    }
+    if not enrolled_for_org:
+        raise HandoffError("organization has no enrolled peer repositories")
+    if not 1 <= args.limit <= 25:
+        raise HandoffError("--limit must be between 1 and 25")
+    if not 1 <= args.timeout_seconds <= 30:
+        raise HandoffError("--timeout-seconds must be between 1 and 30")
+    label = queue_label(args.recipient)
+    query = f'org:{organization} is:pr is:open label:"{label}"'
+    previous_deadline = _COMMAND_DEADLINE
+    _COMMAND_DEADLINE = time.monotonic() + args.timeout_seconds
+    try:
+        search = gh_json(
+            root,
+            f"search/issues?q={quote(query, safe='')}&per_page={args.limit}",
+        )
+        items = search.get("items") if isinstance(search, dict) else None
+        total = search.get("total_count") if isinstance(search, dict) else None
+        if not isinstance(items, list) or type(total) is not int:
+            raise HandoffError("GitHub returned invalid issue search data")
+        results: list[dict[str, Any]] = []
+        ignored = 0
+        rejected = 0
+        for item in items[: args.limit]:
+            if not isinstance(item, dict) or "pull_request" not in item:
+                ignored += 1
+                continue
+            slug = search_slug(item)
+            number = item.get("number")
+            if slug not in enrolled_for_org or type(number) is not int or number < 1:
+                ignored += 1
+                continue
+            pr = gh_json(root, f"repos/{slug}/pulls/{number}")
+            try:
+                head = validate_pr_data(pr, slug, number)
+            except HandoffError:
+                rejected += 1
+                continue
+            states, invalid_or_untrusted, conflicts = load_states(root, slug, auth, number)
+            ignored += invalid_or_untrusted
+            rejected += conflicts
+            if conflicts:
+                continue
+            for request_value, current in sorted(states.items()):
+                request = current["request"]
+                if (
+                    request["to"] != args.recipient
+                    or request["pull_request"] != number
+                    or request["head_sha"] != head
+                    or current["state"] != "requested"
+                ):
+                    continue
+                results.append(
+                    {
+                        "checks": request["checks"],
+                        "from": request["from"],
+                        "head_sha": head,
+                        "pull_request": number,
+                        "repository": slug,
+                        "request_id": request_value,
+                        "role": request["role"],
+                        "to": request["to"],
+                    }
+                )
+        print(
+            json.dumps(
+                {
+                    "handoffs": results,
+                    "ignored_invalid_untrusted_or_unenrolled": ignored,
+                    "label": label,
+                    "conflicting_trusted_events": rejected,
+                    "truncated": total > len(items),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    finally:
+        _COMMAND_DEADLINE = previous_deadline
+
+
+def ack_command(args: argparse.Namespace) -> int:
+    root, slug, auth = context(args)
+    head = validate_sha(args.head)
+    request, current = require_request(root, slug, auth, args.pr, args.request_id, head)
+    authenticated_author(root, slug, auth)
+    if args.actor != request["to"]:
+        raise HandoffError("actor is not the addressed peer")
+    if current["state"] in {"acknowledged", "completed"}:
+        print(
+            json.dumps(
+                {
+                    "event": "ack",
+                    "head_sha": head,
+                    "published": False,
+                    "queue_action": "remove",
+                    "queue_label": queue_label(request["to"]),
+                    "reason": "already-current",
+                    "request_id": args.request_id,
+                    "state": current["state"],
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    packet = transition_packet(request, "ack", args.actor)
+    print(
+        json.dumps(
+            publish_comment(
+                root,
+                slug,
+                args.pr,
+                packet,
+                apply=args.apply,
+                lease_id=args.lease_id,
+            ),
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def complete_command(args: argparse.Namespace) -> int:
+    root, slug, auth = context(args)
+    head = validate_sha(args.head)
+    request, current = require_request(root, slug, auth, args.pr, args.request_id, head)
+    authenticated_author(root, slug, auth)
+    if args.actor != request["to"]:
+        raise HandoffError("actor is not the addressed peer")
+    summary = validate_text(args.summary, "summary")
+    if current["state"] == "completed":
+        if current["outcome"] != args.outcome or current.get("summary") != summary:
+            raise HandoffError("handoff is already complete with a different result")
+        print(
+            json.dumps(
+                {
+                    "event": "complete",
+                    "head_sha": head,
+                    "published": False,
+                    "queue_action": "remove",
+                    "queue_label": queue_label(request["to"]),
+                    "reason": "already-current",
+                    "request_id": args.request_id,
+                    "state": "completed",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    packet = transition_packet(
+        request,
+        "complete",
+        args.actor,
+        outcome=args.outcome,
+        summary=summary,
+    )
+    print(
+        json.dumps(
+            publish_comment(
+                root,
+                slug,
+                args.pr,
+                packet,
+                apply=args.apply,
+                lease_id=args.lease_id,
+            ),
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def attestation_context(suite: str) -> str:
+    if suite not in MACOS_SUITES:
+        raise HandoffError("macOS attestation suite is unsupported")
+    return f"agent-system/platform/macos/{suite}"
+
+
+def existing_status(root: Path, slug: str, head: str, status_context: str) -> dict[str, Any] | None:
+    value = gh_json(root, f"repos/{slug}/commits/{head}/status")
+    statuses = value.get("statuses") if isinstance(value, dict) else None
+    if not isinstance(statuses, list):
+        raise HandoffError("GitHub returned invalid commit status data")
+    return next(
+        (
+            item
+            for item in statuses
+            if isinstance(item, dict) and item.get("context") == status_context
+        ),
+        None,
+    )
+
+
+def attest_command(args: argparse.Namespace) -> int:
+    root, slug, auth = context(args)
+    head = validate_sha(args.head)
+    request, _ = require_request(root, slug, auth, args.pr, args.request_id, head)
+    authenticated_author(root, slug, auth)
+    if request["to"] != "mac-cal" or request["role"] != "macos-validation":
+        raise HandoffError("platform attestation requires a Mac-addressed validation handoff")
+    if args.suite not in request["checks"]:
+        raise HandoffError("attestation suite was not requested by the handoff")
+    if platform.system() != "Darwin":
+        raise HandoffError("macOS platform attestation can run only on Darwin")
+    machine = platform.machine().lower()
+    if not re.fullmatch(r"[a-z0-9_.-]{1,32}", machine):
+        raise HandoffError("host architecture is invalid")
+    status_context = attestation_context(args.suite)
+    description = f"{args.state} {args.request_id[:12]} Darwin/{machine}"
+    current = existing_status(root, slug, head, status_context)
+    if current and current.get("state") == args.state and current.get("description") == description:
+        print(
+            json.dumps(
+                {
+                    "context": status_context,
+                    "head_sha": head,
+                    "published": False,
+                    "reason": "already-current",
+                    "state": args.state,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not args.apply:
+        print(
+            json.dumps(
+                {
+                    "context": status_context,
+                    "head_sha": head,
+                    "state": args.state,
+                    "would_write": True,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    verify_public_lease(root, args.lease_id, head)
+    gh_json(
+        root,
+        f"repos/{slug}/statuses/{head}",
+        method="POST",
+        payload={
+            "context": status_context,
+            "description": description,
+            "state": args.state,
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "context": status_context,
+                "head_sha": head,
+                "published": True,
+                "state": args.state,
+                "would_write": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repo")
+    parser.add_argument("--config")
+
+
+def add_mutation(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--lease-id")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    commands = root.add_subparsers(dest="command", required=True)
+
+    request_parser = commands.add_parser("request")
+    add_common(request_parser)
+    add_mutation(request_parser)
+    request_parser.add_argument("--pr", type=int, required=True)
+    request_parser.add_argument("--head", required=True)
+    request_parser.add_argument("--from", required=True, dest="sender", choices=sorted(RECIPIENTS))
+    request_parser.add_argument("--to", required=True, dest="recipient", choices=sorted(RECIPIENTS))
+    request_parser.add_argument("--role", required=True, choices=sorted(ROLES))
+    request_parser.add_argument("--objective", required=True)
+    request_parser.add_argument("--check", action="append", required=True, choices=sorted(CHECKS))
+    request_parser.set_defaults(handler=request_command)
+
+    list_parser = commands.add_parser("list")
+    add_common(list_parser)
+    list_parser.add_argument("--to", required=True, dest="recipient", choices=sorted(RECIPIENTS))
+    list_parser.add_argument("--pr", type=int)
+    list_parser.add_argument("--include-complete", action="store_true")
+    list_parser.set_defaults(handler=list_command)
+
+    show_parser = commands.add_parser("show")
+    add_common(show_parser)
+    show_parser.add_argument("--pr", type=int, required=True)
+    show_parser.add_argument("--head", required=True)
+    show_parser.add_argument("--request-id", required=True)
+    show_parser.add_argument("--actor", required=True, choices=sorted(RECIPIENTS))
+    show_parser.set_defaults(handler=show_command)
+
+    discover_parser = commands.add_parser("discover")
+    add_common(discover_parser)
+    discover_parser.add_argument("--organization", required=True)
+    discover_parser.add_argument("--to", required=True, dest="recipient", choices=sorted(RECIPIENTS))
+    discover_parser.add_argument("--limit", type=int, default=20)
+    discover_parser.add_argument("--timeout-seconds", type=int, default=25)
+    discover_parser.set_defaults(handler=discover_command)
+
+    ack_parser = commands.add_parser("ack")
+    add_common(ack_parser)
+    add_mutation(ack_parser)
+    ack_parser.add_argument("--pr", type=int, required=True)
+    ack_parser.add_argument("--head", required=True)
+    ack_parser.add_argument("--request-id", required=True)
+    ack_parser.add_argument("--actor", required=True, choices=sorted(RECIPIENTS))
+    ack_parser.set_defaults(handler=ack_command)
+
+    signal_parser = commands.add_parser("signal")
+    add_common(signal_parser)
+    add_mutation(signal_parser)
+    signal_parser.add_argument("--pr", type=int, required=True)
+    signal_parser.add_argument("--head", required=True)
+    signal_parser.add_argument("--request-id", required=True)
+    signal_parser.add_argument("--to", required=True, dest="recipient", choices=sorted(RECIPIENTS))
+    signal_parser.add_argument("--state", required=True, choices=("absent", "present"))
+    signal_parser.set_defaults(handler=signal_command)
+
+    complete_parser = commands.add_parser("complete")
+    add_common(complete_parser)
+    add_mutation(complete_parser)
+    complete_parser.add_argument("--pr", type=int, required=True)
+    complete_parser.add_argument("--head", required=True)
+    complete_parser.add_argument("--request-id", required=True)
+    complete_parser.add_argument("--actor", required=True, choices=sorted(RECIPIENTS))
+    complete_parser.add_argument("--outcome", required=True, choices=sorted(OUTCOMES))
+    complete_parser.add_argument("--summary", required=True)
+    complete_parser.set_defaults(handler=complete_command)
+
+    attest_parser = commands.add_parser("attest")
+    add_common(attest_parser)
+    add_mutation(attest_parser)
+    attest_parser.add_argument("--pr", type=int, required=True)
+    attest_parser.add_argument("--head", required=True)
+    attest_parser.add_argument("--request-id", required=True)
+    attest_parser.add_argument("--suite", required=True, choices=sorted(MACOS_SUITES))
+    attest_parser.add_argument("--state", required=True, choices=sorted(STATUS_STATES))
+    attest_parser.set_defaults(handler=attest_command)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if hasattr(args, "apply") and not args.apply and getattr(args, "lease_id", None):
+        raise HandoffError("--lease-id is valid only with --apply")
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, HandoffError) as exc:
+        print(f"agent-github-handoff: {exc}", file=sys.stderr)
+        raise SystemExit(1)
