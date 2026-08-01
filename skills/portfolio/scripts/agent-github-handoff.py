@@ -10,7 +10,9 @@ import json
 import os
 from pathlib import Path
 import platform
+import pwd
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -48,6 +50,9 @@ COMMAND_TIMEOUT_SECONDS = 20.0
 DEFAULT_OPERATION_TIMEOUT_SECONDS = 25
 MAX_OPERATION_TIMEOUT_SECONDS = 30
 MAX_COMMENT_PAGES = 3
+MAX_DISCOVERY_CANDIDATES = 25
+DISCOVERY_OVERSCAN_MULTIPLIER = 5
+PINNED_CONFIG_PATH_FILE = Path("/etc/coding-agent-system/agents-config-path")
 _COMMAND_DEADLINE: float | None = None
 
 
@@ -131,11 +136,93 @@ def repository_slug(root: Path) -> str:
     return slug.lower()
 
 
-def config_path(explicit: str | None) -> Path:
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    agents_home = Path(os.environ.get("AGENTS_HOME", Path.home() / ".agents")).expanduser()
-    return agents_home / "config.json"
+def check_root_controlled_directories(directory: Path, label: str) -> None:
+    for candidate in reversed((directory, *directory.parents)):
+        try:
+            value = candidate.lstat()
+        except OSError as exc:
+            raise HandoffError(f"cannot inspect {label} ancestor: {candidate}") from exc
+        if (
+            stat.S_ISLNK(value.st_mode)
+            or not stat.S_ISDIR(value.st_mode)
+            or value.st_uid != 0
+            or value.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise HandoffError(f"{label} ancestors must be root-controlled directories")
+
+
+def canonical_config_path() -> Path:
+    pointer = PINNED_CONFIG_PATH_FILE
+    try:
+        pointer.parent.lstat()
+        pointer_value = pointer.lstat()
+    except FileNotFoundError:
+        pointer_value = None
+    except OSError as exc:
+        raise HandoffError("cannot inspect the installer-pinned agent config path") from exc
+    if pointer_value is not None:
+        check_root_controlled_directories(pointer.parent, "pinned agent config")
+        if (
+            stat.S_ISLNK(pointer_value.st_mode)
+            or not stat.S_ISREG(pointer_value.st_mode)
+            or pointer_value.st_uid != 0
+            or pointer_value.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or pointer_value.st_size > 4_096
+        ):
+            raise HandoffError("pinned agent config path is not root-controlled")
+        try:
+            raw = pointer.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise HandoffError("cannot read the installer-pinned agent config path") from exc
+        candidate = Path(raw)
+        if (
+            not raw
+            or "\n" in raw
+            or not candidate.is_absolute()
+            or candidate.name != "config.json"
+            or candidate.parent.name != ".agents"
+        ):
+            raise HandoffError("installer-pinned agent config path is invalid")
+        check_root_controlled_directories(
+            candidate.parent, "installer-pinned agent config target"
+        )
+        check_authorization_file(candidate, allowed_owners={0})
+        return candidate
+    try:
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise HandoffError("current OS account has no canonical home directory") from exc
+    if not account_home.is_absolute():
+        raise HandoffError("current OS account home directory is not absolute")
+    return account_home / ".agents" / "config.json"
+
+
+def authorization_path(args: argparse.Namespace) -> Path:
+    # Tests inject a fixture below the public CLI boundary. The parser never
+    # exposes this private attribute, and production ignores HOME/AGENTS_HOME.
+    injected = getattr(args, "_authorization_path", None)
+    return Path(injected) if injected is not None else canonical_config_path()
+
+
+def check_authorization_file(
+    path: Path, *, allowed_owners: set[int] | None = None
+) -> None:
+    try:
+        parent = path.parent.lstat()
+        value = path.lstat()
+    except OSError as exc:
+        raise HandoffError(f"invalid agent configuration: {path}") from exc
+    owners = allowed_owners or {0, os.getuid()}
+    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+        raise HandoffError("agent configuration directory must be a real directory")
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+        raise HandoffError("agent configuration must be a regular non-symlink file")
+    if parent.st_uid not in owners or value.st_uid not in owners:
+        raise HandoffError("agent configuration ownership is not authorized for this host")
+    if parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise HandoffError("agent configuration directory must not be group/world writable")
+    if value.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise HandoffError("agent configuration must not be group/world writable")
 
 
 def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
@@ -150,6 +237,7 @@ def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
 
 
 def authorization(path: Path) -> dict[str, Any]:
+    check_authorization_file(path)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -172,7 +260,7 @@ def authorization(path: Path) -> dict[str, Any]:
 def context(args: argparse.Namespace) -> tuple[Path, str, dict[str, Any]]:
     root = repository_root(args.repo)
     slug = repository_slug(root)
-    auth = authorization(config_path(args.config))
+    auth = authorization(authorization_path(args))
     if slug not in auth["repositories"]:
         raise HandoffError(f"repository is not enrolled for GitHub peer work: {slug}")
     return root, slug, auth
@@ -537,7 +625,14 @@ def reconcile(events: list[tuple[int, dict[str, Any]]]) -> tuple[dict[str, dict[
             else:
                 rejected += 1
             continue
-        if current is None or event["actor"] != current["request"]["to"]:
+        if current is None:
+            rejected += 1
+            continue
+        request = current["request"]
+        immutable_fields = ("repository", "pull_request", "head_sha", "request_id")
+        if event["actor"] != request["to"] or any(
+            event[field] != request[field] for field in immutable_fields
+        ):
             rejected += 1
             continue
         if event["event"] == "ack":
@@ -915,7 +1010,7 @@ def search_slug(item: dict[str, Any]) -> str | None:
 
 def discover_command(args: argparse.Namespace) -> int:
     root = repository_root(args.repo)
-    auth = authorization(config_path(args.config))
+    auth = authorization(authorization_path(args))
     require_local_peer(auth, args.recipient, "queue discovery")
     organization = args.organization.lower()
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,38})", organization):
@@ -927,20 +1022,33 @@ def discover_command(args: argparse.Namespace) -> int:
         raise HandoffError("organization has no enrolled peer repositories")
     if not 1 <= args.limit <= 25:
         raise HandoffError("--limit must be between 1 and 25")
+    candidate_limit = min(
+        MAX_DISCOVERY_CANDIDATES,
+        max(args.limit, args.limit * DISCOVERY_OVERSCAN_MULTIPLIER),
+    )
     label = queue_label(args.recipient)
     query = f'org:{organization} is:pr is:open label:"{label}"'
     search = gh_json(
         root,
-        f"search/issues?q={quote(query, safe='')}&per_page={args.limit}",
+        f"search/issues?q={quote(query, safe='')}"
+        f"&sort=updated&order=desc&per_page={candidate_limit}",
     )
     items = search.get("items") if isinstance(search, dict) else None
     total = search.get("total_count") if isinstance(search, dict) else None
-    if not isinstance(items, list) or type(total) is not int:
+    incomplete = search.get("incomplete_results") if isinstance(search, dict) else None
+    if (
+        not isinstance(items, list)
+        or type(total) is not int
+        or total < 0
+        or type(incomplete) is not bool
+    ):
         raise HandoffError("GitHub returned invalid issue search data")
+    candidates = items[:candidate_limit]
     results: list[dict[str, Any]] = []
     ignored = 0
     rejected = 0
-    for item in items[: args.limit]:
+    result_overflow = False
+    for item in candidates:
         if not isinstance(item, dict) or "pull_request" not in item:
             ignored += 1
             continue
@@ -981,14 +1089,24 @@ def discover_command(args: argparse.Namespace) -> int:
                     "to": request["to"],
                 }
             )
+            if len(results) > args.limit:
+                result_overflow = True
+                break
+        if result_overflow:
+            break
     print(
         json.dumps(
             {
-                "handoffs": results,
+                "handoffs": results[: args.limit],
                 "ignored_invalid_untrusted_or_unenrolled": ignored,
                 "label": label,
                 "conflicting_trusted_events": rejected,
-                "truncated": total > len(items),
+                "truncated": (
+                    incomplete
+                    or total > len(items)
+                    or len(items) > candidate_limit
+                    or result_overflow
+                ),
             },
             sort_keys=True,
         )
@@ -1188,7 +1306,6 @@ def attest_command(args: argparse.Namespace) -> int:
 
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo")
-    parser.add_argument("--config")
     parser.add_argument(
         "--timeout-seconds",
         type=int,

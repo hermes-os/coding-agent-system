@@ -98,7 +98,10 @@ for portfolio wake-ups. Lifecycle comments and queue-label signals are separate
 idempotent writes, each admitted under its own public lease. Local
 `githubPeer.localPeer` configuration binds a host to `mac-cal` or `vm-cal` even
 when both share one trusted GitHub login. PR comment scans and whole operations
-are capped, and every write rechecks the live PR head after lease admission.
+are capped, discovery overscans a bounded recent candidate set without
+exceeding its output limit, and every write rechecks the live PR head after
+lease admission. Enrollment is read only from the canonical host config or a
+root-controlled pointer; the public CLI cannot replace it.
 
 Read `references/github-peer-handoff.md` before configuring a peer watcher or
 publishing a handoff. Keep host polling and launch behavior in the owning host

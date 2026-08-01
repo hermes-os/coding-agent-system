@@ -5,8 +5,10 @@ This file records user-visible changes to the portable coding-agent system.
 ## Unreleased
 
 - Add constrained GitHub peer handoffs with local host identity, bounded queue
-  discovery, recipient-wide signals, post-lease PR revalidation, exact-head
-  lifecycle events, and Darwin-only macOS validation statuses.
+  discovery without stale-label starvation, recipient-wide signals,
+  immutable transition binding, canonical host authorization, post-lease PR
+  revalidation, exact-head lifecycle events, and Darwin-only macOS validation
+  statuses.
 - Report Xcode, `xcrun`, and simulator capabilities when available.
 
 ### Changed

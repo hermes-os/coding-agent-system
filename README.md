@@ -61,9 +61,11 @@ Enrolled hosts can exchange constrained, exact-SHA PR work with
 `agent-github-handoff`. Local `githubPeer.localPeer`, repository, and
 trusted-author settings define its authorization surface; handoffs never grant
 mutation, commands, merge, or deploy authority. See the portfolio skill before
-enabling a host-specific watcher. A bounded organization discovery call uses
-constant peer queue labels and revalidates every returned packet without
-interpreting PR bodies as instructions.
+enabling a host-specific watcher. Peer enrollment comes only from the canonical
+host config (or a root-pinned nonstandard install), never a CLI or environment
+override. A bounded organization discovery call overscans recent constant-label
+candidates and revalidates every returned packet without interpreting PR bodies
+as instructions.
 
 To replace an older cataloged but unmanifested installation, pass its clean
 tracked source explicitly:

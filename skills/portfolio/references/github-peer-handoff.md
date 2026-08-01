@@ -7,8 +7,8 @@ the repository, PR head, CI, reviews, and remote leases remain authoritative.
 ## Local Authorization
 
 Each host adds the same repository and trusted GitHub author allowlists, plus
-its one distinct logical identity, to local `~/.agents/config.json`. This is an
-authorization surface, not project memory:
+its one distinct logical identity, to the installed host's canonical
+`~/.agents/config.json`. This is an authorization surface, not project memory:
 
 ```json
 {
@@ -22,10 +22,35 @@ authorization surface, not project memory:
 
 Use `mac-cal` on the Mac and `vm-cal` on the VM. The hosts may share the same
 trusted GitHub login; `localPeer` is the local boundary that prevents one host
-from inspecting or completing work addressed to the other. The helper also
-requires the local checkout's `origin` to match the enrolled repository, the PR
-to be open in that repository, every packet author to have GitHub write
-authority, and the current PR head to equal the packet's full SHA.
+from inspecting or completing work addressed to the other. The public CLI has
+no config-path option and ignores `HOME` and `AGENTS_HOME` for this enrollment.
+It uses the current OS account's passwd home, so the existing Mac path is
+`/Users/Josh/.agents/config.json`. The config and `.agents` directory must be
+real, root/current-account-owned, and not group/world writable.
+
+When an integration installer deliberately keeps the canonical `.agents`
+directory outside that account's passwd home, it may create
+`/etc/coding-agent-system/agents-config-path`. The pointer contains one absolute
+path ending in `.agents/config.json`. Its directory, pointer, target directory,
+target file, and every target-path ancestor from the filesystem root must be
+root-owned, non-symlink, and not group/world writable.
+For VM Cal's root-owned install, bootstrap it once as root:
+
+```bash
+install -d -m 0755 /etc/coding-agent-system
+printf '%s\n' /root/.agents/config.json \
+  > /etc/coding-agent-system/agents-config-path
+chown root /etc/coding-agent-system /etc/coding-agent-system/agents-config-path \
+  /root/.agents /root/.agents/config.json
+chmod go-w /etc/coding-agent-system /etc/coding-agent-system/agents-config-path \
+  /root/.agents /root/.agents/config.json
+```
+
+Run those commands in the privileged host installer, not through an agent task
+packet. The helper also requires the local checkout's `origin` to match the
+enrolled repository, the PR to be open in that repository, every packet author
+to have GitHub write authority, and the current PR head to equal the packet's
+full SHA.
 
 Packets use fixed logical recipients (`mac-cal`, `vm-cal`), roles
 (`implementation`, `review`, `macos-validation`), and symbolic check IDs. A
@@ -43,10 +68,22 @@ wake idempotent. `agent-github-handoff list` reconstructs the current state and
 ignores ordinary PR discussion. Do not copy packets into a separate ledger.
 
 Two constant labels are bounded discovery signals: `agent:mac-pending` and
-`agent:vm-pending`. Repositories provision them once. Lifecycle commands expose
-the required queue action but do not combine it with their comment write. Apply
-the signal in a second invocation under a newly acquired public lease, keeping
-the one-provider-write boundary intact.
+`agent:vm-pending`. GitHub does not create an unknown label when the helper adds
+it to a PR: provision both labels once in every enrolled repository before
+enabling a watcher. Under one fresh `public:mutation` lease per provider write,
+an operator with repository write access runs:
+
+```bash
+gh label create agent:mac-pending --repo owner/repository \
+  --color 1D76DB --description "Mac peer work is pending"
+gh label create agent:vm-pending --repo owner/repository \
+  --color 5319E7 --description "VM peer work is pending"
+```
+
+If a label already exists, inspect it and skip creation. Lifecycle commands
+expose the required queue action but do not combine it with their comment
+write. Apply the signal in a second invocation under a newly acquired public
+lease, keeping the one-provider-write boundary intact.
 
 ```bash
 agent-github-handoff request \
@@ -102,10 +139,14 @@ agent-github-handoff discover \
   --limit 20 --timeout-seconds 25
 ```
 
-Discovery filters to locally enrolled repositories, fetches the live PR head,
-revalidates packet schemas and author permission, and returns only unacknowledged
-requests for that exact SHA. It never reads a PR title or body as instructions.
-Stale labels, untrusted comments, and ordinary discussion cannot create work.
+Discovery searches a bounded, recently updated candidate overscan, filters to
+locally enrolled repositories, fetches the live PR head, revalidates packet
+schemas and author permission, and returns no more than `--limit`
+unacknowledged requests for that exact SHA. `truncated` is true when eligible
+work exceeded the output limit, GitHub omitted candidates, or its search result
+was incomplete. It never reads a PR title or body as instructions. Stale
+labels, untrusted comments, and ordinary discussion cannot create work or
+starve the first valid candidate behind one stale result.
 Queue-label removal reconciles every current-head request for that recipient;
 one acknowledged request cannot hide a requested sibling.
 After selecting a request, the addressed peer uses `show` to retrieve its

@@ -1,11 +1,12 @@
 import argparse
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
 import json
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -61,6 +62,7 @@ class Provider:
             return [{"name": label} for label in sorted(self.labels)]
         if endpoint.startswith("search/issues?"):
             return {
+                "incomplete_results": False,
                 "total_count": 1 if "agent:mac-pending" in self.labels else 0,
                 "items": (
                     [
@@ -144,7 +146,7 @@ class GitHubHandoffTests(unittest.TestCase):
     def args(self, **values):
         defaults = {
             "repo": str(self.repo),
-            "config": str(self.config),
+            "_authorization_path": str(self.config),
             "pr": 7,
             "head": self.head,
             "sender": "vm-cal",
@@ -250,7 +252,7 @@ class GitHubHandoffTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.mac_config),
+            _authorization_path=str(self.mac_config),
             recipient="mac-cal",
             pr=7,
             include_complete=False,
@@ -289,6 +291,50 @@ class GitHubHandoffTests(unittest.TestCase):
             with self.assertRaisesRegex(self.module.HandoffError, "conflicting trusted"):
                 self.module.request_command(self.args())
 
+    def test_transition_must_match_every_immutable_request_field(self):
+        request_value = self.publish_request()
+        request = self.module.decode_comment(self.provider.comments[0]["body"])
+        self.assertIsNotNone(request)
+        mismatches = (
+            {"head_sha": "f" * 40},
+            {"pull_request": 8},
+        )
+        for comment_id, changed in enumerate(mismatches, start=20):
+            packet = self.module.transition_packet(request, "ack", "mac-cal")
+            packet.update(changed)
+            self.provider.comments.append(
+                {
+                    "id": comment_id,
+                    "body": self.module.encode_comment(packet),
+                    "user": {"login": "trusted-author"},
+                }
+            )
+        with mock.patch.object(self.module, "gh_json", self.provider):
+            states, ignored, conflicts = self.module.load_states(
+                self.repo, "example/app", self.module.authorization(self.vm_config), 7
+            )
+        self.assertEqual(ignored, 0)
+        self.assertEqual(conflicts, 2)
+        self.assertEqual(states[request_value]["state"], "requested")
+
+        writes_before = len(self.provider.writes)
+        signal = argparse.Namespace(
+            repo=str(self.repo),
+            _authorization_path=str(self.vm_config),
+            pr=7,
+            head=self.head,
+            request_id=request_value,
+            recipient="mac-cal",
+            state="present",
+            apply=True,
+            lease_id="c" * 32,
+        )
+        with mock.patch.object(self.module, "gh_json", self.provider):
+            with self.assertRaisesRegex(self.module.HandoffError, "conflicting trusted"):
+                self.module.signal_command(signal)
+        self.assertEqual(len(self.provider.writes), writes_before)
+        self.assertNotIn("agent:mac-pending", self.provider.labels)
+
     def test_show_returns_only_validated_request_to_exact_recipient_and_head(self):
         request_value = self.publish_request()
         self.provider.comments.append(
@@ -300,7 +346,7 @@ class GitHubHandoffTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.mac_config),
+            _authorization_path=str(self.mac_config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -325,7 +371,7 @@ class GitHubHandoffTests(unittest.TestCase):
         request_value = self.publish_request()
         common = {
             "repo": str(self.repo),
-            "config": str(self.mac_config),
+            "_authorization_path": str(self.mac_config),
             "pr": 7,
             "head": self.head,
             "request_id": request_value,
@@ -362,7 +408,7 @@ class GitHubHandoffTests(unittest.TestCase):
         request_value = self.publish_request()
         present = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.config),
+            _authorization_path=str(self.config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -381,7 +427,7 @@ class GitHubHandoffTests(unittest.TestCase):
 
         discover = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.mac_config),
+            _authorization_path=str(self.mac_config),
             organization="example",
             recipient="mac-cal",
             limit=20,
@@ -407,7 +453,7 @@ class GitHubHandoffTests(unittest.TestCase):
 
         ack = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.mac_config),
+            _authorization_path=str(self.mac_config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -422,7 +468,7 @@ class GitHubHandoffTests(unittest.TestCase):
         absent = argparse.Namespace(
             **{
                 **vars(present),
-                "config": str(self.mac_config),
+                "_authorization_path": str(self.mac_config),
                 "state": "absent",
                 "lease_id": "f" * 32,
             }
@@ -434,12 +480,117 @@ class GitHubHandoffTests(unittest.TestCase):
         self.assertTrue(cleared["published"])
         self.assertNotIn("agent:mac-pending", self.provider.labels)
 
+    def test_discovery_caps_multiple_requests_and_reports_incomplete_provider_results(self):
+        first = self.publish_request(objective="Run the Mac build.", check=["macos-build"])
+        second = self.publish_request(objective="Run the Mac tests.", check=["macos-tests"])
+        self.provider.labels.add("agent:mac-pending")
+        discover = argparse.Namespace(
+            repo=str(self.repo),
+            _authorization_path=str(self.mac_config),
+            organization="example",
+            recipient="mac-cal",
+            limit=1,
+            timeout_seconds=25,
+        )
+        with mock.patch.object(self.module, "gh_json", self.provider):
+            _, found = self.capture(self.module.discover_command, discover)
+        self.assertEqual(len(found["handoffs"]), 1)
+        self.assertEqual(found["handoffs"][0]["request_id"], min(first, second))
+        self.assertTrue(found["truncated"])
+
+        def incomplete_provider(root, endpoint, *, method="GET", payload=None):
+            value = self.provider(root, endpoint, method=method, payload=payload)
+            if endpoint.startswith("search/issues?"):
+                value = {**value, "incomplete_results": True}
+            return value
+
+        self.provider.comments = self.provider.comments[:1]
+        with mock.patch.object(self.module, "gh_json", incomplete_provider):
+            _, incomplete = self.capture(self.module.discover_command, discover)
+        self.assertEqual(len(incomplete["handoffs"]), 1)
+        self.assertTrue(incomplete["truncated"])
+
+    def test_discovery_overscan_skips_a_stale_label_before_valid_work(self):
+        stale = self.module.request_packet(
+            slug="example/app",
+            pull_request=7,
+            head=self.head,
+            sender="vm-cal",
+            recipient="mac-cal",
+            role="macos-validation",
+            objective="Stale Mac validation.",
+            checks=["macos-tests"],
+        )
+        valid_head = "e" * 40
+        valid = self.module.request_packet(
+            slug="example/app",
+            pull_request=8,
+            head=valid_head,
+            sender="vm-cal",
+            recipient="mac-cal",
+            role="macos-validation",
+            objective="Current Mac validation.",
+            checks=["macos-tests"],
+        )
+        comments = {
+            7: [{"id": 1, "body": self.module.encode_comment(stale), "user": {"login": "trusted-author"}}],
+            8: [{"id": 2, "body": self.module.encode_comment(valid), "user": {"login": "trusted-author"}}],
+        }
+
+        def provider(_root, endpoint, *, method="GET", payload=None):
+            self.assertEqual(method, "GET")
+            self.assertIsNone(payload)
+            if endpoint.startswith("search/issues?"):
+                self.assertIn("sort=updated&order=desc&per_page=5", endpoint)
+                return {
+                    "incomplete_results": False,
+                    "total_count": 2,
+                    "items": [
+                        {
+                            "number": number,
+                            "pull_request": {"url": "unused"},
+                            "repository_url": "https://api.github.com/repos/example/app",
+                        }
+                        for number in (7, 8)
+                    ],
+                }
+            if endpoint == "repos/example/app/pulls/7":
+                head = "f" * 40
+            elif endpoint == "repos/example/app/pulls/8":
+                head = valid_head
+            elif endpoint.startswith("repos/example/app/issues/7/comments?"):
+                return comments[7]
+            elif endpoint.startswith("repos/example/app/issues/8/comments?"):
+                return comments[8]
+            elif endpoint == "repos/example/app/collaborators/trusted-author/permission":
+                return {"permission": "write"}
+            else:
+                raise AssertionError(endpoint)
+            return {
+                "state": "open",
+                "head": {"sha": head},
+                "base": {"repo": {"full_name": "example/app"}},
+            }
+
+        discover = argparse.Namespace(
+            repo=str(self.repo),
+            _authorization_path=str(self.mac_config),
+            organization="example",
+            recipient="mac-cal",
+            limit=1,
+            timeout_seconds=25,
+        )
+        with mock.patch.object(self.module, "gh_json", provider):
+            _, found = self.capture(self.module.discover_command, discover)
+        self.assertEqual([item["request_id"] for item in found["handoffs"]], [valid["request_id"]])
+        self.assertFalse(found["truncated"])
+
     def test_queue_removal_waits_for_every_current_head_recipient_request(self):
         first = self.publish_request(objective="Run the Mac build.", check=["macos-build"])
         second = self.publish_request(objective="Run the Mac tests.", check=["macos-tests"])
         present = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.vm_config),
+            _authorization_path=str(self.vm_config),
             pr=7,
             head=self.head,
             request_id=first,
@@ -456,7 +607,7 @@ class GitHubHandoffTests(unittest.TestCase):
         def acknowledge(request_value):
             args = argparse.Namespace(
                 repo=str(self.repo),
-                config=str(self.mac_config),
+                _authorization_path=str(self.mac_config),
                 pr=7,
                 head=self.head,
                 request_id=request_value,
@@ -475,7 +626,7 @@ class GitHubHandoffTests(unittest.TestCase):
         absent = argparse.Namespace(
             **{
                 **vars(present),
-                "config": str(self.mac_config),
+                "_authorization_path": str(self.mac_config),
                 "state": "absent",
             }
         )
@@ -506,7 +657,7 @@ class GitHubHandoffTests(unittest.TestCase):
 
         recipient = {
             "repo": str(self.repo),
-            "config": str(self.vm_config),
+            "_authorization_path": str(self.vm_config),
             "pr": 7,
             "head": self.head,
             "request_id": request_value,
@@ -531,7 +682,7 @@ class GitHubHandoffTests(unittest.TestCase):
                 )
         attest = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.vm_config),
+            _authorization_path=str(self.vm_config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -543,6 +694,102 @@ class GitHubHandoffTests(unittest.TestCase):
         with mock.patch.object(self.module, "gh_json", self.provider):
             with self.assertRaisesRegex(self.module.HandoffError, "local peer"):
                 self.module.attest_command(attest)
+
+    def test_authorization_path_is_canonical_and_public_cli_cannot_replace_it(self):
+        account_home = Path(self.temp.name) / "account-home"
+        redirected_home = Path(self.temp.name) / "redirected-home"
+        pointer = Path(self.temp.name) / "missing-pointer"
+        with mock.patch.object(self.module, "PINNED_CONFIG_PATH_FILE", pointer), mock.patch.object(
+            self.module.pwd,
+            "getpwuid",
+            return_value=type("Account", (), {"pw_dir": str(account_home)})(),
+        ), mock.patch.dict(
+            self.module.os.environ,
+            {"HOME": str(redirected_home), "AGENTS_HOME": str(redirected_home / ".agents")},
+        ):
+            self.assertEqual(
+                self.module.canonical_config_path(), account_home / ".agents" / "config.json"
+            )
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.module.parser().parse_args(
+                [
+                    "list",
+                    "--repo",
+                    str(self.repo),
+                    "--to",
+                    "mac-cal",
+                    "--pr",
+                    "7",
+                    "--config",
+                    str(self.mac_config),
+                ]
+            )
+
+    def test_authorization_rejects_symlink_and_writable_config_state(self):
+        linked = self.mac_config.parent / "linked-config.json"
+        linked.symlink_to(self.mac_config)
+        with self.assertRaisesRegex(self.module.HandoffError, "non-symlink"):
+            self.module.authorization(linked)
+
+        original_mode = self.mac_config.stat().st_mode & 0o777
+        try:
+            self.mac_config.chmod(0o666)
+            with self.assertRaisesRegex(self.module.HandoffError, "group/world writable"):
+                self.module.authorization(self.mac_config)
+        finally:
+            self.mac_config.chmod(original_mode)
+
+    def test_root_pinned_config_cannot_target_caller_owned_enrollment(self):
+        with self.assertRaisesRegex(self.module.HandoffError, "ownership"):
+            self.module.check_authorization_file(
+                self.mac_config, allowed_owners={self.mac_config.stat().st_uid + 1}
+            )
+
+        pointer = Path(self.temp.name) / "etc" / "coding-agent-system" / "agents-config-path"
+        pointer.parent.mkdir(parents=True)
+        target = Path(self.temp.name) / "root" / ".agents" / "config.json"
+        pointer.write_text(f"{target}\n", encoding="utf-8")
+        real_lstat = Path.lstat
+
+        def root_controlled_lstat(path):
+            value = real_lstat(path)
+            if path in {pointer.parent, pointer}:
+                return SimpleNamespace(
+                    st_mode=value.st_mode,
+                    st_uid=0,
+                    st_size=value.st_size,
+                )
+            return value
+
+        with mock.patch.object(
+            self.module, "PINNED_CONFIG_PATH_FILE", pointer
+        ), mock.patch.object(Path, "lstat", root_controlled_lstat), mock.patch.object(
+            self.module, "check_root_controlled_directories"
+        ) as checked_directories, mock.patch.object(
+            self.module, "check_authorization_file"
+        ) as checked:
+            self.assertEqual(self.module.canonical_config_path(), target)
+        self.assertEqual(
+            checked_directories.call_args_list,
+            [
+                mock.call(pointer.parent, "pinned agent config"),
+                mock.call(target.parent, "installer-pinned agent config target"),
+            ],
+        )
+        checked.assert_called_once_with(target, allowed_owners={0})
+
+    def test_root_pinned_config_rejects_a_writable_ancestor_swap(self):
+        target_directory = Path("/safe/caller-writable/.agents")
+
+        def directory_state(path):
+            mode = 0o777 if path == Path("/safe/caller-writable") else 0o755
+            return SimpleNamespace(st_mode=self.module.stat.S_IFDIR | mode, st_uid=0)
+
+        with mock.patch.object(Path, "lstat", directory_state):
+            with self.assertRaisesRegex(self.module.HandoffError, "root-controlled"):
+                self.module.check_root_controlled_directories(
+                    target_directory, "installer-pinned agent config target"
+                )
 
     def test_each_write_revalidates_pr_head_after_lease_admission(self):
         def advance_head(*_args, **_kwargs):
@@ -562,7 +809,7 @@ class GitHubHandoffTests(unittest.TestCase):
         writes_before = len(self.provider.writes)
         signal = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.vm_config),
+            _authorization_path=str(self.vm_config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -583,7 +830,7 @@ class GitHubHandoffTests(unittest.TestCase):
         writes_before = len(self.provider.writes)
         attest = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.mac_config),
+            _authorization_path=str(self.mac_config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -654,7 +901,7 @@ class GitHubHandoffTests(unittest.TestCase):
         request_value = self.publish_request()
         args = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.mac_config),
+            _authorization_path=str(self.mac_config),
             pr=7,
             head=self.head,
             request_id=request_value,
