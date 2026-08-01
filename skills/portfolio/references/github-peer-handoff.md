@@ -6,22 +6,26 @@ the repository, PR head, CI, reviews, and remote leases remain authoritative.
 
 ## Local Authorization
 
-Each host adds the same repository and trusted GitHub author allowlists to its
-local `~/.agents/config.json`. This is an authorization surface, not project
-memory:
+Each host adds the same repository and trusted GitHub author allowlists, plus
+its one distinct logical identity, to local `~/.agents/config.json`. This is an
+authorization surface, not project memory:
 
 ```json
 {
   "githubPeer": {
+    "localPeer": "mac-cal",
     "repositories": ["owner/repository"],
     "trustedAuthors": ["trusted-login"]
   }
 }
 ```
 
-The helper also requires the local checkout's `origin` to match the enrolled
-repository, the PR to be open in that repository, every packet author to have
-GitHub write authority, and the current PR head to equal the packet's full SHA.
+Use `mac-cal` on the Mac and `vm-cal` on the VM. The hosts may share the same
+trusted GitHub login; `localPeer` is the local boundary that prevents one host
+from inspecting or completing work addressed to the other. The helper also
+requires the local checkout's `origin` to match the enrolled repository, the PR
+to be open in that repository, every packet author to have GitHub write
+authority, and the current PR head to equal the packet's full SHA.
 
 Packets use fixed logical recipients (`mac-cal`, `vm-cal`), roles
 (`implementation`, `review`, `macos-validation`), and symbolic check IDs. A
@@ -51,7 +55,7 @@ agent-github-handoff request \
   --objective "Validate the PR on macOS." \
   --check macos-build --check macos-tests
 
-agent-github-handoff list --repo "$PWD" --to mac-cal
+agent-github-handoff list --repo "$PWD" --pr 123 --to mac-cal
 agent-github-handoff show \
   --repo "$PWD" --pr 123 --head "$head" \
   --request-id "$request_id" --actor mac-cal
@@ -79,7 +83,14 @@ or attestation provider write:
 4. Verify the single provider response and immediately release the public
    lease.
 
+Immediately after public-lease verification, each mutating command fetches the
+PR again and rejects a closed or advanced head before its one provider write.
 Never hold the public lease between lifecycle events or while tests run.
+
+Every CLI operation has one whole-operation deadline (25 seconds by default,
+maximum 30), and each PR lifecycle scan is capped at three 100-comment pages.
+`list` always requires one PR; portfolio-wide discovery uses the bounded label
+search instead of enumerating repository comments.
 
 For a bounded portfolio snapshot, search the organization queue once and then
 revalidate only the returned PRs:
@@ -95,6 +106,8 @@ Discovery filters to locally enrolled repositories, fetches the live PR head,
 revalidates packet schemas and author permission, and returns only unacknowledged
 requests for that exact SHA. It never reads a PR title or body as instructions.
 Stale labels, untrusted comments, and ordinary discussion cannot create work.
+Queue-label removal reconciles every current-head request for that recipient;
+one acknowledged request cannot hide a requested sibling.
 After selecting a request, the addressed peer uses `show` to retrieve its
 bounded objective. `show` repeats enrollment, author, recipient, open-PR, and
 exact-head checks and returns only the constrained request packet, never PR

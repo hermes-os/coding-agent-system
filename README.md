@@ -58,12 +58,12 @@ recorded locally in `~/.agents/config.json`; it is host state, not project
 memory.
 
 Enrolled hosts can exchange constrained, exact-SHA PR work with
-`agent-github-handoff`. Local `githubPeer` repository and trusted-author
-allowlists define its authorization surface; handoffs never grant mutation,
-commands, merge, or deploy authority. See the portfolio skill before enabling a
-host-specific watcher. A bounded organization discovery call uses constant peer
-queue labels and revalidates every returned packet without interpreting PR
-bodies as instructions.
+`agent-github-handoff`. Local `githubPeer.localPeer`, repository, and
+trusted-author settings define its authorization surface; handoffs never grant
+mutation, commands, merge, or deploy authority. See the portfolio skill before
+enabling a host-specific watcher. A bounded organization discovery call uses
+constant peer queue labels and revalidates every returned packet without
+interpreting PR bodies as instructions.
 
 To replace an older cataloged but unmanifested installation, pass its clean
 tracked source explicitly:

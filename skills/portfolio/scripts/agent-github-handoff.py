@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -44,6 +45,9 @@ REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}")
 REMOTE_RE = re.compile(r"github\.com(?::|/)([^/\s]+/[^/\s]+?)(?:\.git)?$")
 MAX_TEXT = 1_000
 COMMAND_TIMEOUT_SECONDS = 20.0
+DEFAULT_OPERATION_TIMEOUT_SECONDS = 25
+MAX_OPERATION_TIMEOUT_SECONDS = 30
+MAX_COMMENT_PAGES = 3
 _COMMAND_DEADLINE: float | None = None
 
 
@@ -53,6 +57,22 @@ class HandoffError(RuntimeError):
 
 class AuthorRejected(HandoffError):
     pass
+
+
+@contextmanager
+def operation_deadline(seconds: int):
+    global _COMMAND_DEADLINE
+    if not 1 <= seconds <= MAX_OPERATION_TIMEOUT_SECONDS:
+        raise HandoffError(
+            f"--timeout-seconds must be between 1 and {MAX_OPERATION_TIMEOUT_SECONDS}"
+        )
+    previous = _COMMAND_DEADLINE
+    candidate = time.monotonic() + seconds
+    _COMMAND_DEADLINE = min(previous, candidate) if previous is not None else candidate
+    try:
+        yield
+    finally:
+        _COMMAND_DEADLINE = previous
 
 
 def sanitized_error(value: str) -> str:
@@ -129,7 +149,7 @@ def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
     return output
 
 
-def authorization(path: Path) -> dict[str, set[str]]:
+def authorization(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -137,22 +157,32 @@ def authorization(path: Path) -> dict[str, set[str]]:
     peer = value.get("githubPeer") if isinstance(value, dict) else None
     if not isinstance(peer, dict):
         raise HandoffError("agent configuration has no githubPeer authorization")
+    local_peer = peer.get("localPeer")
+    if local_peer not in RECIPIENTS:
+        raise HandoffError("githubPeer.localPeer must name one known local peer")
     repositories = string_set(peer.get("repositories"), "githubPeer.repositories", SLUG_RE)
     authors = string_set(
         peer.get("trustedAuthors"),
         "githubPeer.trustedAuthors",
         re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})"),
     )
-    return {"repositories": repositories, "authors": authors}
+    return {"repositories": repositories, "authors": authors, "local_peer": local_peer}
 
 
-def context(args: argparse.Namespace) -> tuple[Path, str, dict[str, set[str]]]:
+def context(args: argparse.Namespace) -> tuple[Path, str, dict[str, Any]]:
     root = repository_root(args.repo)
     slug = repository_slug(root)
     auth = authorization(config_path(args.config))
     if slug not in auth["repositories"]:
         raise HandoffError(f"repository is not enrolled for GitHub peer work: {slug}")
     return root, slug, auth
+
+
+def require_local_peer(auth: dict[str, Any], claimed: str, action: str) -> str:
+    local_peer = auth["local_peer"]
+    if claimed != local_peer:
+        raise HandoffError(f"{action} is not authorized for this host's local peer")
+    return local_peer
 
 
 def gh_json(
@@ -179,10 +209,16 @@ def gh_json(
         raise HandoffError("GitHub returned invalid JSON") from exc
 
 
-def paginated(root: Path, endpoint: str) -> list[dict[str, Any]]:
+def paginated(
+    root: Path,
+    endpoint: str,
+    *,
+    max_pages: int = MAX_COMMENT_PAGES,
+    budget_label: str = "provider result",
+) -> list[dict[str, Any]]:
     values: list[dict[str, Any]] = []
     separator = "&" if "?" in endpoint else "?"
-    for page in range(1, 101):
+    for page in range(1, max_pages + 1):
         response = gh_json(root, f"{endpoint}{separator}per_page=100&page={page}")
         if not isinstance(response, list):
             raise HandoffError("GitHub returned an invalid paginated response")
@@ -191,7 +227,9 @@ def paginated(root: Path, endpoint: str) -> list[dict[str, Any]]:
         values.extend(response)
         if len(response) < 100:
             return values
-    raise HandoffError("GitHub pagination exceeded the safety limit")
+    raise HandoffError(
+        f"{budget_label} exceeded the {max_pages * 100}-item safety budget"
+    )
 
 
 def validate_text(value: object, label: str, *, required: bool = True) -> str:
@@ -253,7 +291,7 @@ def author_permission(root: Path, slug: str, author: str) -> str:
 def validate_author(
     root: Path,
     slug: str,
-    auth: dict[str, set[str]],
+    auth: dict[str, Any],
     author: object,
     cache: dict[str, str] | None = None,
 ) -> str:
@@ -268,7 +306,7 @@ def validate_author(
     return normalized
 
 
-def authenticated_author(root: Path, slug: str, auth: dict[str, set[str]]) -> str:
+def authenticated_author(root: Path, slug: str, auth: dict[str, Any]) -> str:
     value = gh_json(root, "user")
     login = value.get("login") if isinstance(value, dict) else None
     return validate_author(root, slug, auth, login)
@@ -436,19 +474,20 @@ def decode_comment(body: object) -> dict[str, Any] | None:
     return validate_packet(packet)
 
 
-def issue_comments(root: Path, slug: str, pull_request: int | None = None) -> list[dict[str, Any]]:
-    endpoint = (
-        f"repos/{slug}/issues/{pull_request}/comments"
-        if pull_request is not None
-        else f"repos/{slug}/issues/comments?sort=created&direction=asc"
+def issue_comments(root: Path, slug: str, pull_request: int) -> list[dict[str, Any]]:
+    if pull_request < 1:
+        raise HandoffError("pull request number must be positive")
+    return paginated(
+        root,
+        f"repos/{slug}/issues/{pull_request}/comments",
+        budget_label="pull request comment scan",
     )
-    return paginated(root, endpoint)
 
 
 def trusted_events(
     root: Path,
     slug: str,
-    auth: dict[str, set[str]],
+    auth: dict[str, Any],
     comments: list[dict[str, Any]],
 ) -> tuple[list[tuple[int, dict[str, Any]]], int]:
     output: list[tuple[int, dict[str, Any]]] = []
@@ -524,8 +563,8 @@ def reconcile(events: list[tuple[int, dict[str, Any]]]) -> tuple[dict[str, dict[
 def load_states(
     root: Path,
     slug: str,
-    auth: dict[str, set[str]],
-    pull_request: int | None = None,
+    auth: dict[str, Any],
+    pull_request: int,
 ) -> tuple[dict[str, dict[str, Any]], int, int]:
     events, ignored = trusted_events(
         root, slug, auth, issue_comments(root, slug, pull_request)
@@ -537,11 +576,11 @@ def load_states(
 def require_request(
     root: Path,
     slug: str,
-    auth: dict[str, set[str]],
+    auth: dict[str, Any],
     pull_request: int,
     request_value: str,
     head: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
     if not REQUEST_ID_RE.fullmatch(request_value):
         raise HandoffError("request ID is invalid")
     states, _ignored, conflicts = load_states(root, slug, auth, pull_request)
@@ -554,7 +593,7 @@ def require_request(
     if request["pull_request"] != pull_request or request["head_sha"] != head:
         raise HandoffError("handoff request does not match the requested PR head")
     validate_pr(root, slug, pull_request, head)
-    return request, current
+    return request, current, states
 
 
 def verify_public_lease(root: Path, lease_id: str | None, head: str) -> None:
@@ -578,10 +617,37 @@ def queue_label(recipient: str) -> str:
     return f"agent:{recipient.removesuffix('-cal')}-pending"
 
 
-def queue_instruction(packet: dict[str, Any]) -> dict[str, str]:
-    if packet["event"] == "request":
-        return {"queue_action": "add", "queue_label": queue_label(packet["to"])}
-    return {"queue_action": "remove", "queue_label": queue_label(packet["actor"])}
+def pending_request_ids(
+    states: dict[str, dict[str, Any]],
+    recipient: str,
+    head: str,
+    *,
+    excluding: str | None = None,
+) -> list[str]:
+    return sorted(
+        request_value
+        for request_value, current in states.items()
+        if request_value != excluding
+        and current["state"] == "requested"
+        and current["request"]["to"] == recipient
+        and current["request"]["head_sha"] == head
+    )
+
+
+def transition_queue_instruction(
+    request: dict[str, Any], states: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    pending = pending_request_ids(
+        states,
+        request["to"],
+        request["head_sha"],
+        excluding=request["request_id"],
+    )
+    return {
+        "queue_action": "keep" if pending else "remove",
+        "queue_label": queue_label(request["to"]),
+        "pending_sibling_request_ids": pending,
+    }
 
 
 def publish_comment(
@@ -592,17 +658,23 @@ def publish_comment(
     *,
     apply: bool,
     lease_id: str | None,
+    queue: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    queue = queue or {
+        "queue_action": "add",
+        "queue_label": queue_label(packet["to"]),
+    }
     output = {
         "event": packet["event"],
         "head_sha": packet["head_sha"],
         "request_id": packet["request_id"],
         "would_write": not apply,
-        **queue_instruction(packet),
+        **queue,
     }
     if not apply:
         return output
     verify_public_lease(root, lease_id, packet["head_sha"])
+    validate_pr(root, slug, pull_request, packet["head_sha"])
     value = gh_json(
         root,
         f"repos/{slug}/issues/{pull_request}/comments",
@@ -621,6 +693,7 @@ def request_command(args: argparse.Namespace) -> int:
     head = validate_sha(args.head)
     validate_pr(root, slug, args.pr, head)
     authenticated_author(root, slug, auth)
+    require_local_peer(auth, args.sender, "request sender")
     packet = request_packet(
         slug=slug,
         pull_request=args.pr,
@@ -638,14 +711,18 @@ def request_command(args: argparse.Namespace) -> int:
     if existing:
         if existing["request"] != packet:
             raise HandoffError("request ID collides with a different handoff")
+        queue = (
+            {"queue_action": "add", "queue_label": queue_label(packet["to"])}
+            if existing["state"] == "requested"
+            else transition_queue_instruction(packet, states)
+        )
         print(
             json.dumps(
                 {
                     "event": "request",
                     "head_sha": head,
                     "published": False,
-                    "queue_action": "add" if existing["state"] == "requested" else "remove",
-                    "queue_label": queue_label(packet["to"]),
+                    **queue,
                     "reason": "already-current",
                     "request_id": packet["request_id"],
                     "state": existing["state"],
@@ -672,13 +749,14 @@ def request_command(args: argparse.Namespace) -> int:
 
 def list_command(args: argparse.Namespace) -> int:
     root, slug, auth = context(args)
+    require_local_peer(auth, args.recipient, "queue listing")
     states, ignored, conflicts = load_states(root, slug, auth, args.pr)
     items: list[dict[str, Any]] = []
     for request_value, current in sorted(states.items()):
         request = current["request"]
         if request["to"] != args.recipient:
             continue
-        if args.pr is not None and request["pull_request"] != args.pr:
+        if request["pull_request"] != args.pr:
             continue
         if current["state"] == "completed" and not args.include_complete:
             continue
@@ -718,11 +796,12 @@ def list_command(args: argparse.Namespace) -> int:
 def show_command(args: argparse.Namespace) -> int:
     root, slug, auth = context(args)
     head = validate_sha(args.head)
-    request, _current = require_request(
+    request, _current, _states = require_request(
         root, slug, auth, args.pr, args.request_id, head
     )
     authenticated_author(root, slug, auth)
-    if args.actor != request["to"]:
+    local_peer = require_local_peer(auth, args.actor, "handoff inspection")
+    if local_peer != request["to"]:
         raise HandoffError("only the addressed peer may inspect the handoff objective")
     print(json.dumps({"request": request}, sort_keys=True))
     return 0
@@ -731,7 +810,7 @@ def show_command(args: argparse.Namespace) -> int:
 def signal_command(args: argparse.Namespace) -> int:
     root, slug, auth = context(args)
     head = validate_sha(args.head)
-    request, current = require_request(root, slug, auth, args.pr, args.request_id, head)
+    request, current, states = require_request(root, slug, auth, args.pr, args.request_id, head)
     authenticated_author(root, slug, auth)
     if args.recipient != request["to"]:
         raise HandoffError("queue recipient does not match the handoff")
@@ -739,10 +818,31 @@ def signal_command(args: argparse.Namespace) -> int:
         raise HandoffError("only a requested handoff may enter the peer queue")
     if args.state == "absent" and current["state"] == "requested":
         raise HandoffError("acknowledge or complete the handoff before removing its queue signal")
+    if args.state == "present":
+        require_local_peer(auth, request["from"], "queue publication")
+    else:
+        require_local_peer(auth, request["to"], "queue removal")
     label = queue_label(args.recipient)
     values = paginated(root, f"repos/{slug}/issues/{args.pr}/labels")
     present = any(item.get("name") == label for item in values)
     desired = args.state == "present"
+    pending_siblings = pending_request_ids(states, args.recipient, head)
+    if not desired and pending_siblings:
+        print(
+            json.dumps(
+                {
+                    "effective_state": "present",
+                    "head_sha": head,
+                    "label": label,
+                    "pending_request_ids": pending_siblings,
+                    "published": False,
+                    "reason": "pending-recipient-requests",
+                    "request_id": args.request_id,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
     if present == desired:
         print(
             json.dumps(
@@ -773,6 +873,7 @@ def signal_command(args: argparse.Namespace) -> int:
         )
         return 0
     verify_public_lease(root, args.lease_id, head)
+    validate_pr(root, slug, args.pr, head)
     if desired:
         gh_json(
             root,
@@ -813,9 +914,9 @@ def search_slug(item: dict[str, Any]) -> str | None:
 
 
 def discover_command(args: argparse.Namespace) -> int:
-    global _COMMAND_DEADLINE
     root = repository_root(args.repo)
     auth = authorization(config_path(args.config))
+    require_local_peer(auth, args.recipient, "queue discovery")
     organization = args.organization.lower()
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,38})", organization):
         raise HandoffError("organization is invalid")
@@ -826,89 +927,84 @@ def discover_command(args: argparse.Namespace) -> int:
         raise HandoffError("organization has no enrolled peer repositories")
     if not 1 <= args.limit <= 25:
         raise HandoffError("--limit must be between 1 and 25")
-    if not 1 <= args.timeout_seconds <= 30:
-        raise HandoffError("--timeout-seconds must be between 1 and 30")
     label = queue_label(args.recipient)
     query = f'org:{organization} is:pr is:open label:"{label}"'
-    previous_deadline = _COMMAND_DEADLINE
-    _COMMAND_DEADLINE = time.monotonic() + args.timeout_seconds
-    try:
-        search = gh_json(
-            root,
-            f"search/issues?q={quote(query, safe='')}&per_page={args.limit}",
-        )
-        items = search.get("items") if isinstance(search, dict) else None
-        total = search.get("total_count") if isinstance(search, dict) else None
-        if not isinstance(items, list) or type(total) is not int:
-            raise HandoffError("GitHub returned invalid issue search data")
-        results: list[dict[str, Any]] = []
-        ignored = 0
-        rejected = 0
-        for item in items[: args.limit]:
-            if not isinstance(item, dict) or "pull_request" not in item:
-                ignored += 1
+    search = gh_json(
+        root,
+        f"search/issues?q={quote(query, safe='')}&per_page={args.limit}",
+    )
+    items = search.get("items") if isinstance(search, dict) else None
+    total = search.get("total_count") if isinstance(search, dict) else None
+    if not isinstance(items, list) or type(total) is not int:
+        raise HandoffError("GitHub returned invalid issue search data")
+    results: list[dict[str, Any]] = []
+    ignored = 0
+    rejected = 0
+    for item in items[: args.limit]:
+        if not isinstance(item, dict) or "pull_request" not in item:
+            ignored += 1
+            continue
+        slug = search_slug(item)
+        number = item.get("number")
+        if slug not in enrolled_for_org or type(number) is not int or number < 1:
+            ignored += 1
+            continue
+        pr = gh_json(root, f"repos/{slug}/pulls/{number}")
+        try:
+            head = validate_pr_data(pr, slug, number)
+        except HandoffError:
+            rejected += 1
+            continue
+        states, invalid_or_untrusted, conflicts = load_states(root, slug, auth, number)
+        ignored += invalid_or_untrusted
+        rejected += conflicts
+        if conflicts:
+            continue
+        for request_value, current in sorted(states.items()):
+            request = current["request"]
+            if (
+                request["to"] != args.recipient
+                or request["pull_request"] != number
+                or request["head_sha"] != head
+                or current["state"] != "requested"
+            ):
                 continue
-            slug = search_slug(item)
-            number = item.get("number")
-            if slug not in enrolled_for_org or type(number) is not int or number < 1:
-                ignored += 1
-                continue
-            pr = gh_json(root, f"repos/{slug}/pulls/{number}")
-            try:
-                head = validate_pr_data(pr, slug, number)
-            except HandoffError:
-                rejected += 1
-                continue
-            states, invalid_or_untrusted, conflicts = load_states(root, slug, auth, number)
-            ignored += invalid_or_untrusted
-            rejected += conflicts
-            if conflicts:
-                continue
-            for request_value, current in sorted(states.items()):
-                request = current["request"]
-                if (
-                    request["to"] != args.recipient
-                    or request["pull_request"] != number
-                    or request["head_sha"] != head
-                    or current["state"] != "requested"
-                ):
-                    continue
-                results.append(
-                    {
-                        "checks": request["checks"],
-                        "from": request["from"],
-                        "head_sha": head,
-                        "pull_request": number,
-                        "repository": slug,
-                        "request_id": request_value,
-                        "role": request["role"],
-                        "to": request["to"],
-                    }
-                )
-        print(
-            json.dumps(
+            results.append(
                 {
-                    "handoffs": results,
-                    "ignored_invalid_untrusted_or_unenrolled": ignored,
-                    "label": label,
-                    "conflicting_trusted_events": rejected,
-                    "truncated": total > len(items),
-                },
-                sort_keys=True,
+                    "checks": request["checks"],
+                    "from": request["from"],
+                    "head_sha": head,
+                    "pull_request": number,
+                    "repository": slug,
+                    "request_id": request_value,
+                    "role": request["role"],
+                    "to": request["to"],
+                }
             )
+    print(
+        json.dumps(
+            {
+                "handoffs": results,
+                "ignored_invalid_untrusted_or_unenrolled": ignored,
+                "label": label,
+                "conflicting_trusted_events": rejected,
+                "truncated": total > len(items),
+            },
+            sort_keys=True,
         )
-        return 0
-    finally:
-        _COMMAND_DEADLINE = previous_deadline
+    )
+    return 0
 
 
 def ack_command(args: argparse.Namespace) -> int:
     root, slug, auth = context(args)
     head = validate_sha(args.head)
-    request, current = require_request(root, slug, auth, args.pr, args.request_id, head)
+    request, current, states = require_request(root, slug, auth, args.pr, args.request_id, head)
     authenticated_author(root, slug, auth)
-    if args.actor != request["to"]:
+    local_peer = require_local_peer(auth, args.actor, "handoff acknowledgement")
+    if local_peer != request["to"]:
         raise HandoffError("actor is not the addressed peer")
+    queue = transition_queue_instruction(request, states)
     if current["state"] in {"acknowledged", "completed"}:
         print(
             json.dumps(
@@ -916,8 +1012,7 @@ def ack_command(args: argparse.Namespace) -> int:
                     "event": "ack",
                     "head_sha": head,
                     "published": False,
-                    "queue_action": "remove",
-                    "queue_label": queue_label(request["to"]),
+                    **queue,
                     "reason": "already-current",
                     "request_id": args.request_id,
                     "state": current["state"],
@@ -936,6 +1031,7 @@ def ack_command(args: argparse.Namespace) -> int:
                 packet,
                 apply=args.apply,
                 lease_id=args.lease_id,
+                queue=queue,
             ),
             sort_keys=True,
         )
@@ -946,10 +1042,12 @@ def ack_command(args: argparse.Namespace) -> int:
 def complete_command(args: argparse.Namespace) -> int:
     root, slug, auth = context(args)
     head = validate_sha(args.head)
-    request, current = require_request(root, slug, auth, args.pr, args.request_id, head)
+    request, current, states = require_request(root, slug, auth, args.pr, args.request_id, head)
     authenticated_author(root, slug, auth)
-    if args.actor != request["to"]:
+    local_peer = require_local_peer(auth, args.actor, "handoff completion")
+    if local_peer != request["to"]:
         raise HandoffError("actor is not the addressed peer")
+    queue = transition_queue_instruction(request, states)
     summary = validate_text(args.summary, "summary")
     if current["state"] == "completed":
         if current["outcome"] != args.outcome or current.get("summary") != summary:
@@ -960,8 +1058,7 @@ def complete_command(args: argparse.Namespace) -> int:
                     "event": "complete",
                     "head_sha": head,
                     "published": False,
-                    "queue_action": "remove",
-                    "queue_label": queue_label(request["to"]),
+                    **queue,
                     "reason": "already-current",
                     "request_id": args.request_id,
                     "state": "completed",
@@ -986,6 +1083,7 @@ def complete_command(args: argparse.Namespace) -> int:
                 packet,
                 apply=args.apply,
                 lease_id=args.lease_id,
+                queue=queue,
             ),
             sort_keys=True,
         )
@@ -1017,8 +1115,11 @@ def existing_status(root: Path, slug: str, head: str, status_context: str) -> di
 def attest_command(args: argparse.Namespace) -> int:
     root, slug, auth = context(args)
     head = validate_sha(args.head)
-    request, _ = require_request(root, slug, auth, args.pr, args.request_id, head)
+    request, _current, _states = require_request(
+        root, slug, auth, args.pr, args.request_id, head
+    )
     authenticated_author(root, slug, auth)
+    require_local_peer(auth, "mac-cal", "macOS attestation")
     if request["to"] != "mac-cal" or request["role"] != "macos-validation":
         raise HandoffError("platform attestation requires a Mac-addressed validation handoff")
     if args.suite not in request["checks"]:
@@ -1059,6 +1160,7 @@ def attest_command(args: argparse.Namespace) -> int:
         )
         return 0
     verify_public_lease(root, args.lease_id, head)
+    validate_pr(root, slug, args.pr, head)
     gh_json(
         root,
         f"repos/{slug}/statuses/{head}",
@@ -1087,6 +1189,11 @@ def attest_command(args: argparse.Namespace) -> int:
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo")
     parser.add_argument("--config")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_OPERATION_TIMEOUT_SECONDS,
+    )
 
 
 def add_mutation(parser: argparse.ArgumentParser) -> None:
@@ -1113,7 +1220,7 @@ def parser() -> argparse.ArgumentParser:
     list_parser = commands.add_parser("list")
     add_common(list_parser)
     list_parser.add_argument("--to", required=True, dest="recipient", choices=sorted(RECIPIENTS))
-    list_parser.add_argument("--pr", type=int)
+    list_parser.add_argument("--pr", type=int, required=True)
     list_parser.add_argument("--include-complete", action="store_true")
     list_parser.set_defaults(handler=list_command)
 
@@ -1130,7 +1237,6 @@ def parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--organization", required=True)
     discover_parser.add_argument("--to", required=True, dest="recipient", choices=sorted(RECIPIENTS))
     discover_parser.add_argument("--limit", type=int, default=20)
-    discover_parser.add_argument("--timeout-seconds", type=int, default=25)
     discover_parser.set_defaults(handler=discover_command)
 
     ack_parser = commands.add_parser("ack")
@@ -1179,7 +1285,8 @@ def main() -> int:
     args = parser().parse_args()
     if hasattr(args, "apply") and not args.apply and getattr(args, "lease_id", None):
         raise HandoffError("--lease-id is valid only with --apply")
-    return args.handler(args)
+    with operation_deadline(args.timeout_seconds):
+        return args.handler(args)
 
 
 if __name__ == "__main__":

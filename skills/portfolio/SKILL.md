@@ -95,7 +95,10 @@ dry-run by default and require an exact-head `public:mutation` lease with
 
 Use the bounded `discover` operation with the recipient's constant queue label
 for portfolio wake-ups. Lifecycle comments and queue-label signals are separate
-idempotent writes, each admitted under its own public lease.
+idempotent writes, each admitted under its own public lease. Local
+`githubPeer.localPeer` configuration binds a host to `mac-cal` or `vm-cal` even
+when both share one trusted GitHub login. PR comment scans and whole operations
+are capped, and every write rechecks the live PR head after lease admission.
 
 Read `references/github-peer-handoff.md` before configuring a peer watcher or
 publishing a handoff. Keep host polling and launch behavior in the owning host

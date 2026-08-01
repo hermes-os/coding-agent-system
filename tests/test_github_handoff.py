@@ -116,18 +116,25 @@ class GitHubHandoffTests(unittest.TestCase):
         git(self.repo, "commit", "-m", "initial")
         git(self.repo, "remote", "add", "origin", "https://github.com/example/app.git")
         self.head = git(self.repo, "rev-parse", "HEAD")
-        self.config = base / "config.json"
-        self.config.write_text(
-            json.dumps(
-                {
-                    "githubPeer": {
-                        "repositories": ["example/app"],
-                        "trustedAuthors": ["trusted-author"],
+        self.vm_config = base / "vm-config.json"
+        self.mac_config = base / "mac-config.json"
+        for path, local_peer in (
+            (self.vm_config, "vm-cal"),
+            (self.mac_config, "mac-cal"),
+        ):
+            path.write_text(
+                json.dumps(
+                    {
+                        "githubPeer": {
+                            "localPeer": local_peer,
+                            "repositories": ["example/app"],
+                            "trustedAuthors": ["trusted-author"],
+                        }
                     }
-                }
-            ),
-            encoding="utf-8",
-        )
+                ),
+                encoding="utf-8",
+            )
+        self.config = self.vm_config
         self.module = load_module()
         self.provider = Provider(self.head)
 
@@ -157,13 +164,13 @@ class GitHubHandoffTests(unittest.TestCase):
             result = function(args)
         return result, json.loads(output.getvalue())
 
-    def publish_request(self):
+    def publish_request(self, **values):
         with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
             self.module, "verify_public_lease"
         ):
             _, result = self.capture(
                 self.module.request_command,
-                self.args(apply=True, lease_id="a" * 32),
+                self.args(apply=True, lease_id="a" * 32, **values),
             )
         return result["request_id"]
 
@@ -243,7 +250,7 @@ class GitHubHandoffTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.config),
+            config=str(self.mac_config),
             recipient="mac-cal",
             pr=7,
             include_complete=False,
@@ -293,7 +300,7 @@ class GitHubHandoffTests(unittest.TestCase):
         )
         args = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.config),
+            config=str(self.mac_config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -307,7 +314,7 @@ class GitHubHandoffTests(unittest.TestCase):
         self.assertNotIn("body", packet)
 
         with mock.patch.object(self.module, "gh_json", self.provider):
-            with self.assertRaisesRegex(self.module.HandoffError, "addressed peer"):
+            with self.assertRaisesRegex(self.module.HandoffError, "local peer"):
                 self.module.show_command(argparse.Namespace(**{**vars(args), "actor": "vm-cal"}))
         self.provider.head = "f" * 40
         with mock.patch.object(self.module, "gh_json", self.provider):
@@ -318,7 +325,7 @@ class GitHubHandoffTests(unittest.TestCase):
         request_value = self.publish_request()
         common = {
             "repo": str(self.repo),
-            "config": str(self.config),
+            "config": str(self.mac_config),
             "pr": 7,
             "head": self.head,
             "request_id": request_value,
@@ -374,7 +381,7 @@ class GitHubHandoffTests(unittest.TestCase):
 
         discover = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.config),
+            config=str(self.mac_config),
             organization="example",
             recipient="mac-cal",
             limit=20,
@@ -383,6 +390,16 @@ class GitHubHandoffTests(unittest.TestCase):
         writes_before = len(self.provider.writes)
         with mock.patch.object(self.module, "gh_json", self.provider):
             _, found = self.capture(self.module.discover_command, discover)
+        self.assertEqual(
+            set(found),
+            {
+                "handoffs",
+                "ignored_invalid_untrusted_or_unenrolled",
+                "label",
+                "conflicting_trusted_events",
+                "truncated",
+            },
+        )
         self.assertEqual(len(found["handoffs"]), 1)
         self.assertEqual(found["handoffs"][0]["request_id"], request_value)
         self.assertNotIn("objective", found["handoffs"][0])
@@ -390,7 +407,7 @@ class GitHubHandoffTests(unittest.TestCase):
 
         ack = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.config),
+            config=str(self.mac_config),
             pr=7,
             head=self.head,
             request_id=request_value,
@@ -402,13 +419,208 @@ class GitHubHandoffTests(unittest.TestCase):
             self.module, "verify_public_lease"
         ):
             self.capture(self.module.ack_command, ack)
-        absent = argparse.Namespace(**{**vars(present), "state": "absent", "lease_id": "f" * 32})
+        absent = argparse.Namespace(
+            **{
+                **vars(present),
+                "config": str(self.mac_config),
+                "state": "absent",
+                "lease_id": "f" * 32,
+            }
+        )
         with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
             self.module, "verify_public_lease"
         ):
             _, cleared = self.capture(self.module.signal_command, absent)
         self.assertTrue(cleared["published"])
         self.assertNotIn("agent:mac-pending", self.provider.labels)
+
+    def test_queue_removal_waits_for_every_current_head_recipient_request(self):
+        first = self.publish_request(objective="Run the Mac build.", check=["macos-build"])
+        second = self.publish_request(objective="Run the Mac tests.", check=["macos-tests"])
+        present = argparse.Namespace(
+            repo=str(self.repo),
+            config=str(self.vm_config),
+            pr=7,
+            head=self.head,
+            request_id=first,
+            recipient="mac-cal",
+            state="present",
+            apply=True,
+            lease_id="a" * 32,
+        )
+        with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
+            self.module, "verify_public_lease"
+        ):
+            self.capture(self.module.signal_command, present)
+
+        def acknowledge(request_value):
+            args = argparse.Namespace(
+                repo=str(self.repo),
+                config=str(self.mac_config),
+                pr=7,
+                head=self.head,
+                request_id=request_value,
+                actor="mac-cal",
+                apply=True,
+                lease_id="b" * 32,
+            )
+            with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
+                self.module, "verify_public_lease"
+            ):
+                return self.capture(self.module.ack_command, args)[1]
+
+        first_ack = acknowledge(first)
+        self.assertEqual(first_ack["queue_action"], "keep")
+        self.assertEqual(first_ack["pending_sibling_request_ids"], [second])
+        absent = argparse.Namespace(
+            **{
+                **vars(present),
+                "config": str(self.mac_config),
+                "state": "absent",
+            }
+        )
+        writes_before = len(self.provider.writes)
+        with mock.patch.object(self.module, "gh_json", self.provider):
+            _, held = self.capture(self.module.signal_command, absent)
+        self.assertEqual(held["reason"], "pending-recipient-requests")
+        self.assertIn(second, held["pending_request_ids"])
+        self.assertEqual(len(self.provider.writes), writes_before)
+        self.assertIn("agent:mac-pending", self.provider.labels)
+
+        second_ack = acknowledge(second)
+        self.assertEqual(second_ack["queue_action"], "remove")
+        self.assertEqual(second_ack["pending_sibling_request_ids"], [])
+        clear_second = argparse.Namespace(**{**vars(absent), "request_id": second})
+        with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
+            self.module, "verify_public_lease"
+        ):
+            _, cleared = self.capture(self.module.signal_command, clear_second)
+        self.assertTrue(cleared["published"])
+        self.assertNotIn("agent:mac-pending", self.provider.labels)
+
+    def test_local_peer_binding_prevents_cross_peer_lifecycle_actions(self):
+        request_value = self.publish_request()
+        with mock.patch.object(self.module, "gh_json", self.provider):
+            with self.assertRaisesRegex(self.module.HandoffError, "local peer"):
+                self.module.request_command(self.args(sender="mac-cal", recipient="vm-cal"))
+
+        recipient = {
+            "repo": str(self.repo),
+            "config": str(self.vm_config),
+            "pr": 7,
+            "head": self.head,
+            "request_id": request_value,
+            "actor": "mac-cal",
+        }
+        with mock.patch.object(self.module, "gh_json", self.provider):
+            with self.assertRaisesRegex(self.module.HandoffError, "local peer"):
+                self.module.show_command(argparse.Namespace(**recipient))
+            with self.assertRaisesRegex(self.module.HandoffError, "local peer"):
+                self.module.ack_command(
+                    argparse.Namespace(**recipient, apply=False, lease_id=None)
+                )
+            with self.assertRaisesRegex(self.module.HandoffError, "local peer"):
+                self.module.complete_command(
+                    argparse.Namespace(
+                        **recipient,
+                        apply=False,
+                        lease_id=None,
+                        outcome="success",
+                        summary="Spoofed completion.",
+                    )
+                )
+        attest = argparse.Namespace(
+            repo=str(self.repo),
+            config=str(self.vm_config),
+            pr=7,
+            head=self.head,
+            request_id=request_value,
+            suite="macos-tests",
+            state="success",
+            apply=False,
+            lease_id=None,
+        )
+        with mock.patch.object(self.module, "gh_json", self.provider):
+            with self.assertRaisesRegex(self.module.HandoffError, "local peer"):
+                self.module.attest_command(attest)
+
+    def test_each_write_revalidates_pr_head_after_lease_admission(self):
+        def advance_head(*_args, **_kwargs):
+            self.provider.head = "f" * 40
+
+        with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
+            self.module, "verify_public_lease", side_effect=advance_head
+        ):
+            with self.assertRaisesRegex(self.module.HandoffError, "drifted"):
+                self.module.request_command(
+                    self.args(apply=True, lease_id="a" * 32)
+                )
+        self.assertEqual(self.provider.writes, [])
+
+        self.provider = Provider(self.head)
+        request_value = self.publish_request()
+        writes_before = len(self.provider.writes)
+        signal = argparse.Namespace(
+            repo=str(self.repo),
+            config=str(self.vm_config),
+            pr=7,
+            head=self.head,
+            request_id=request_value,
+            recipient="mac-cal",
+            state="present",
+            apply=True,
+            lease_id="b" * 32,
+        )
+        with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
+            self.module, "verify_public_lease", side_effect=advance_head
+        ):
+            with self.assertRaisesRegex(self.module.HandoffError, "drifted"):
+                self.module.signal_command(signal)
+        self.assertEqual(len(self.provider.writes), writes_before)
+
+        self.provider = Provider(self.head)
+        request_value = self.publish_request()
+        writes_before = len(self.provider.writes)
+        attest = argparse.Namespace(
+            repo=str(self.repo),
+            config=str(self.mac_config),
+            pr=7,
+            head=self.head,
+            request_id=request_value,
+            suite="macos-tests",
+            state="success",
+            apply=True,
+            lease_id="c" * 32,
+        )
+        with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
+            self.module, "verify_public_lease", side_effect=advance_head
+        ), mock.patch.object(self.module.platform, "system", return_value="Darwin"), mock.patch.object(
+            self.module.platform, "machine", return_value="arm64"
+        ):
+            with self.assertRaisesRegex(self.module.HandoffError, "drifted"):
+                self.module.attest_command(attest)
+        self.assertEqual(len(self.provider.writes), writes_before)
+
+    def test_comment_scan_and_whole_operation_deadlines_are_bounded(self):
+        calls = 0
+
+        def full_page(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return [{"id": number, "body": "ordinary"} for number in range(100)]
+
+        with mock.patch.object(self.module, "gh_json", side_effect=full_page):
+            with self.assertRaisesRegex(self.module.HandoffError, "300-item safety budget"):
+                self.module.issue_comments(self.repo, "example/app", 7)
+        self.assertEqual(calls, 3)
+
+        with mock.patch.object(self.module.time, "monotonic", side_effect=[100.0, 126.0]), mock.patch.object(
+            self.module.subprocess, "run"
+        ) as invoked:
+            with self.module.operation_deadline(25):
+                with self.assertRaisesRegex(self.module.HandoffError, "overall deadline"):
+                    self.module.run(["gh", "api", "user"], cwd=self.repo)
+        invoked.assert_not_called()
 
     def test_provider_subprocess_timeout_fails_closed(self):
         with mock.patch.object(
@@ -442,7 +654,7 @@ class GitHubHandoffTests(unittest.TestCase):
         request_value = self.publish_request()
         args = argparse.Namespace(
             repo=str(self.repo),
-            config=str(self.config),
+            config=str(self.mac_config),
             pr=7,
             head=self.head,
             request_id=request_value,
