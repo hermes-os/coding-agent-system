@@ -26,7 +26,9 @@ from inspecting or completing work addressed to the other. The public CLI has
 no config-path option and ignores `HOME` and `AGENTS_HOME` for this enrollment.
 It uses the current OS account's passwd home, so the existing Mac path is
 `/Users/Josh/.agents/config.json`. The config and `.agents` directory must be
-real, root/current-account-owned, and not group/world writable.
+real, root/current-account-owned, and not group/world writable. The helper
+reads at most 256 KiB from one no-follow file descriptor and rejects any inode,
+metadata, or final-path change during that read.
 
 When an integration installer deliberately keeps the canonical `.agents`
 directory outside that account's passwd home, it may create
