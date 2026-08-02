@@ -248,7 +248,9 @@ def read_authorization_json(path: Path) -> object:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
         descriptor_state = os.fstat(descriptor)
         if state_signature(path_state) != state_signature(descriptor_state):

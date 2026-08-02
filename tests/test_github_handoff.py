@@ -764,6 +764,25 @@ class GitHubHandoffTests(unittest.TestCase):
                 self.module.authorization(self.mac_config)
         self.assertTrue(replaced)
 
+    def test_authorization_fifo_replacement_cannot_block_before_validation(self):
+        replacement = self.mac_config.parent / "replacement-config"
+        os.mkfifo(replacement)
+        real_open = self.module.os.open
+        replaced = False
+
+        def replace_with_fifo(path, flags, *args, **kwargs):
+            nonlocal replaced
+            if path == self.mac_config and not replaced:
+                os.replace(replacement, self.mac_config)
+                replaced = True
+                self.assertTrue(flags & self.module.os.O_NONBLOCK)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(self.module.os, "open", replace_with_fifo):
+            with self.assertRaisesRegex(self.module.HandoffError, "changed during inspection"):
+                self.module.authorization(self.mac_config)
+        self.assertTrue(replaced)
+
     def test_authorization_rejects_atomic_replacement_during_read(self):
         replacement = self.mac_config.parent / "replacement-config.json"
         replacement.write_text(self.vm_config.read_text(encoding="utf-8"), encoding="utf-8")
