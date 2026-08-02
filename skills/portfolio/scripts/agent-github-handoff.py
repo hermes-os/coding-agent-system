@@ -52,6 +52,7 @@ MAX_OPERATION_TIMEOUT_SECONDS = 30
 MAX_COMMENT_PAGES = 3
 MAX_DISCOVERY_CANDIDATES = 25
 DISCOVERY_OVERSCAN_MULTIPLIER = 5
+MAX_AGENT_CONFIG_BYTES = 256 * 1024
 PINNED_CONFIG_PATH_FILE = Path("/etc/coding-agent-system/agents-config-path")
 _COMMAND_DEADLINE: float | None = None
 
@@ -151,6 +152,19 @@ def check_root_controlled_directories(directory: Path, label: str) -> None:
             raise HandoffError(f"{label} ancestors must be root-controlled directories")
 
 
+def state_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def canonical_config_path() -> Path:
     pointer = PINNED_CONFIG_PATH_FILE
     try:
@@ -206,7 +220,7 @@ def authorization_path(args: argparse.Namespace) -> Path:
 
 def check_authorization_file(
     path: Path, *, allowed_owners: set[int] | None = None
-) -> None:
+) -> os.stat_result:
     try:
         parent = path.parent.lstat()
         value = path.lstat()
@@ -223,6 +237,49 @@ def check_authorization_file(
         raise HandoffError("agent configuration directory must not be group/world writable")
     if value.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise HandoffError("agent configuration must not be group/world writable")
+    if value.st_size > MAX_AGENT_CONFIG_BYTES:
+        raise HandoffError("agent configuration exceeds its size limit")
+    return value
+
+
+def read_authorization_json(path: Path) -> object:
+    path_state = check_authorization_file(path)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        descriptor_state = os.fstat(descriptor)
+        if state_signature(path_state) != state_signature(descriptor_state):
+            raise HandoffError("agent configuration changed during inspection")
+        content = bytearray()
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > MAX_AGENT_CONFIG_BYTES:
+                raise HandoffError("agent configuration exceeds its size limit")
+        final_descriptor_state = os.fstat(descriptor)
+        final_path_state = path.lstat()
+        if (
+            state_signature(descriptor_state)
+            != state_signature(final_descriptor_state)
+            or state_signature(final_descriptor_state)
+            != state_signature(final_path_state)
+        ):
+            raise HandoffError("agent configuration changed during inspection")
+        return json.loads(bytes(content))
+    except HandoffError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HandoffError(f"invalid agent configuration: {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
@@ -237,11 +294,7 @@ def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
 
 
 def authorization(path: Path) -> dict[str, Any]:
-    check_authorization_file(path)
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HandoffError(f"invalid agent configuration: {path}") from exc
+    value = read_authorization_json(path)
     peer = value.get("githubPeer") if isinstance(value, dict) else None
     if not isinstance(peer, dict):
         raise HandoffError("agent configuration has no githubPeer authorization")

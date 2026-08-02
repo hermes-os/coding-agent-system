@@ -65,7 +65,9 @@ enabling a host-specific watcher. Peer enrollment comes only from the canonical
 host config (or a root-pinned nonstandard install), never a CLI or environment
 override. A bounded organization discovery call overscans recent constant-label
 candidates and revalidates every returned packet without interpreting PR bodies
-as instructions.
+as instructions. Canonical peer enrollment is read through one bounded,
+no-follow descriptor and fails closed if the file or path changes during the
+read.
 
 To replace an older cataloged but unmanifested installation, pass its clean
 tracked source explicitly:
