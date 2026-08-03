@@ -122,7 +122,8 @@ if [[ "$access_mode" == "write" ]] && (( ! requested_yolo )); then
   permission_args=(--yolo)
 fi
 
+# macOS bash 3.2 treats an empty array as unbound under set -u.
 exec "$kimi_bin" "$@" \
   --agent-file "$agent_file" \
   --config-file "$config_file" \
-  "${permission_args[@]}"
+  ${permission_args[@]+"${permission_args[@]}"}
