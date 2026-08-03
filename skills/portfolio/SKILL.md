@@ -110,7 +110,6 @@ Other qualified private lanes stay active.
 
 Read `references/cursor-orchestration.md` only when configuring Cursor
 Automations. Re-run inventory after landings and report repository, exact head,
-<<<<<<< HEAD
 phase, proof, next action, and blocker compactly.
 
 ## GitHub Peer Handoff

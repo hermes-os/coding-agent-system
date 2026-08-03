@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import platform
 import shutil
-<<<<<<< HEAD
 import subprocess
 import sys
 
