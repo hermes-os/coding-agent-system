@@ -105,7 +105,7 @@ if [[ ! -r "$agent_file" ]]; then
   echo "agent-kimi: canonical agent specification not found: $agent_file" >&2
   exit 2
 fi
-config_file="$HOME/.kimi/config.toml"
+config_file="${KIMI_SHARE_DIR:-$HOME/.kimi}/config.toml"
 if [[ ! -r "$config_file" ]]; then
   echo "agent-kimi: managed Kimi configuration not found: $config_file" >&2
   exit 2
