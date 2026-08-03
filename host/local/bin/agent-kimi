@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Local Kimi invocation: inject the canonical engineering policy and enforce
+# the global write-bypass/read-only access contract.
+set -euo pipefail
+
+resolve_kimi() {
+  local candidate
+  for candidate in \
+    "${AGENT_KIMI_BIN:-}" \
+    "$HOME/.local/bin/kimi" \
+    /usr/local/bin/kimi \
+    /opt/homebrew/bin/kimi; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  command -v kimi 2>/dev/null || return 1
+}
+
+kimi_bin="$(resolve_kimi || true)"
+if [[ -z "$kimi_bin" ]]; then
+  echo "agent-kimi: Kimi executable not found" >&2
+  exit 127
+fi
+
+classify_arguments() {
+    local expect_value=0
+    local argument
+    for argument in "$@"; do
+    if (( expect_value )); then
+      expect_value=0
+      continue
+    fi
+    case "$argument" in
+      login|logout|info|export|mcp|plugin|vis|-h|--help|-V|--version)
+        printf 'passthrough\n'
+        return 0
+        ;;
+      acp|term|web)
+        echo "agent-kimi: '$argument' cannot load the canonical agent specification in Kimi CLI 1.47.0; use the managed print or root-option CLI" >&2
+        return 2
+        ;;
+      --agent|--agent-file|--config|--config-file|--skills-dir)
+        echo "agent-kimi: '$argument' would override managed policy, hooks, or skills" >&2
+        return 2
+        ;;
+      --agent=*|--agent-file=*|--config=*|--config-file=*|--skills-dir=*)
+        echo "agent-kimi: '${argument%%=*}' would override managed policy, hooks, or skills" >&2
+        return 2
+        ;;
+      --work-dir|-w|--add-dir|--session|--resume|-S|-r|--model|-m|--prompt|--command|-p|-c|--input-format|--output-format|--mcp-config-file|--mcp-config|--max-steps-per-turn|--max-retries-per-step|--max-ralph-iterations)
+        expect_value=1
+        ;;
+      --*=*|-w?*|-S?*|-r?*|-m?*|-p?*|-c?*)
+        ;;
+      --)
+        printf 'agent\n'
+        return 0
+        ;;
+      -*)
+        ;;
+      *)
+        echo "agent-kimi: '$argument' is not an allowed administrative command and cannot load the canonical agent specification" >&2
+        return 2
+        ;;
+    esac
+  done
+  printf 'agent\n'
+}
+
+mode="$(classify_arguments "$@")" || exit $?
+if [[ "$mode" == "passthrough" ]]; then
+  exec "$kimi_bin" "$@"
+fi
+
+access_mode="${AGENT_ACCESS_MODE:-write}"
+case "$access_mode" in
+  write|read)
+    ;;
+  *)
+    echo "agent-kimi: AGENT_ACCESS_MODE must be 'write' or 'read', got '$access_mode'" >&2
+    exit 64
+    ;;
+esac
+
+requested_yolo=0
+for argument in "$@"; do
+  if [[ "$argument" == "--" ]]; then
+    break
+  fi
+  case "$argument" in
+    --yolo|-y|--yes)
+      requested_yolo=1
+      ;;
+  esac
+done
+if [[ "$access_mode" == "read" ]] && (( requested_yolo )); then
+  echo "agent-kimi: read access cannot enable Kimi yolo mode" >&2
+  exit 64
+fi
+
+agent_file="$HOME/.agents/kimi/agent.yaml"
+if [[ ! -r "$agent_file" ]]; then
+  echo "agent-kimi: canonical agent specification not found: $agent_file" >&2
+  exit 2
+fi
+config_file="$HOME/.kimi/config.toml"
+if [[ ! -r "$config_file" ]]; then
+  echo "agent-kimi: managed Kimi configuration not found: $config_file" >&2
+  exit 2
+fi
+session_guard="$HOME/.agents/kimi/session-guard.py"
+if [[ ! -x "$session_guard" ]]; then
+  echo "agent-kimi: managed Kimi session guard not found: $session_guard" >&2
+  exit 2
+fi
+"$session_guard" --preflight -- "$@"
+
+declare -a permission_args=()
+if [[ "$access_mode" == "write" ]] && (( ! requested_yolo )); then
+  permission_args=(--yolo)
+fi
+
+exec "$kimi_bin" "$@" \
+  --agent-file "$agent_file" \
+  --config-file "$config_file" \
+  "${permission_args[@]}"
