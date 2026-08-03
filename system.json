@@ -13,15 +13,19 @@
   "skills": [
     {"name": "behavior-validator", "command": false},
     {"name": "capabilities", "command": true},
+    {"name": "create-cli", "command": true},
     {"name": "delegate", "command": true},
     {"name": "fix-issue", "command": true},
+    {"name": "github-project-triage", "command": true},
     {"name": "handoff", "command": true},
     {"name": "land", "command": true},
     {"name": "maintain-skills", "command": true},
     {"name": "pickup", "command": true},
     {"name": "portfolio", "command": true},
     {"name": "release", "command": true},
-    {"name": "review", "command": true}
+    {"name": "review", "command": true},
+    {"name": "ssh-doctor", "command": true},
+    {"name": "worker-first", "command": true}
   ],
   "binaries": [
     {"name": "agent-autoreview", "source": "skills/review/scripts/agent-autoreview.py"},

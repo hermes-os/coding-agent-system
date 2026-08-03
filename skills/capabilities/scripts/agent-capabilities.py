@@ -9,13 +9,22 @@ import os
 from pathlib import Path
 import platform
 import shutil
+<<<<<<< HEAD
 import subprocess
+import sys
+
+
+SYSTEM_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(SYSTEM_ROOT))
+
+from lib.host_contract import hook_budgets, kimi_agent_spec
+from lib.kimi_config import contains_expected_kimi_hooks
 
 
 TOOL_GROUPS = {
     "core": ("git", "gh", "rg", "jq", "curl", "ssh", "tmux", "make"),
     "runtimes": ("node", "npm", "npx", "pnpm", "yarn", "bun", "python3", "ruby", "go", "rustc", "swift"),
-    "agents": ("codex", "claude", "cursor-agent"),
+    "agents": ("codex", "claude", "kimi", "cursor-agent"),
     "agent_system": (
         "agent-autoreview",
         "agent-lease",
@@ -122,10 +131,42 @@ def skills(root: Path) -> list[dict[str, str]]:
     return found
 
 
+def kimi_ready(home: Path) -> bool:
+    policy = home / ".agents" / "AGENTS.md"
+    agent_spec = home / ".agents" / "kimi" / "agent.yaml"
+    session_guard = home / ".agents" / "kimi" / "session-guard.py"
+    launcher = home / ".local" / "bin" / "agent-kimi"
+    config = home / ".kimi" / "config.toml"
+    if not (
+        policy.is_file()
+        and agent_spec.is_file()
+        and session_guard.is_file()
+        and os.access(session_guard, os.X_OK)
+        and launcher.is_file()
+        and os.access(launcher, os.X_OK)
+        and config.is_file()
+    ):
+        return False
+    try:
+        catalog = json.loads((SYSTEM_ROOT / "system.json").read_text(encoding="utf-8"))
+        budgets = hook_budgets(catalog)
+        return (
+            agent_spec.read_text(encoding="utf-8")
+            == kimi_agent_spec(policy.read_text(encoding="utf-8"))
+            and contains_expected_kimi_hooks(
+                config.read_text(encoding="utf-8"),
+                budgets,
+            )
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def configured_hosts(home: Path) -> dict[str, bool]:
     return {
         "codex": (home / ".codex" / "AGENTS.md").is_file() and (home / ".codex" / "hooks.json").is_file(),
         "claude": (home / ".claude" / "CLAUDE.md").is_file() and (home / ".claude" / "settings.json").is_file(),
+        "kimi": kimi_ready(home),
         "cursor": (home / ".cursor" / "rules" / "global-engineering.mdc").is_file()
         and (home / ".cursor" / "hooks.json").is_file(),
     }

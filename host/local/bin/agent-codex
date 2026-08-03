@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local Codex invocation: keep the desktop host remotely controllable and
-# launch interactive work without approval or sandbox prompts.
+# enforce the global write-bypass/read-only access contract.
 set -euo pipefail
 
 resolve_codex() {
@@ -29,28 +29,157 @@ fi
 
 passthrough=0
 remote_requested=0
+noninteractive=0
+review_command=0
+arguments_ended=0
 for arg in "$@"; do
+  if (( arguments_ended )); then
+    continue
+  fi
   case "$arg" in
+    --)
+      arguments_ended=1
+      ;;
     -h|--help|-v|-V|--version)
       passthrough=1
       ;;
     --remote|--remote=*)
       remote_requested=1
       ;;
+    review)
+      noninteractive=1
+      review_command=1
+      ;;
   esac
 done
 
 case "${1:-}" in
-  exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|cloud|features|help|archive|delete|unarchive)
+  exec|e)
+    noninteractive=1
+    ;;
+  review)
+    noninteractive=1
+    review_command=1
+    ;;
+  login|logout|mcp|plugin|mcp-server|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|cloud|features|help|archive|delete|unarchive)
     passthrough=1
     ;;
 esac
 
+fail_access_mode() {
+  echo "agent-codex: $1" >&2
+  exit 64
+}
+
+is_managed_config_override() {
+  local config="$1"
+  local key=""
+  [[ "$config" == *=* ]] || return 1
+  key="${config%%=*}"
+  key="${key//[[:space:]]/}"
+  [[ "$key" == "sandbox_mode" || "$key" == "approval_policy" ]]
+}
+
+validate_permission_arguments() {
+  local access="$1"
+  shift
+  local argument=""
+  local expect_sandbox=0
+  local expect_config=0
+
+  for argument in "$@"; do
+    if (( expect_sandbox )); then
+      expect_sandbox=0
+      if [[ "$access" == "read" && "$argument" != "read-only" ]]; then
+        fail_access_mode "read access cannot use Codex sandbox '$argument'"
+      fi
+      if [[ "$access" == "write" && "$argument" != "danger-full-access" ]]; then
+        fail_access_mode "write access is globally configured for bypass; use AGENT_ACCESS_MODE=read for a restricted run"
+      fi
+      continue
+    fi
+    if (( expect_config )); then
+      expect_config=0
+      if is_managed_config_override "$argument"; then
+        fail_access_mode "sandbox_mode and approval_policy are managed by AGENT_ACCESS_MODE"
+      fi
+      continue
+    fi
+    case "$argument" in
+      --)
+        break
+        ;;
+      --dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust)
+        if [[ "$access" == "read" ]]; then
+          fail_access_mode "read access cannot enable Codex bypass flags"
+        fi
+        ;;
+      -s|--sandbox)
+        expect_sandbox=1
+        ;;
+      -s?*)
+        local sandbox="${argument#-s}"
+        sandbox="${sandbox#=}"
+        if [[ "$access" == "read" && "$sandbox" != "read-only" ]]; then
+          fail_access_mode "read access cannot use Codex sandbox '$sandbox'"
+        fi
+        if [[ "$access" == "write" && "$sandbox" != "danger-full-access" ]]; then
+          fail_access_mode "write access is globally configured for bypass; use AGENT_ACCESS_MODE=read for a restricted run"
+        fi
+        ;;
+      --sandbox=*)
+        local sandbox="${argument#*=}"
+        if [[ "$access" == "read" && "$sandbox" != "read-only" ]]; then
+          fail_access_mode "read access cannot use Codex sandbox '$sandbox'"
+        fi
+        if [[ "$access" == "write" && "$sandbox" != "danger-full-access" ]]; then
+          fail_access_mode "write access is globally configured for bypass; use AGENT_ACCESS_MODE=read for a restricted run"
+        fi
+        ;;
+      -a|-a?*|--ask-for-approval|--ask-for-approval=*)
+        fail_access_mode "approval policy is managed by AGENT_ACCESS_MODE"
+        ;;
+      -c|--config)
+        expect_config=1
+        ;;
+      -c?*)
+        local config="${argument#-c}"
+        config="${config#=}"
+        if is_managed_config_override "$config"; then
+          fail_access_mode "sandbox_mode and approval_policy are managed by AGENT_ACCESS_MODE"
+        fi
+        ;;
+      --config=*)
+        local config="${argument#*=}"
+        if is_managed_config_override "$config"; then
+          fail_access_mode "sandbox_mode and approval_policy are managed by AGENT_ACCESS_MODE"
+        fi
+        ;;
+    esac
+  done
+}
+
 remote_control_running() {
   local pid_file="$HOME/.codex/app-server-daemon/app-server.pid"
+  local settings_file="$HOME/.codex/app-server-daemon/settings.json"
+  local pid_state
   local pid
+  local daemon_state
+
+  if daemon_state="$("$codex_bin" app-server daemon version 2>/dev/null)" &&
+    jq -e '.status == "running"' <<<"$daemon_state" >/dev/null 2>&1 &&
+    jq -e '.remoteControlEnabled == true' "$settings_file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Compatibility with Codex releases that predate the daemon control socket.
   [[ -s "$pid_file" ]] || return 1
-  pid="$(tr -d '[:space:]' <"$pid_file")"
+  pid_state="$(<"$pid_file")"
+  if [[ "$pid_state" =~ \"pid\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then
+    pid="${BASH_REMATCH[1]}"
+  else
+    pid="${pid_state//[[:space:]]/}"
+  fi
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null
 }
@@ -75,7 +204,7 @@ start_remote_control() {
   fi
 }
 
-if (( ! passthrough && ! remote_requested )) && \
+if (( ! passthrough && ! noninteractive && ! remote_requested )) && \
   [[ "${AGENT_REMOTE_CONTROL:-1}" != "0" && "${AGENT_CODEX_REMOTE_CONTROL:-1}" != "0" ]]; then
   start_remote_control
 fi
@@ -84,8 +213,38 @@ if (( passthrough )); then
   exec "$codex_bin" "$@"
 fi
 
-exec "$codex_bin" \
-  --dangerously-bypass-approvals-and-sandbox \
-  --dangerously-bypass-hook-trust \
-  --search \
-  "$@"
+access_mode="${AGENT_ACCESS_MODE:-write}"
+if (( review_command )); then
+  access_mode="read"
+fi
+case "$access_mode" in
+  write|read)
+    ;;
+  *)
+    fail_access_mode "AGENT_ACCESS_MODE must be 'write' or 'read', got '$access_mode'"
+    ;;
+esac
+validate_permission_arguments "$access_mode" "$@"
+
+declare -a permission_args=()
+if [[ "$access_mode" == "write" ]]; then
+  permission_args=(
+    --dangerously-bypass-approvals-and-sandbox
+    --dangerously-bypass-hook-trust
+  )
+else
+  permission_args=(
+    -c 'sandbox_mode="read-only"'
+    -c 'approval_policy="never"'
+  )
+fi
+
+case "${1:-}" in
+  exec|e|review)
+    command_name="$1"
+    shift
+    exec "$codex_bin" "$command_name" "${permission_args[@]}" "$@"
+    ;;
+esac
+
+exec "$codex_bin" "${permission_args[@]}" --search "$@"

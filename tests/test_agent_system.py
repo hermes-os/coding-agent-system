@@ -2,6 +2,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import stat
@@ -36,6 +37,23 @@ GIT_REPOSITORY_ENVIRONMENT = (
 )
 
 
+def identity_is_mapped(map_path, identity):
+    for line in map_path.read_text(encoding="utf-8").splitlines():
+        inside, _outside, length = (int(part) for part in line.split())
+        if inside <= identity < inside + length:
+            return True
+    return False
+
+
+def can_switch_to_nobody():
+    if os.geteuid() != 0 or not Path("/usr/bin/setpriv").is_file():
+        return False
+    nobody = pwd.getpwnam("nobody")
+    return identity_is_mapped(Path("/proc/self/uid_map"), nobody.pw_uid) and identity_is_mapped(
+        Path("/proc/self/gid_map"), nobody.pw_gid
+    )
+
+
 class AgentSystemTests(unittest.TestCase):
     def test_skill_catalog_is_small_and_valid(self):
         catalog = json.loads((SYSTEM_ROOT / "system.json").read_text(encoding="utf-8"))
@@ -45,8 +63,10 @@ class AgentSystemTests(unittest.TestCase):
             [
                 "behavior-validator",
                 "capabilities",
+                "create-cli",
                 "delegate",
                 "fix-issue",
+                "github-project-triage",
                 "handoff",
                 "land",
                 "maintain-skills",
@@ -54,12 +74,15 @@ class AgentSystemTests(unittest.TestCase):
                 "portfolio",
                 "release",
                 "review",
+                "ssh-doctor",
+                "worker-first",
             ],
         )
         self.assertEqual([entry["name"] for entry in catalog["skills"]], [path.name for path in skills])
         binary_names = {entry["name"] for entry in catalog["binaries"]}
         self.assertNotIn("agent-claude", binary_names)
         self.assertNotIn("agent-codex", binary_names)
+        self.assertNotIn("agent-kimi", binary_names)
         for skill in skills:
             text = (skill / "SKILL.md").read_text(encoding="utf-8")
             self.assertTrue(text.startswith("---\n"), skill)
@@ -152,8 +175,10 @@ class AgentSystemTests(unittest.TestCase):
             home = Path(temp)
             codex = home / ".codex"
             claude = home / ".claude"
+            kimi = home / ".kimi"
             codex.mkdir()
             claude.mkdir()
+            kimi.mkdir()
             config = codex / "config.toml"
             config.write_text(
                 'banner = """literal config text\n[not.a.table]\n"""\n'
@@ -210,6 +235,19 @@ class AgentSystemTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            kimi_config = kimi / "config.toml"
+            kimi_config.write_text(
+                '# preserve this comment\n'
+                'default_model = "operator-selected"\n'
+                'custom_setting = "keep"\n\n'
+                '[[hooks]]\n'
+                'event = "SessionStart"\n'
+                'command = "custom-kimi-start"\n'
+                'matcher = ""\n'
+                'timeout = 5\n',
+                encoding="utf-8",
+            )
+            kimi_config.chmod(0o600)
             cursor = home / ".cursor"
             cursor.mkdir()
             (cursor / "hooks.json").write_text(
@@ -278,6 +316,30 @@ class AgentSystemTests(unittest.TestCase):
             self.assertEqual(updated_cursor_hooks["custom"], "keep")
             self.assertIn("custom-cursor-stop", json.dumps(updated_cursor_hooks["hooks"]))
             self.assertIn("afterFileEdit", updated_cursor_hooks["hooks"])
+            updated_kimi = kimi_config.read_text(encoding="utf-8")
+            parsed_kimi = tomllib.loads(updated_kimi)
+            self.assertEqual(parsed_kimi["default_model"], "operator-selected")
+            self.assertEqual(parsed_kimi["custom_setting"], "keep")
+            self.assertIn("custom-kimi-start", updated_kimi)
+            self.assertEqual(
+                sum(
+                    1
+                    for hook in parsed_kimi["hooks"]
+                    if hook["command"].startswith(
+                        '"$HOME/.agents/hooks/dispatch.py" --host kimi '
+                    )
+                ),
+                2,
+            )
+            self.assertEqual(
+                sum(
+                    1
+                    for hook in parsed_kimi["hooks"]
+                    if "session-guard.py" in hook["command"]
+                ),
+                1,
+            )
+            self.assertEqual(stat.S_IMODE(kimi_config.stat().st_mode), 0o600)
             known = json.loads((plugins / "known_marketplaces.json").read_text(encoding="utf-8"))
             self.assertEqual(
                 known,
@@ -385,13 +447,13 @@ class AgentSystemTests(unittest.TestCase):
             home.mkdir()
             (integration / "bin").mkdir(parents=True)
             (integration / "shell").mkdir()
-            for name in ("agent-claude", "agent-codex"):
+            for name in ("agent-claude", "agent-codex", "agent-kimi"):
                 helper = integration / "bin" / name
                 helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
                 helper.chmod(0o755)
             shell_adapter = integration / "shell" / "default-invocations.sh"
             shell_adapter.write_text(
-                "claude() { :; }\ncodex() { :; }\n",
+                "claude() { :; }\ncodex() { :; }\nkimi() { :; }\n",
                 encoding="utf-8",
             )
             shell_rc = home / ".zshrc"
@@ -449,6 +511,152 @@ class AgentSystemTests(unittest.TestCase):
             self.assertNotEqual(damaged.returncode, 0)
             self.assertIn("default invocation adapter", damaged.stderr)
 
+    def test_installer_accepts_host_integration_without_optional_kimi_launcher(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            home = base / "home"
+            integration = base / "legacy-host"
+            home.mkdir()
+            (integration / "bin").mkdir(parents=True)
+            (integration / "shell").mkdir()
+            for name in ("agent-claude", "agent-codex"):
+                helper = integration / "bin" / name
+                helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                helper.chmod(0o755)
+            (integration / "shell" / "default-invocations.sh").write_text(
+                "claude() { :; }\ncodex() { :; }\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run(
+                [
+                    "bash",
+                    str(SYSTEM_ROOT / "install.sh"),
+                    "--host-integration",
+                    str(integration),
+                ],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            config = json.loads(
+                (home / ".agents" / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                config["hostLaunchers"],
+                ["agent-claude", "agent-codex"],
+            )
+            self.assertFalse((home / ".local" / "bin" / "agent-kimi").exists())
+            self.assertFalse((home / ".agents" / "kimi" / "agent.yaml").exists())
+            doctor = subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "bin" / "agent-system-doctor"),
+                    "--home",
+                    str(home),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+
+    def test_doctor_detects_altered_kimi_dispatch_hook(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            config = home / ".kimi" / "config.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    "--host kimi Stop",
+                    "--host kimi Altered",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            doctor = subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "bin" / "agent-system-doctor"),
+                    "--home",
+                    str(home),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(doctor.returncode, 0)
+            self.assertIn("unexpected Kimi hook configuration", doctor.stderr)
+
+    def test_removing_optional_kimi_integration_retires_managed_hooks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            home = base / "home"
+            integration = base / "two-host"
+            home.mkdir()
+            subprocess.run(
+                ["bash", str(SYSTEM_ROOT / "install.sh")],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertIn(
+                "--host kimi",
+                (home / ".kimi" / "config.toml").read_text(encoding="utf-8"),
+            )
+
+            (integration / "bin").mkdir(parents=True)
+            (integration / "shell").mkdir()
+            for name in ("agent-claude", "agent-codex"):
+                helper = integration / "bin" / name
+                helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                helper.chmod(0o755)
+            (integration / "shell" / "default-invocations.sh").write_text(
+                "claude() { :; }\ncodex() { :; }\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "bash",
+                    str(SYSTEM_ROOT / "install.sh"),
+                    "--host-integration",
+                    str(integration),
+                ],
+                env={**os.environ, "HOME": str(home)},
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            kimi_config = (home / ".kimi" / "config.toml").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("--host kimi", kimi_config)
+            self.assertNotIn("session-guard.py", kimi_config)
+            self.assertFalse((home / ".agents" / "kimi" / "agent.yaml").exists())
+            self.assertFalse(
+                (home / ".agents" / "kimi" / "session-guard.py").exists()
+            )
+            self.assertFalse((home / ".local" / "bin" / "agent-kimi").exists())
+            doctor = subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "bin" / "agent-system-doctor"),
+                    "--home",
+                    str(home),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+
     def test_installer_migrates_only_an_exact_clean_legacy_install(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -462,6 +670,7 @@ class AgentSystemTests(unittest.TestCase):
             )
             shutil.copy2(legacy / "host" / "local" / "bin" / "agent-claude", legacy / "bin")
             shutil.copy2(legacy / "host" / "local" / "bin" / "agent-codex", legacy / "bin")
+            shutil.copy2(legacy / "host" / "local" / "bin" / "agent-kimi", legacy / "bin")
             (legacy / "shell").mkdir(exist_ok=True)
             shutil.copy2(
                 legacy / "host" / "local" / "shell" / "default-invocations.sh",
@@ -669,6 +878,21 @@ class AgentSystemTests(unittest.TestCase):
                 SYSTEM_ROOT / "host" / "local" / "bin" / "agent-codex",
             )
             self.assertEqual(
+                (home / ".local" / "bin" / "agent-kimi").resolve(),
+                SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi",
+            )
+            kimi_spec = (home / ".agents" / "kimi" / "agent.yaml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("extend: default", kimi_spec)
+            self.assertIn("# Global Engineering System", kimi_spec)
+            self.assertIn("subagents: {}", kimi_spec)
+            self.assertIn("managed-policy-sha256:", kimi_spec)
+            self.assertEqual(
+                (home / ".agents" / "kimi" / "session-guard.py").resolve(),
+                SYSTEM_ROOT / "lib" / "kimi_session_guard.py",
+            )
+            self.assertEqual(
                 (home / ".local" / "bin" / "agent-skill-audit").resolve(),
                 SYSTEM_ROOT / "skills" / "maintain-skills" / "scripts" / "skill-audit.py",
             )
@@ -736,7 +960,9 @@ class AgentSystemTests(unittest.TestCase):
                 "HOME": str(root),
                 "AGENT_TEST_LOG": str(log),
                 "AGENT_CLAUDE_BIN": str(stub),
+                "AGENT_CLAUDE_RUN_AS": "current",
                 "AGENT_CODEX_BIN": str(stub),
+                "AGENT_KIMI_BIN": str(stub),
                 "AGENT_CODEX_IGNORE_DESKTOP_APP_SERVER": "1",
             }
 
@@ -760,6 +986,119 @@ class AgentSystemTests(unittest.TestCase):
                 env=env,
                 check=True,
             )
+            agent_home = root / ".agents" / "kimi"
+            agent_home.mkdir(parents=True)
+            (agent_home / "agent.yaml").write_text("version: 1\n", encoding="utf-8")
+            (agent_home / "session-guard.py").symlink_to(
+                SYSTEM_ROOT / "lib" / "kimi_session_guard.py"
+            )
+            kimi_config = root / ".kimi" / "config.toml"
+            kimi_config.parent.mkdir()
+            kimi_config.write_text('default_model = "operator"\n', encoding="utf-8")
+            subprocess.run(
+                [str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi"), "--print"],
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi"), "info"],
+                env=env,
+                check=True,
+            )
+            unsupported = subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi"),
+                    "--work-dir",
+                    str(root),
+                    "web",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(unsupported.returncode, 2)
+            self.assertIn("cannot load the canonical agent specification", unsupported.stderr)
+            for hidden_worker in (
+                ["__web-worker", "11111111-2222-3333-4444-555555555555"],
+                [
+                    "--work-dir",
+                    str(root),
+                    "__web-worker",
+                    "11111111-2222-3333-4444-555555555555",
+                ],
+            ):
+                blocked_worker = subprocess.run(
+                    [
+                        str(
+                            SYSTEM_ROOT
+                            / "host"
+                            / "local"
+                            / "bin"
+                            / "agent-kimi"
+                        ),
+                        *hidden_worker,
+                    ],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(blocked_worker.returncode, 2)
+                self.assertIn(
+                    "not an allowed administrative command",
+                    blocked_worker.stderr,
+                )
+            override = subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi"),
+                    "--agent-file",
+                    str(agent_home / "other.yaml"),
+                    "--print",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(override.returncode, 2)
+            self.assertIn("would override managed policy", override.stderr)
+            config_override = subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi"),
+                    "--config={}",
+                    "--print",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(config_override.returncode, 2)
+            self.assertIn("would override managed policy", config_override.stderr)
+            subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi"),
+                    "mcp",
+                    "add",
+                    "--transport",
+                    "http",
+                    "web",
+                    "https://example.invalid",
+                ],
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-kimi"),
+                    "--prompt",
+                    "web",
+                    "--print",
+                ],
+                env=env,
+                check=True,
+            )
 
             calls = log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(
@@ -767,11 +1106,107 @@ class AgentSystemTests(unittest.TestCase):
                 [
                     "--remote-control --permission-mode bypassPermissions fix it",
                     "doctor",
+                    "app-server daemon version",
                     "remote-control start --json",
                     "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --search fix it",
                     "doctor",
+                    f"--print --agent-file {agent_home / 'agent.yaml'} --config-file {kimi_config} --yolo",
+                    "info",
+                    "mcp add --transport http web https://example.invalid",
+                    f"--prompt web --print --agent-file {agent_home / 'agent.yaml'} --config-file {kimi_config} --yolo",
                 ],
             )
+
+    @unittest.skipUnless(can_switch_to_nobody(), "requires a mapped unprivileged test user")
+    def test_agent_claude_drops_root_before_invoking_native_cli(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            tempfile.TemporaryDirectory(prefix="openclaw-cli-mcp-test-") as mcp_temp,
+            tempfile.TemporaryDirectory(
+                prefix="openclaw-claude-skills-test-"
+            ) as plugin_temp,
+        ):
+            root = Path(temp)
+            root.chmod(0o755)
+            config_dir = root / ".claude"
+            config_dir.mkdir()
+            config_dir.chmod(0o755)
+            mcp_config = Path(mcp_temp) / "mcp.json"
+            mcp_config.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+            mcp_config.chmod(0o600)
+            plugin_dir = Path(plugin_temp) / "openclaw-session-skills"
+            manifest_dir = plugin_dir / ".claude-plugin"
+            manifest_dir.mkdir(parents=True)
+            Path(plugin_temp).chmod(0o755)
+            plugin_manifest = manifest_dir / "plugin.json"
+            plugin_manifest.write_text('{"name": "test"}\n', encoding="utf-8")
+            plugin_manifest.chmod(0o644)
+            log = root / "calls.log"
+            log.touch()
+            log.chmod(0o666)
+            stub = root / "native-agent"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "call=1\\nuid=%s\\nhome=%s\\nconfig=%s\\nargs=%s\\n" '
+                '"$(id -u)" "$HOME" "$CLAUDE_CONFIG_DIR" "$*" >>"$AGENT_TEST_LOG"\n'
+                'printf "mcp_path=%s\\nmcp=%s\\nplugin=%s\\n" '
+                '"$3" "$(cat "$3")" "$(cat "$5")" >>"$AGENT_TEST_LOG"\n',
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+
+            subprocess.run(
+                [
+                    str(SYSTEM_ROOT / "host" / "local" / "bin" / "agent-claude"),
+                    "-p",
+                    "--mcp-config",
+                    str(mcp_config),
+                    "--plugin-dir",
+                    str(plugin_manifest),
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "prove it",
+                ],
+                env={
+                    **os.environ,
+                    "HOME": str(root),
+                    "AGENT_CLAUDE_BIN": str(stub),
+                    "AGENT_CLAUDE_RUN_AS": "nobody",
+                    "AGENT_TEST_LOG": str(log),
+                },
+                check=True,
+            )
+
+            log_text = log.read_text(encoding="utf-8")
+            self.assertEqual(log_text.count("call=1\n"), 1)
+            values = dict(
+                line.split("=", 1)
+                for line in log_text.splitlines()
+            )
+            nobody = pwd.getpwnam("nobody")
+            staged_mcp = Path(values["mcp_path"])
+            self.assertEqual(values["uid"], str(nobody.pw_uid))
+            self.assertEqual(values["home"], nobody.pw_dir)
+            self.assertEqual(values["config"], str(config_dir))
+            self.assertNotEqual(staged_mcp, mcp_config)
+            self.assertRegex(
+                str(staged_mcp),
+                r"^/tmp/agent-claude\.[^/]+/config-0\.json$",
+            )
+            self.assertEqual(
+                values["args"],
+                (
+                    f"-p --mcp-config {staged_mcp} --plugin-dir {plugin_manifest} "
+                    "--permission-mode bypassPermissions prove it"
+                ),
+            )
+            self.assertEqual(values["mcp"], '{"mcpServers": {}}')
+            self.assertEqual(values["plugin"], '{"name": "test"}')
+            self.assertFalse(staged_mcp.exists())
+            self.assertEqual(mcp_config.stat().st_uid, 0)
+            self.assertEqual(stat.S_IMODE(mcp_config.stat().st_mode), 0o600)
+            self.assertEqual(plugin_manifest.stat().st_uid, 0)
+            self.assertEqual(stat.S_IMODE(plugin_manifest.stat().st_mode), 0o644)
 
     def test_installer_refuses_unowned_and_modified_managed_collisions(self):
         with tempfile.TemporaryDirectory() as temp:

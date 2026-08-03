@@ -25,6 +25,12 @@ skills add job workflows.
 - Preserve changes you did not make. Work with concurrent edits when possible.
 - Use one heavy process at a time. Check host headroom before builds or broad
   tests, close only processes you own, and treat exit 137 as host starvation.
+- Agent work defaults to write access with provider approval prompts bypassed.
+  Host launchers must make that mode explicit instead of relying on mutable
+  provider defaults.
+- Read-only analysis and review are the exception: declare read access, disable
+  provider bypass, and enforce a read-only filesystem boundary where the host
+  supports one. Role names alone never change access.
 - Keep secrets out of output, commits, logs, prompts, and new files.
 
 ## Quality
@@ -86,7 +92,9 @@ skills add job workflows.
 
 - Roles describe jobs and output contracts, never model identities.
 - The task prompt may assign any available model to any role. Do not pin models
-  in policy, skills, hooks, launchers, or agent configuration.
+  in shared policy, skills, hooks, launchers, or generated agent configuration.
+  A provider-required operator default may remain in local host state; it does
+  not assign a model to a role or acceptance decision.
 - Record the actual model in generated artifacts as provenance, not acceptance.
 - Shared workflows live globally in one canonical `SKILL.md`. Product-specific
   workflows live in their repository under `.agents/skills/<name>/SKILL.md`.

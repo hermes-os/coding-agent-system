@@ -158,6 +158,47 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["followup_message"], "retry this")
 
+    def test_kimi_blocks_with_exit_two_and_stderr_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.repo_with_blocking_hook(root)
+            result = self.run_dispatch(root, "kimi", "PreToolUse")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("retry this", result.stderr)
+
+    def test_kimi_rejects_hook_budget_without_outer_timeout_margin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            skill = root / ".agents" / "skills" / "slow"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: slow\ndescription: Slow fixture.\n---\n# Slow\n",
+                encoding="utf-8",
+            )
+            hook = skill / "hook.py"
+            hook.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            hook.chmod(0o755)
+            (skill / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "events": {
+                            "PreToolUse": [
+                                {
+                                    "command": ["hook.py"],
+                                    "timeoutSeconds": 600,
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = self.run_dispatch(root, "kimi", "PreToolUse")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("570-second kimi event budget", result.stderr)
+
     def test_global_skill_hooks_are_discovered(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"
