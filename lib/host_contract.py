@@ -134,6 +134,26 @@ def kimi_agent_spec(policy: str) -> str:
     )
 
 
+def kimi_agent_markdown(policy: str) -> str:
+    """Render the canonical policy for the Kimi Code CLI's v2 agent engine.
+
+    The 1.x CLI consumes `kimi_agent_spec` YAML; the Kimi Code CLI takes a
+    Markdown agent definition with frontmatter whose body extends the system
+    prompt. Both carry the same policy marker so the session guard can verify
+    either shape.
+    """
+    marker = kimi_policy_marker(policy)
+    return (
+        "---\n"
+        "name: coding-worker\n"
+        "description: Managed repository worker under the canonical"
+        " engineering policy.\n"
+        "---\n\n"
+        f"{marker}\n\n"
+        f"{policy.rstrip()}\n"
+    )
+
+
 def kimi_policy_marker(policy: str) -> str:
     digest = hashlib.sha256(policy.rstrip().encode("utf-8")).hexdigest()
     return f"{KIMI_POLICY_MARKER_PREFIX}{digest}"

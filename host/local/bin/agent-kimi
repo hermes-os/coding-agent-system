@@ -100,7 +100,25 @@ if [[ "$access_mode" == "read" ]] && (( requested_yolo )); then
   exit 64
 fi
 
-agent_file="$HOME/.agents/kimi/agent.yaml"
+# Kimi ships two CLI generations. The 1.x CLI takes a YAML agent spec and an
+# explicit config file. The Kimi Code CLI (0.x, v2 engine) takes a Markdown
+# agent definition behind KIMI_CODE_EXPERIMENTAL_FLAG and discovers its
+# config through KIMI_SHARE_DIR. The launcher selects the dialect.
+engine="${AGENT_KIMI_ENGINE:-v1}"
+case "$engine" in
+  v1|v2)
+    ;;
+  *)
+    echo "agent-kimi: AGENT_KIMI_ENGINE must be 'v1' or 'v2', got '$engine'" >&2
+    exit 64
+    ;;
+esac
+
+if [[ "$engine" == "v2" ]]; then
+  agent_file="$HOME/.agents/kimi/agent.md"
+else
+  agent_file="$HOME/.agents/kimi/agent.yaml"
+fi
 if [[ ! -r "$agent_file" ]]; then
   echo "agent-kimi: canonical agent specification not found: $agent_file" >&2
   exit 2
@@ -123,6 +141,12 @@ if [[ "$access_mode" == "write" ]] && (( ! requested_yolo )); then
 fi
 
 # macOS bash 3.2 treats an empty array as unbound under set -u.
+if [[ "$engine" == "v2" ]]; then
+  export KIMI_CODE_EXPERIMENTAL_FLAG=1
+  exec "$kimi_bin" "$@" \
+    --agent-file "$agent_file" \
+    ${permission_args[@]+"${permission_args[@]}"}
+fi
 exec "$kimi_bin" "$@" \
   --agent-file "$agent_file" \
   --config-file "$config_file" \
