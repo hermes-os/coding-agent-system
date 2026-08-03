@@ -148,6 +148,16 @@ def preflight_argv(argv: list[str]) -> None:
             print_mode = True
             index += 1
             continue
+        if argument in {"--prompt", "-p"}:
+            # The Kimi Code CLI (v2 engine) has no --print; -p/--prompt is
+            # its non-interactive mode.
+            print_mode = True
+            index += 2
+            continue
+        if argument.startswith("--prompt="):
+            print_mode = True
+            index += 1
+            continue
         if argument in {"--wire", "--acp"}:
             raise ValueError(
                 f"{argument} can load sessions outside the managed preflight"
