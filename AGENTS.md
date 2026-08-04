@@ -9,8 +9,7 @@ skills add job workflows.
 - Read the repository `AGENTS.md`, then load only relevant skills and documents.
 - If `docs/` exists and `docs-list` is available, run it and read only matching
   documents.
-- Inspect the real code, git state, nearby patterns, and live provider state
-  before deciding.
+- Inspect real code, git state, and live provider state before deciding.
 - Read the entire target file before editing it. Read its direct callers,
   callees, and tests when behavior crosses the file boundary.
 - Inspect neighboring files to learn local conventions, and follow the
@@ -105,6 +104,7 @@ skills add job workflows.
 - Use `behavior-validator` when user-visible behavior needs source-blind proof.
 - Never claim success without fresh evidence. Complete skipped checks before
   delivery and state residual risk plainly.
+- Report final changed-file scope and verification evidence concisely.
 - Prefer a deterministic gate over prose for anything a machine can check: the
   strictest practical type checker, a strict configuration schema rejecting
   unknown and missing keys, and residue blocked in CI. A hallucinated API or
@@ -132,8 +132,6 @@ skills add job workflows.
 - Never commit prompt transcripts, model self-reviews, chain-of-thought,
   session links, model signatures, or placeholders such as `your-api-key`,
   `changeme`, and `lorem ipsum`.
-- Commit messages describe the product change, constraint, and migration
-  impact.
 
 ## Data And Concurrency
 
@@ -213,12 +211,12 @@ skills add job workflows.
 - Use `agent-trash` for routine deletion so recovery remains possible; delete
   permanently only when clearly warranted and within the task's scope.
 - Prefer `committer` with explicit paths when creating a commit in a dirty or
-  concurrently edited repository.
+  concurrently edited repository. Commit messages describe the product change,
+  constraint, and migration impact.
 - A request to implement authorizes local edits and tests. A request to land,
   ship, publish, or deploy authorizes the matching commit/push/deploy sequence.
 - Destructive commands and irreversible production or data actions must remain
   inside the user's stated scope. Clarify only genuinely ambiguous boundaries.
-- Report final changed-file scope and verification evidence concisely.
 
 ## Roles And Skills
 
