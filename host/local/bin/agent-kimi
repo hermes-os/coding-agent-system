@@ -142,10 +142,10 @@ fi
 
 # macOS bash 3.2 treats an empty array as unbound under set -u.
 if [[ "$engine" == "v2" ]]; then
+  # The v2 CLI refuses --yolo/--auto alongside --prompt because prompt mode is
+  # already non-interactive. The managed sandbox enforces access, not a flag.
   export KIMI_CODE_EXPERIMENTAL_FLAG=1
-  exec "$kimi_bin" "$@" \
-    --agent-file "$agent_file" \
-    ${permission_args[@]+"${permission_args[@]}"}
+  exec "$kimi_bin" "$@" --agent-file "$agent_file"
 fi
 exec "$kimi_bin" "$@" \
   --agent-file "$agent_file" \
