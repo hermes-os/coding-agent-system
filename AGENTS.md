@@ -8,7 +8,8 @@ skills add job workflows.
 
 - Read the repository `AGENTS.md`, then load only relevant skills and documents.
 - If `docs/` exists and `docs-list` is available, run it and read only matching
-  documents.
+  documents. Database and model-boundary rules live in `docs/engineering/` of
+  this repository; load them when the task touches either.
 - Inspect real code, git state, and live provider state before deciding.
 - Read the entire target file before editing it. Read its direct callers,
   callees, and tests when behavior crosses the file boundary.
@@ -132,41 +133,6 @@ skills add job workflows.
 - Never commit prompt transcripts, model self-reviews, chain-of-thought,
   session links, model signatures, or placeholders such as `your-api-key`,
   `changeme`, and `lorem ipsum`.
-
-## Data And Concurrency
-
-- No query in a loop without an explicit reason why batching is impossible.
-  Reduce query count before parallelizing, and never fan out unbounded
-  concurrency over a collection of queries.
-- Every list query has deterministic ordering; every paginated query has a
-  stable unique tie-breaker. Prefer cursor pagination for large result sets.
-- Database constraints enforce uniqueness and referential integrity;
-  application pre-checks do not replace them. Use idempotent writes where
-  repeated requests are expected.
-- Keep transactions short: never hold one across network calls, file
-  generation, model calls, user interaction, or long computation.
-- Set explicit command timeouts and propagate cancellation.
-- No `SELECT *` outside disposable scripts; review indexes alongside new
-  high-volume query paths.
-- Derived summaries are projections, not the source of truth. Measure before
-  introducing replicas, sharding, or caches.
-
-## Generated Content
-
-- Model output is untrusted input: parse and validate it before use, and never
-  let a model waive validation, authorization, or publication rules.
-- Keep prompts, provider SDKs, retries, token accounting, and raw responses
-  behind a dedicated boundary; core domain code must not depend on a provider.
-- Store accepted outputs and concise provenance. Model commentary is not
-  documentation, and automated critique is advisory until made a deterministic
-  check.
-- Human approval stays explicit where output is published, safety-sensitive,
-  legally meaningful, or hard to reverse.
-- Parallel model calls are an execution strategy, not a licence for autonomous
-  orchestration; prefer a deterministic workflow with explicit stages.
-- Every generated artifact carries input identity, generator version, creation
-  timestamp, validation status, and a content hash where reproducibility
-  matters.
 
 ## Anti-Rules
 
