@@ -937,5 +937,129 @@ class GitHubHandoffTests(unittest.TestCase):
                 self.module.attest_command(args)
 
 
+class ForgejoTransportTest(unittest.TestCase):
+    """The Forgejo port must preserve every GitHub-era invariant."""
+
+    def setUp(self):
+        self.module = load_module()
+
+    def test_absent_forge_block_keeps_the_github_transport(self):
+        self.assertEqual(
+            self.module.forge_authorization({}),
+            {"kind": "github"},
+        )
+
+    def test_forge_block_requires_https_api_base_and_absolute_token(self):
+        for forge in (
+            {"apiBase": "http://git.example/api/v1", "tokenPath": "/t"},
+            {"apiBase": "https://git.example/", "tokenPath": "/t"},
+            {"apiBase": "https://git.example/api/v1", "tokenPath": "relative"},
+            {"apiBase": "https://git.example/api/v1"},
+            "not-an-object",
+        ):
+            with self.assertRaises(self.module.HandoffError):
+                self.module.forge_authorization({"forge": forge})
+
+    def test_forge_token_must_be_private_and_well_formed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            good = root / "good"
+            good.write_text("a" * 40)
+            good.chmod(0o600)
+            self.assertEqual(self.module.forge_token(good), "a" * 40)
+
+            world_writable = root / "loose"
+            world_writable.write_text("a" * 40)
+            world_writable.chmod(0o666)
+            with self.assertRaises(self.module.HandoffError):
+                self.module.forge_token(world_writable)
+
+            malformed = root / "bad"
+            malformed.write_text("short")
+            malformed.chmod(0o600)
+            with self.assertRaisesRegex(self.module.HandoffError, "malformed"):
+                self.module.forge_token(malformed)
+
+    def test_queue_search_normalizes_the_forge_array_shape(self):
+        items = [
+            {"number": 4, "repository": {"owner": "hermes", "name": "marquee"}},
+            {"number": 5, "repository": {"full_name": "hermes/hearth"}},
+            {"number": 6, "repository": {"owner": "hermes", "name": "inkwell"}},
+        ]
+        self.module._FORGE = {"kind": "forgejo"}
+        try:
+            with mock.patch.object(self.module, "gh_json", return_value=items):
+                page = self.module.queue_search(Path("/"), "hermes", "agent:mac-pending", 2)
+        finally:
+            self.module._FORGE = None
+        self.assertEqual(page["total_count"], 2)
+        self.assertTrue(page["incomplete_results"])
+        # Discovery keys off this GitHub-only marker.
+        self.assertTrue(all("pull_request" in item for item in page["items"]))
+        self.assertEqual(self.module.search_slug(page["items"][0]), "hermes/marquee")
+        self.assertEqual(self.module.search_slug(page["items"][1]), "hermes/hearth")
+
+    def test_queue_search_rejects_a_non_array_forge_response(self):
+        self.module._FORGE = {"kind": "forgejo"}
+        try:
+            with mock.patch.object(self.module, "gh_json", return_value={"items": []}):
+                with self.assertRaises(self.module.HandoffError):
+                    self.module.queue_search(Path("/"), "hermes", "agent:mac-pending", 5)
+        finally:
+            self.module._FORGE = None
+
+    def test_search_slug_rejects_an_unusable_repository_object(self):
+        for item in ({"repository": {}}, {"repository": "hermes/x"}, {}):
+            self.assertIsNone(self.module.search_slug(item))
+
+    def test_repository_owner_holds_write_authority_on_both_forges(self):
+        # Forgejo reports the owner as "owner"; GitHub reports "admin".
+        for permission in ("owner", "admin", "write"):
+            with mock.patch.object(
+                self.module, "gh_json", return_value={"permission": permission}
+            ):
+                self.assertEqual(
+                    self.module.author_permission(Path("/"), "hermes/x", "hermes"),
+                    permission,
+                )
+        for permission in ("read", "none", "triage"):
+            with mock.patch.object(
+                self.module, "gh_json", return_value={"permission": permission}
+            ):
+                with self.assertRaises(self.module.AuthorRejected):
+                    self.module.author_permission(Path("/"), "hermes/x", "hermes")
+
+    def test_unreported_commit_status_is_empty_not_invalid(self):
+        forge_shape = {"state": "", "sha": "", "total_count": 0, "statuses": None}
+        with mock.patch.object(self.module, "gh_json", return_value=forge_shape):
+            self.assertIsNone(
+                self.module.existing_status(Path("/"), "hermes/x", "a" * 40, "ctx")
+            )
+        with mock.patch.object(self.module, "gh_json", return_value={"statuses": "nope"}):
+            with self.assertRaises(self.module.HandoffError):
+                self.module.existing_status(Path("/"), "hermes/x", "a" * 40, "ctx")
+
+    def test_forge_endpoint_cannot_escape_its_api_base(self):
+        with tempfile.TemporaryDirectory() as raw:
+            token = Path(raw) / "token"
+            token.write_text("a" * 40)
+            token.chmod(0o600)
+            forge = {
+                "kind": "forgejo",
+                "api_base": "https://git.example/api/v1",
+                "token_path": token,
+            }
+            for endpoint in (
+                "https://evil.example/steal",
+                "repos/../../admin/users",
+            ):
+                with self.assertRaisesRegex(
+                    self.module.HandoffError, "escaped its API base"
+                ):
+                    self.module.forge_json(
+                        endpoint, method="GET", payload=None, forge=forge
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

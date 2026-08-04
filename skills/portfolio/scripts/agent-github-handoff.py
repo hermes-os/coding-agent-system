@@ -17,7 +17,9 @@ import subprocess
 import sys
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
+import urllib.error
+import urllib.request
 
 
 SCHEMA_VERSION = 1
@@ -34,7 +36,9 @@ CHECKS = {
 MACOS_SUITES = {"macos-build", "macos-tests", "macos-app-smoke"}
 OUTCOMES = {"success", "failure", "blocked"}
 STATUS_STATES = {"success", "failure", "error"}
-WRITE_PERMISSIONS = {"admin", "write"}
+# GitHub reports the repository owner as "admin"; Forgejo distinguishes
+# "owner" as a level above it. Both imply push, which is what this gate means.
+WRITE_PERMISSIONS = {"owner", "admin", "write"}
 AUTHORITY = {
     "arbitrary_commands": False,
     "deploy": False,
@@ -42,9 +46,14 @@ AUTHORITY = {
     "repository_mutation": False,
 }
 SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+FORGE_API_BASE_RE = re.compile(r"https://[A-Za-z0-9.-]+(?::\d+)?/api/v1/?")
+FORGE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
+FORGE_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}")
-REMOTE_RE = re.compile(r"github\.com(?::|/)([^/\s]+/[^/\s]+?)(?:\.git)?$")
+REMOTE_RE = re.compile(
+    r"(?:github\.com|[A-Za-z0-9.-]+)(?::|/)([^/\s]+/[^/\s]+?)(?:\.git)?$"
+)
 MAX_TEXT = 1_000
 COMMAND_TIMEOUT_SECONDS = 20.0
 DEFAULT_OPERATION_TIMEOUT_SECONDS = 25
@@ -54,6 +63,7 @@ MAX_DISCOVERY_CANDIDATES = 25
 DISCOVERY_OVERSCAN_MULTIPLIER = 5
 PINNED_CONFIG_PATH_FILE = Path("/etc/coding-agent-system/agents-config-path")
 _COMMAND_DEADLINE: float | None = None
+_FORGE: dict | None = None
 
 
 class HandoffError(RuntimeError):
@@ -254,7 +264,52 @@ def authorization(path: Path) -> dict[str, Any]:
         "githubPeer.trustedAuthors",
         re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})"),
     )
-    return {"repositories": repositories, "authors": authors, "local_peer": local_peer}
+    global _FORGE
+    _FORGE = forge_authorization(peer)
+    return {
+        "repositories": repositories,
+        "authors": authors,
+        "local_peer": local_peer,
+        "forge": _FORGE,
+    }
+
+
+def forge_authorization(peer: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the Forgejo endpoint and credential for this host.
+
+    Absent a `githubPeer.forge` block the caller is still on github.com and
+    keeps the historical `gh` transport, so an unmigrated peer is unaffected.
+    """
+    forge = peer.get("forge")
+    if forge is None:
+        return {"kind": "github"}
+    if not isinstance(forge, dict):
+        raise HandoffError("githubPeer.forge must be an object")
+    base = forge.get("apiBase")
+    if (
+        not isinstance(base, str)
+        or not FORGE_API_BASE_RE.fullmatch(base)
+    ):
+        raise HandoffError("githubPeer.forge.apiBase must be an https API base URL")
+    token_path = forge.get("tokenPath")
+    if not isinstance(token_path, str) or not token_path.startswith("/"):
+        raise HandoffError("githubPeer.forge.tokenPath must be an absolute path")
+    return {
+        "kind": "forgejo",
+        "api_base": base.rstrip("/"),
+        "token_path": Path(token_path),
+    }
+
+
+def forge_token(path: Path) -> str:
+    check_authorization_file(path)
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise HandoffError("cannot read the forge API credential") from exc
+    if not FORGE_TOKEN_RE.fullmatch(value):
+        raise HandoffError("forge API credential is malformed")
+    return value
 
 
 def context(args: argparse.Namespace) -> tuple[Path, str, dict[str, Any]]:
@@ -280,6 +335,9 @@ def gh_json(
     method: str = "GET",
     payload: dict[str, Any] | None = None,
 ) -> Any:
+    forge = _FORGE
+    if forge is not None and forge.get("kind") == "forgejo":
+        return forge_json(endpoint, method=method, payload=payload, forge=forge)
     command = ["gh", "api"]
     if method != "GET":
         command.extend(["--method", method])
@@ -295,6 +353,66 @@ def gh_json(
         return json.loads(output)
     except json.JSONDecodeError as exc:
         raise HandoffError("GitHub returned invalid JSON") from exc
+
+
+def forge_json(
+    endpoint: str,
+    *,
+    method: str,
+    payload: dict[str, Any] | None,
+    forge: dict[str, Any],
+) -> Any:
+    """Call Forgejo's REST API with the host's own credential.
+
+    The request is issued in-process rather than through a helper binary so
+    the token never reaches argv or a child environment, and the response is
+    size-capped for the same reason every other input here is bounded.
+    """
+    # The credential is sent as a bearer header, so an endpoint that redirects
+    # the request to another origin would leak it. Endpoints are built by this
+    # script, never by a remote, but keep that guarantee enforced.
+    relative = endpoint.lstrip("/")
+    if (
+        "://" in relative
+        or relative.startswith("/")
+        or any(part == ".." for part in relative.split("?", 1)[0].split("/"))
+    ):
+        raise HandoffError("forge endpoint escaped its API base")
+    token = forge_token(forge["token_path"])
+    url = f"{forge['api_base']}/{relative}"
+    body = None
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/json",
+        "User-Agent": "agent-system-handoff/1",
+    }
+    if payload is not None:
+        body = json.dumps(payload, sort_keys=True).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, method=method, headers=headers)
+    timeout = COMMAND_TIMEOUT_SECONDS
+    if _COMMAND_DEADLINE is not None:
+        remaining = _COMMAND_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            raise HandoffError("provider operation exceeded its overall deadline")
+        timeout = min(timeout, remaining)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(FORGE_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        detail = sanitized_error(f"forge request failed: {exc.code}")
+        raise HandoffError(detail) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise HandoffError("forge request failed") from exc
+    if len(raw) > FORGE_MAX_RESPONSE_BYTES:
+        raise HandoffError("the forge returned an oversized response")
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HandoffError("the forge returned invalid JSON") from exc
 
 
 def paginated(
@@ -998,14 +1116,77 @@ def signal_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def queue_search(
+    root: Path,
+    organization: str,
+    label: str,
+    candidate_limit: int,
+) -> dict[str, Any]:
+    """Return the queue page in GitHub's issue-search shape.
+
+    Forgejo has no `search/issues`; its equivalent is `repos/issues/search`,
+    which returns a bare array and reports totals in a header this client does
+    not read. Normalize it into the one shape the caller already validates so
+    the discovery logic stays identical on both forges.
+    """
+    if _FORGE is None or _FORGE.get("kind") != "forgejo":
+        query = f'org:{organization} is:pr is:open label:"{label}"'
+        return gh_json(
+            root,
+            f"search/issues?q={quote(query, safe='')}"
+            f"&sort=updated&order=desc&per_page={candidate_limit}",
+        )
+    parameters = urlencode(
+        {
+            "type": "pulls",
+            "state": "open",
+            "labels": label,
+            "owner": organization,
+            "sort": "updated",
+            "order": "desc",
+            "limit": candidate_limit,
+        }
+    )
+    value = gh_json(root, f"repos/issues/search?{parameters}")
+    if not isinstance(value, list):
+        raise HandoffError("the forge returned invalid issue search data")
+    items = value[:candidate_limit]
+    for item in items:
+        if not isinstance(item, dict):
+            raise HandoffError("the forge returned invalid issue search data")
+        # GitHub marks pull requests with this key; discovery relies on it.
+        item.setdefault("pull_request", {})
+    return {
+        "items": items,
+        "total_count": len(items),
+        "incomplete_results": len(value) > candidate_limit,
+    }
+
+
 def search_slug(item: dict[str, Any]) -> str | None:
     repository = item.get("repository_url")
-    if not isinstance(repository, str):
+    if isinstance(repository, str):
+        match = re.fullmatch(
+            r"https://api\.github\.com/repos/([^/]+/[^/]+)", repository
+        )
+        if not match or not SLUG_RE.fullmatch(match.group(1)):
+            return None
+        return match.group(1).lower()
+    # Forgejo returns a repository object rather than an API URL.
+    value = item.get("repository")
+    if not isinstance(value, dict):
         return None
-    match = re.fullmatch(r"https://api\.github\.com/repos/([^/]+/[^/]+)", repository)
-    if not match or not SLUG_RE.fullmatch(match.group(1)):
+    owner = value.get("owner")
+    name = value.get("name")
+    if not isinstance(owner, str) or not isinstance(name, str):
+        full = value.get("full_name")
+        if not isinstance(full, str) or not SLUG_RE.fullmatch(full):
+            return None
+        return full.lower()
+    slug = f"{owner}/{name}"
+    if not SLUG_RE.fullmatch(slug):
         return None
-    return match.group(1).lower()
+    return slug.lower()
 
 
 def discover_command(args: argparse.Namespace) -> int:
@@ -1027,12 +1208,7 @@ def discover_command(args: argparse.Namespace) -> int:
         max(args.limit, args.limit * DISCOVERY_OVERSCAN_MULTIPLIER),
     )
     label = queue_label(args.recipient)
-    query = f'org:{organization} is:pr is:open label:"{label}"'
-    search = gh_json(
-        root,
-        f"search/issues?q={quote(query, safe='')}"
-        f"&sort=updated&order=desc&per_page={candidate_limit}",
-    )
+    search = queue_search(root, organization, label, candidate_limit)
     items = search.get("items") if isinstance(search, dict) else None
     total = search.get("total_count") if isinstance(search, dict) else None
     incomplete = search.get("incomplete_results") if isinstance(search, dict) else None
@@ -1218,8 +1394,12 @@ def attestation_context(suite: str) -> str:
 def existing_status(root: Path, slug: str, head: str, status_context: str) -> dict[str, Any] | None:
     value = gh_json(root, f"repos/{slug}/commits/{head}/status")
     statuses = value.get("statuses") if isinstance(value, dict) else None
+    # GitHub returns an empty list for an unreported commit; Forgejo returns
+    # null. Both mean "no status yet", which is not a protocol violation.
+    if statuses is None and isinstance(value, dict) and "statuses" in value:
+        statuses = []
     if not isinstance(statuses, list):
-        raise HandoffError("GitHub returned invalid commit status data")
+        raise HandoffError("the forge returned invalid commit status data")
     return next(
         (
             item
