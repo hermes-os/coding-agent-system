@@ -11,6 +11,14 @@ skills add job workflows.
   documents.
 - Inspect the real code, git state, nearby patterns, and live provider state
   before deciding.
+- Read the whole target file before editing it, plus its direct callers,
+  callees, and tests when behavior crosses the file boundary.
+- Inspect file history before changing a workaround, a security boundary,
+  compatibility logic, or code whose purpose is unclear.
+- Search the repository and standard library before adding a symbol, helper,
+  config key, or pattern. Reuse what fits. Follow the repository's current
+  framework, language, and module conventions; do not import idioms from
+  another version of the stack.
 - Treat a user's requested outcome and commands as authorization for the work
   they plainly require. Do not ask for the same approval at every step.
 - Ask once only when required information cannot be discovered and guessing
@@ -22,6 +30,22 @@ skills add job workflows.
 - Make the smallest coherent change that fixes the root cause.
 - Follow existing architecture and dependencies. Avoid speculative features,
   broad refactors, and unrelated cleanup.
+- Touch only the lines the task requires; a one-line fix stays a one-line diff.
+  No drive-by reformatting, renaming, or style normalization outside scope, and
+  leave unrelated TODOs and local idiom differences alone unless asked.
+- Do not combine feature work with dependency upgrades or formatting
+  migrations, and preserve existing public behavior unless the task changes it.
+- Do not abstract before the second real caller. Keep single-use values inline
+  unless extraction materially improves clarity.
+- Interfaces are justified for external or nondeterministic dependencies:
+  databases, identity providers, clocks, filesystems, network services, model
+  providers, object storage, process execution. Never to mirror one internal
+  class or to make pure helpers mockable.
+- Do not pad for symmetry. Two cases get two branches, not three.
+- Prefer explicit data flow over hidden global state, and ordinary functions
+  over classes when state and identity are unnecessary.
+- No new dependency without explicit approval. Do not introduce a framework,
+  queue, service, or abstraction for hypothetical future use.
 - Preserve changes you did not make. Work with concurrent edits when possible.
 - Use one heavy process at a time. Check host headroom before builds or broad
   tests, close only processes you own, and treat exit 137 as host starvation.
@@ -33,10 +57,48 @@ skills add job workflows.
   supports one. Role names alone never change access.
 - Keep secrets out of output, commits, logs, prompts, and new files.
 
+## Code And Comments
+
+- Comment why, never what. Delete comments restating the line below them.
+- No hedge comments. Either implement the behavior or write `TODO(<ticket>):`.
+  Banned: "in a real application", "in production you would", "handles most
+  cases", "for simplicity", "for brevity", "simplified version", "left as an
+  exercise".
+- No banner or divider comments, and no `Step 1:` narration.
+- No emoji in source, logs, error messages, or test output.
+- Never mention the model, prompt, session, or generation process in source.
+- Documentation scales with audience. Public and exported APIs need useful
+  documentation; internal helpers usually need only a clear name and signature;
+  private one-liners need none.
+- Name length scales with scope. Loop indices and short-lived locals stay short;
+  exported symbols are descriptive.
+- Annotate boundaries, not values the checker can already infer.
+
+## Errors
+
+- Catch only at a boundary where you can recover, retry, translate, or add
+  durable context. Never catch and continue, and never catch only to rethrow
+  unchanged.
+- Invalid internal state is a failure, not a fallback. User input and external
+  service failures are expected boundary errors and are translated deliberately.
+- No silent fallbacks that mask missing or invalid data, and no default values
+  that conceal absent required configuration.
+- No redundant null or existence checks on values the type system guarantees.
+- Error messages are terse, actionable, greppable.
+
 ## Quality
 
 - Define observable success criteria before substantial edits.
 - Add or update focused tests for changed behavior when practical.
+- Test behavior at the boundary, not the mock. Mock only nondeterministic or
+  external boundaries; never mock pure code.
+- A bugfix ships with a test that failed before the fix.
+- Every meaningful invalid or boundary condition gets a test. Do not invent
+  degenerate cases to satisfy a quota.
+- No assertion-free tests, and no test that only verifies a mock was called
+  unless that call is the contract.
+- Test names state the behavior and condition. Avoid "works as expected".
+- Coverage is a regression guard, not evidence of test quality.
 - Run narrow checks first, then the repository's required gate.
 - Before delivery, run `agent-repo-check --repo "$PWD"` when available. It
   validates instruction, skill, hook, plan, and clutter hygiene; it does not
@@ -86,7 +148,33 @@ skills add job workflows.
   ship, publish, or deploy authorizes the matching commit/push/deploy sequence.
 - Destructive commands and irreversible production or data actions must remain
   inside the user's stated scope. Clarify only genuinely ambiguous boundaries.
+- Ship the change, not a demo. No `__main__` demo blocks, sample invocations,
+  playground code, or printed summaries in library code. Examples belong in
+  tests, documentation, examples directories, or dedicated CLI commands.
+- Leave no temporary diagnostics, debug logs, commented experiments, or
+  generated notes. Investigation notes stay outside tracked source.
+- Never commit prompt transcripts, model self-reviews, reasoning traces,
+  session links, or model signatures.
+- Commit messages describe the product change, its constraint, and any
+  migration impact.
 - Report final changed-file scope and verification evidence concisely.
+
+## Anti-Rules
+
+- Do not fake scar tissue. Never add inconsistent naming, arbitrary shortcuts,
+  fake TODOs, or pointless duplication to look less uniform. The standard is
+  correct, context-aware, narrowly scoped code, not code that sounds human.
+- Do not adopt lint rules that manufacture the tell: docstrings on every
+  private helper, minimum identifier lengths, abstraction quotas, or a blanket
+  ban on short names.
+- Thoroughness is not quality. Every addition earns its maintenance cost.
+
+## Engineering Standards
+
+Policy, not optional reading. Load the matching document before work in its
+area: `docs/engineering/gates.md` for CI and checker wiring,
+`data-and-concurrency.md` for database work, `generated-content.md` for code
+that calls a model.
 
 ## Roles And Skills
 
