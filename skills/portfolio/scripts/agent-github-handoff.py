@@ -882,6 +882,10 @@ def publish_comment(
         "head_sha": packet["head_sha"],
         "request_id": packet["request_id"],
         "would_write": not apply,
+        # queue_action is the caller's next step, not a receipt. The label is a
+        # separate lease-admitted write, so say so rather than letting a
+        # published comment read as a queued handoff.
+        "queue_applied": False,
         **queue,
     }
     if not apply:

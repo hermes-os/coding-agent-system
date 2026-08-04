@@ -1060,6 +1060,33 @@ class ForgejoTransportTest(unittest.TestCase):
                         endpoint, method="GET", payload=None, forge=forge
                     )
 
+    def test_request_output_does_not_claim_the_queue_label_was_written(self):
+        """The label is a separate lease-admitted write; say so in the output."""
+        module = load_module()
+        packet = {
+            "event": "request",
+            "head_sha": "a" * 40,
+            "request_id": "b" * 32,
+            "to": "mac-cal",
+        }
+        dry = module.publish_comment(
+            Path("/"), "hermes/x", 3, packet, apply=False, lease_id=None
+        )
+        self.assertEqual(dry["queue_action"], "add")
+        self.assertIs(dry["queue_applied"], False)
+
+        with mock.patch.object(module, "gh_json", return_value={"id": 237}), \
+            mock.patch.object(module, "verify_public_lease"), \
+            mock.patch.object(module, "validate_pr"), \
+            mock.patch.object(module, "encode_comment", return_value="body"):
+            applied = module.publish_comment(
+                Path("/"), "hermes/x", 3, packet, apply=True, lease_id="lease"
+            )
+        self.assertEqual(applied["comment_id"], 237)
+        self.assertIs(applied["published"], True)
+        # A published comment must never read as a queued handoff.
+        self.assertIs(applied["queue_applied"], False)
+
 
 if __name__ == "__main__":
     unittest.main()
