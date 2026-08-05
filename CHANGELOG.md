@@ -9,6 +9,8 @@ This file records user-visible changes to the portable coding-agent system.
   immutable transition binding, canonical host authorization, post-lease PR
   revalidation, exact-head lifecycle events, and Darwin-only macOS validation
   statuses.
+- Harden canonical GitHub peer authorization reads with a 256 KiB limit,
+  no-follow descriptor pinning, and fail-closed inode and metadata checks.
 - Report Xcode, `xcrun`, and simulator capabilities when available.
 
 ### Changed

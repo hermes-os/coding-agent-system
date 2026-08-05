@@ -3,6 +3,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -739,6 +740,68 @@ class GitHubHandoffTests(unittest.TestCase):
         finally:
             self.mac_config.chmod(original_mode)
 
+        oversized = self.mac_config.parent / "oversized-config.json"
+        oversized.write_bytes(b" " * (self.module.MAX_AGENT_CONFIG_BYTES + 1))
+        with self.assertRaisesRegex(self.module.HandoffError, "size limit"):
+            self.module.authorization(oversized)
+
+    def test_authorization_rejects_atomic_replacement_before_open(self):
+        replacement = self.mac_config.parent / "replacement-config.json"
+        replacement.write_text(self.vm_config.read_text(encoding="utf-8"), encoding="utf-8")
+        real_lstat = Path.lstat
+        replaced = False
+
+        def replace_after_lstat(path):
+            nonlocal replaced
+            value = real_lstat(path)
+            if path == self.mac_config and not replaced:
+                os.replace(replacement, self.mac_config)
+                replaced = True
+            return value
+
+        with mock.patch.object(Path, "lstat", replace_after_lstat):
+            with self.assertRaisesRegex(self.module.HandoffError, "changed during inspection"):
+                self.module.authorization(self.mac_config)
+        self.assertTrue(replaced)
+
+    def test_authorization_fifo_replacement_cannot_block_before_validation(self):
+        replacement = self.mac_config.parent / "replacement-config"
+        os.mkfifo(replacement)
+        real_open = self.module.os.open
+        replaced = False
+
+        def replace_with_fifo(path, flags, *args, **kwargs):
+            nonlocal replaced
+            if path == self.mac_config and not replaced:
+                os.replace(replacement, self.mac_config)
+                replaced = True
+                self.assertTrue(flags & self.module.os.O_NONBLOCK)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(self.module.os, "open", replace_with_fifo):
+            with self.assertRaisesRegex(self.module.HandoffError, "changed during inspection"):
+                self.module.authorization(self.mac_config)
+        self.assertTrue(replaced)
+
+    def test_authorization_rejects_atomic_replacement_during_read(self):
+        replacement = self.mac_config.parent / "replacement-config.json"
+        replacement.write_text(self.vm_config.read_text(encoding="utf-8"), encoding="utf-8")
+        real_read = self.module.os.read
+        replaced = False
+
+        def replace_after_read(descriptor, size):
+            nonlocal replaced
+            content = real_read(descriptor, size)
+            if content and not replaced:
+                os.replace(replacement, self.mac_config)
+                replaced = True
+            return content
+
+        with mock.patch.object(self.module.os, "read", replace_after_read):
+            with self.assertRaisesRegex(self.module.HandoffError, "changed during inspection"):
+                self.module.authorization(self.mac_config)
+        self.assertTrue(replaced)
+
     def test_root_pinned_config_cannot_target_caller_owned_enrollment(self):
         with self.assertRaisesRegex(self.module.HandoffError, "ownership"):
             self.module.check_authorization_file(
@@ -748,8 +811,12 @@ class GitHubHandoffTests(unittest.TestCase):
         pointer = Path(self.temp.name) / "etc" / "coding-agent-system" / "agents-config-path"
         pointer.parent.mkdir(parents=True)
         target = Path(self.temp.name) / "root" / ".agents" / "config.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(self.vm_config.read_text(encoding="utf-8"), encoding="utf-8")
         pointer.write_text(f"{target}\n", encoding="utf-8")
         real_lstat = Path.lstat
+        real_check = self.module.check_authorization_file
+        checked = []
 
         def root_controlled_lstat(path):
             value = real_lstat(path)
@@ -761,14 +828,28 @@ class GitHubHandoffTests(unittest.TestCase):
                 )
             return value
 
+        def root_fixture_check(path, *, allowed_owners=None):
+            checked.append((path, allowed_owners))
+            effective_owners = (
+                {os.getuid()} if allowed_owners == {0} else allowed_owners
+            )
+            return real_check(path, allowed_owners=effective_owners)
+
         with mock.patch.object(
             self.module, "PINNED_CONFIG_PATH_FILE", pointer
         ), mock.patch.object(Path, "lstat", root_controlled_lstat), mock.patch.object(
             self.module, "check_root_controlled_directories"
         ) as checked_directories, mock.patch.object(
-            self.module, "check_authorization_file"
-        ) as checked:
-            self.assertEqual(self.module.canonical_config_path(), target)
+            self.module,
+            "check_authorization_file",
+            side_effect=root_fixture_check,
+        ):
+            selected = self.module.canonical_config_path()
+            self.assertEqual(selected, target)
+            self.assertEqual(
+                self.module.authorization(selected)["local_peer"],
+                "vm-cal",
+            )
         self.assertEqual(
             checked_directories.call_args_list,
             [
@@ -776,7 +857,7 @@ class GitHubHandoffTests(unittest.TestCase):
                 mock.call(target.parent, "installer-pinned agent config target"),
             ],
         )
-        checked.assert_called_once_with(target, allowed_owners={0})
+        self.assertEqual(checked, [(target, {0}), (target, None)])
 
     def test_root_pinned_config_rejects_a_writable_ancestor_swap(self):
         target_directory = Path("/safe/caller-writable/.agents")
