@@ -166,9 +166,12 @@ remote_control_running() {
   local pid
   local daemon_state
 
+  # python3 is a declared system dependency; jq is not and is absent on macOS.
   if daemon_state="$("$codex_bin" app-server daemon version 2>/dev/null)" &&
-    jq -e '.status == "running"' <<<"$daemon_state" >/dev/null 2>&1 &&
-    jq -e '.remoteControlEnabled == true' "$settings_file" >/dev/null 2>&1; then
+    python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("status") == "running" else 1)' \
+      <<<"$daemon_state" 2>/dev/null &&
+    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("remoteControlEnabled") is True else 1)' \
+      "$settings_file" 2>/dev/null; then
     return 0
   fi
 
