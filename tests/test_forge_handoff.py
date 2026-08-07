@@ -41,6 +41,7 @@ class Provider:
         self.statuses = []
         self.labels = set()
         self.writes = []
+        self.silent_label_drop = False
 
     def __call__(self, _root, endpoint, *, method="GET", payload=None):
         if endpoint == "user":
@@ -95,7 +96,8 @@ class Provider:
             self.writes.append((endpoint, payload))
             return status
         if method == "POST" and endpoint == "repos/example/app/issues/7/labels":
-            self.labels.update(payload["labels"])
+            if not self.silent_label_drop:
+                self.labels.update(payload["labels"])
             self.writes.append((endpoint, payload))
             return [{"name": label} for label in sorted(self.labels)]
         if method == "DELETE" and endpoint == "repos/example/app/issues/7/labels/agent%3Amac-pending":
@@ -404,6 +406,28 @@ class GitHubHandoffTests(unittest.TestCase):
         self.assertEqual(ignored + transition_rejections, 0)
         self.assertEqual(states[request_value]["state"], "completed")
         self.assertEqual(states[request_value]["outcome"], "success")
+
+    def test_queue_signal_fails_loudly_when_the_label_is_not_defined(self):
+        request_value = self.publish_request()
+        self.provider.silent_label_drop = True
+        present = argparse.Namespace(
+            repo=str(self.repo),
+            _authorization_path=str(self.config),
+            pr=7,
+            head=self.head,
+            request_id=request_value,
+            recipient="mac-cal",
+            state="present",
+            apply=True,
+            lease_id="d" * 32,
+        )
+        with mock.patch.object(self.module, "gh_json", self.provider), mock.patch.object(
+            self.module, "verify_public_lease"
+        ):
+            with self.assertRaises(self.module.HandoffError) as raised:
+                self.capture(self.module.signal_command, present)
+        self.assertIn("did not reach state present", str(raised.exception))
+        self.assertNotIn("agent:mac-pending", self.provider.labels)
 
     def test_queue_signal_and_portfolio_discovery_are_bounded_and_idempotent(self):
         request_value = self.publish_request()

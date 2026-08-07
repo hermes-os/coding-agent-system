@@ -1157,6 +1157,15 @@ def signal_command(args: argparse.Namespace) -> int:
             f"repos/{slug}/issues/{args.pr}/labels/{quote(label, safe='')}",
             method="DELETE",
         )
+    applied = paginated(root, f"repos/{slug}/issues/{args.pr}/labels")
+    if any(item.get("name") == label for item in applied) != desired:
+        # The forge silently ignores adding a label the repository does not
+        # define, which would leave the handoff invisible to peer discovery
+        # while this command reports success.
+        raise HandoffError(
+            f"queue label {label} did not reach state {args.state}; "
+            f"define it in {slug} and signal again"
+        )
     print(
         json.dumps(
             {
