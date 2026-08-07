@@ -99,6 +99,10 @@ def sanitized_error(value: str) -> str:
 
 
 def run(command: list[str], *, cwd: Path, input_text: str | None = None) -> subprocess.CompletedProcess:
+    if not Path(cwd).is_dir():
+        # subprocess reports a missing cwd as OSError too; without this the
+        # failure is misattributed to the executable.
+        raise HandoffError(f"repository path is unavailable: {cwd}")
     timeout = COMMAND_TIMEOUT_SECONDS
     if _COMMAND_DEADLINE is not None:
         remaining = _COMMAND_DEADLINE - time.monotonic()

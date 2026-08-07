@@ -407,6 +407,12 @@ class GitHubHandoffTests(unittest.TestCase):
         self.assertEqual(states[request_value]["state"], "completed")
         self.assertEqual(states[request_value]["outcome"], "success")
 
+    def test_missing_repository_path_is_not_blamed_on_the_executable(self):
+        with self.assertRaises(self.module.HandoffError) as raised:
+            self.module.run(["git", "status"], cwd=Path("/nonexistent/repo/path"))
+        self.assertIn("repository path is unavailable", str(raised.exception))
+        self.assertNotIn("executable", str(raised.exception))
+
     def test_queue_signal_fails_loudly_when_the_label_is_not_defined(self):
         request_value = self.publish_request()
         self.provider.silent_label_drop = True
