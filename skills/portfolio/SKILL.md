@@ -114,7 +114,7 @@ phase, proof, next action, and blocker compactly.
 
 ## GitHub Peer Handoff
 
-Use `agent-github-handoff` when enrolled hosts exchange implementation, review,
+Use `agent-forge-handoff` when enrolled hosts exchange implementation, review,
 or Mac-only validation through a pull request. Its comments are constrained,
 machine-addressed events tied to the current PR SHA; they never grant mutation,
 arbitrary-command, merge, or deployment authority. Mutating commands are
@@ -131,6 +131,6 @@ exceeding its output limit, and every write rechecks the live PR head after
 lease admission. Enrollment is read only from the canonical host config or a
 root-controlled pointer; the public CLI cannot replace it.
 
-Read `references/github-peer-handoff.md` before configuring a peer watcher or
+Read `references/forge-peer-handoff.md` before configuring a peer watcher or
 publishing a handoff. Keep host polling and launch behavior in the owning host
 integration, not this portable skill.

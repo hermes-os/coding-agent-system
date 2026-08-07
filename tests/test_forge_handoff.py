@@ -13,7 +13,7 @@ from unittest import mock
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]
-HANDOFF = SYSTEM_ROOT / "skills" / "portfolio" / "scripts" / "agent-github-handoff.py"
+HANDOFF = SYSTEM_ROOT / "skills" / "portfolio" / "scripts" / "agent-forge-handoff.py"
 
 
 def load_module():
@@ -121,14 +121,16 @@ class GitHubHandoffTests(unittest.TestCase):
         self.head = git(self.repo, "rev-parse", "HEAD")
         self.vm_config = base / "vm-config.json"
         self.mac_config = base / "mac-config.json"
-        for path, local_peer in (
-            (self.vm_config, "vm-cal"),
-            (self.mac_config, "mac-cal"),
+        # One host on the canonical forgePeer key and one on the legacy
+        # githubPeer key, so both spellings stay covered through migration.
+        for path, local_peer, key in (
+            (self.vm_config, "vm-cal", "forgePeer"),
+            (self.mac_config, "mac-cal", "githubPeer"),
         ):
             path.write_text(
                 json.dumps(
                     {
-                        "githubPeer": {
+                        key: {
                             "localPeer": local_peer,
                             "repositories": ["example/app"],
                             "trustedAuthors": ["trusted-author"],

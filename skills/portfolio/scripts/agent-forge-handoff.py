@@ -305,16 +305,22 @@ def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
 
 def authorization(path: Path) -> dict[str, Any]:
     value = read_authorization_json(path)
-    peer = value.get("githubPeer") if isinstance(value, dict) else None
+    # forgePeer is the canonical key; githubPeer remains readable so hosts
+    # migrate one at a time without breaking peer routing.
+    peer = None
+    if isinstance(value, dict):
+        peer = value.get("forgePeer")
+        if not isinstance(peer, dict):
+            peer = value.get("githubPeer")
     if not isinstance(peer, dict):
-        raise HandoffError("agent configuration has no githubPeer authorization")
+        raise HandoffError("agent configuration has no forgePeer authorization")
     local_peer = peer.get("localPeer")
     if local_peer not in RECIPIENTS:
-        raise HandoffError("githubPeer.localPeer must name one known local peer")
-    repositories = string_set(peer.get("repositories"), "githubPeer.repositories", SLUG_RE)
+        raise HandoffError("forgePeer.localPeer must name one known local peer")
+    repositories = string_set(peer.get("repositories"), "forgePeer.repositories", SLUG_RE)
     authors = string_set(
         peer.get("trustedAuthors"),
-        "githubPeer.trustedAuthors",
+        "forgePeer.trustedAuthors",
         re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})"),
     )
     global _FORGE
@@ -330,23 +336,23 @@ def authorization(path: Path) -> dict[str, Any]:
 def forge_authorization(peer: dict[str, Any]) -> dict[str, Any]:
     """Resolve the Forgejo endpoint and credential for this host.
 
-    Absent a `githubPeer.forge` block the caller is still on github.com and
+    Absent a `forgePeer.forge` block the caller is still on github.com and
     keeps the historical `gh` transport, so an unmigrated peer is unaffected.
     """
     forge = peer.get("forge")
     if forge is None:
         return {"kind": "github"}
     if not isinstance(forge, dict):
-        raise HandoffError("githubPeer.forge must be an object")
+        raise HandoffError("forgePeer.forge must be an object")
     base = forge.get("apiBase")
     if (
         not isinstance(base, str)
         or not FORGE_API_BASE_RE.fullmatch(base)
     ):
-        raise HandoffError("githubPeer.forge.apiBase must be an https API base URL")
+        raise HandoffError("forgePeer.forge.apiBase must be an https API base URL")
     token_path = forge.get("tokenPath")
     if not isinstance(token_path, str) or not token_path.startswith("/"):
-        raise HandoffError("githubPeer.forge.tokenPath must be an absolute path")
+        raise HandoffError("forgePeer.forge.tokenPath must be an absolute path")
     return {
         "kind": "forgejo",
         "api_base": base.rstrip("/"),
@@ -1647,5 +1653,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, HandoffError) as exc:
-        print(f"agent-github-handoff: {exc}", file=sys.stderr)
+        print(f"{Path(sys.argv[0]).name or 'agent-forge-handoff'}: {exc}", file=sys.stderr)
         raise SystemExit(1)

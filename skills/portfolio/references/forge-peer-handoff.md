@@ -1,7 +1,9 @@
-# GitHub Peer Handoff
+# Forge Peer Handoff
 
 Use this protocol when two enrolled engineering hosts need to exchange PR work,
-review, or platform validation. GitHub is transport and current provider state;
+review, or platform validation. The configured forge (Forgejo at the
+`forgePeer.forge.apiBase` of `~/.agents/config.json`; github.com absent that
+block) is transport and current provider state;
 the repository, PR head, CI, reviews, and remote leases remain authoritative.
 
 ## Local Authorization
