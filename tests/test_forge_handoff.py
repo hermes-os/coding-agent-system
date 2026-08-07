@@ -121,11 +121,9 @@ class GitHubHandoffTests(unittest.TestCase):
         self.head = git(self.repo, "rev-parse", "HEAD")
         self.vm_config = base / "vm-config.json"
         self.mac_config = base / "mac-config.json"
-        # One host on the canonical forgePeer key and one on the legacy
-        # githubPeer key, so both spellings stay covered through migration.
         for path, local_peer, key in (
             (self.vm_config, "vm-cal", "forgePeer"),
-            (self.mac_config, "mac-cal", "githubPeer"),
+            (self.mac_config, "mac-cal", "forgePeer"),
         ):
             path.write_text(
                 json.dumps(

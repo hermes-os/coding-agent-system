@@ -86,9 +86,7 @@ recorded locally in `~/.agents/config.json`; it is host state, not project
 memory.
 
 Enrolled hosts can exchange constrained, exact-SHA PR work with
-`agent-forge-handoff` (the legacy `agent-github-handoff` name remains a
-compatibility alias). Local `forgePeer.localPeer` (legacy `githubPeer` is
-still read), repository, and
+`agent-forge-handoff`. Local `forgePeer.localPeer`, repository, and
 trusted-author settings define its authorization surface; handoffs never grant
 mutation, commands, merge, or deploy authority. See the portfolio skill before
 enabling a host-specific watcher. Peer enrollment comes only from the canonical

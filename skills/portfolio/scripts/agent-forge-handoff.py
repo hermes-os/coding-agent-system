@@ -305,13 +305,7 @@ def string_set(value: object, label: str, pattern: re.Pattern[str]) -> set[str]:
 
 def authorization(path: Path) -> dict[str, Any]:
     value = read_authorization_json(path)
-    # forgePeer is the canonical key; githubPeer remains readable so hosts
-    # migrate one at a time without breaking peer routing.
-    peer = None
-    if isinstance(value, dict):
-        peer = value.get("forgePeer")
-        if not isinstance(peer, dict):
-            peer = value.get("githubPeer")
+    peer = value.get("forgePeer") if isinstance(value, dict) else None
     if not isinstance(peer, dict):
         raise HandoffError("agent configuration has no forgePeer authorization")
     local_peer = peer.get("localPeer")
