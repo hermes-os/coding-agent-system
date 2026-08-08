@@ -1023,12 +1023,20 @@ def request_command(args: argparse.Namespace) -> int:
 
 def list_command(args: argparse.Namespace) -> int:
     root, slug, auth = context(args)
-    require_local_peer(auth, args.recipient, "queue listing")
+    # A peer may list its inbound queue, or the requests it authored: the
+    # author needs the completion verdicts on its own sent requests — a
+    # blocked outcome is work handed back to it — and those are the only
+    # records exposed when the recipient is the inverse peer.
+    sender_view = args.recipient != auth["local_peer"]
+    if not sender_view:
+        require_local_peer(auth, args.recipient, "queue listing")
     states, ignored, conflicts = load_states(root, slug, auth, args.pr)
     items: list[dict[str, Any]] = []
     for request_value, current in sorted(states.items()):
         request = current["request"]
         if request["to"] != args.recipient:
+            continue
+        if sender_view and request["from"] != auth["local_peer"]:
             continue
         if request["pull_request"] != args.pr:
             continue
