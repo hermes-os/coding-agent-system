@@ -15,6 +15,8 @@ This file records user-visible changes to the portable coding-agent system.
 
 ### Changed
 
+- Allow hooks to ignore empty, read-only mounted `.git` placeholders while
+  keeping ordinary malformed repository markers fail-closed.
 - Require fresh verification, prompt repair of verified review findings, and
   removal of obsolete planning documents before delivery.
 - Require every governed repository to maintain an up-to-date changelog.

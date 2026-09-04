@@ -190,7 +190,37 @@ def project_context(payload: dict, timeout: float | None = None) -> ProjectConte
 
     marker = git_repository_marker(start)
     if marker is not None:
-        raise ValueError(f"cannot resolve Git repository containing {marker}")
+        placeholder = False
+        try:
+            marker_fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        except OSError:
+            marker_fd = -1
+        if marker_fd >= 0:
+            try:
+                try:
+                    opened = os.fstat(marker_fd)
+                    parent = os.stat("..", dir_fd=marker_fd)
+                    read_only = bool(os.fstatvfs(marker_fd).f_flag & os.ST_RDONLY)
+                    empty = not os.listdir(marker_fd)
+                    named = os.lstat(marker)
+                except OSError as exc:
+                    raise ValueError(
+                        f"cannot inspect Git repository marker {marker}: {exc}"
+                    ) from exc
+                mounted = (
+                    opened.st_dev != parent.st_dev or opened.st_ino == parent.st_ino
+                )
+                unchanged = (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+                placeholder = mounted and read_only and empty and unchanged
+            finally:
+                try:
+                    os.close(marker_fd)
+                except OSError as exc:
+                    raise ValueError(
+                        f"cannot release Git repository marker {marker}: {exc}"
+                    ) from exc
+        if not placeholder:
+            raise ValueError(f"cannot resolve Git repository containing {marker}")
     return ProjectContext(start, None)
 
 

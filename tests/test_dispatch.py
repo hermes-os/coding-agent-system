@@ -285,6 +285,119 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(response["decision"], "block")
         self.assertIn("cannot resolve Git repository", response["reason"])
 
+    def test_empty_read_only_mounted_git_marker_is_ignored(self):
+        functions = runpy.run_path(str(DISPATCH))
+        context_for = functions["project_context"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".git").mkdir()
+            real_stat = os.stat
+
+            def stat_for(path, *args, dir_fd=None, **kwargs):
+                if dir_fd is not None and path == "..":
+                    return mock.Mock(st_dev=-999, st_ino=-999)
+                return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
+
+            with mock.patch.object(os, "stat", side_effect=stat_for):
+                with mock.patch.object(
+                    os,
+                    "fstatvfs",
+                    return_value=mock.Mock(f_flag=os.ST_RDONLY),
+                ):
+                    context = context_for({"cwd": str(root)})
+        self.assertEqual(context.workdir, root.resolve())
+        self.assertIsNone(context.repository_root)
+
+    def test_plain_empty_git_directory_still_fails_closed(self):
+        functions = runpy.run_path(str(DISPATCH))
+        context_for = functions["project_context"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".git").mkdir()
+            with mock.patch.object(
+                os,
+                "fstatvfs",
+                return_value=mock.Mock(f_flag=os.ST_RDONLY),
+            ):
+                with self.assertRaisesRegex(ValueError, "cannot resolve Git repository"):
+                    context_for({"cwd": str(root)})
+
+    def test_git_marker_replaced_after_mount_check_fails_closed(self):
+        functions = runpy.run_path(str(DISPATCH))
+        context_for = functions["project_context"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            marker = root / ".git"
+            marker.mkdir()
+            real_stat = os.stat
+            real_lstat = os.lstat
+            replaced = mock.Mock(st_dev=-1, st_ino=-1)
+
+            def stat_for(path, *args, dir_fd=None, **kwargs):
+                if dir_fd is not None and path == "..":
+                    return mock.Mock(st_dev=-999, st_ino=-999)
+                return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
+
+            def lstat_for(path, *args, **kwargs):
+                if Path(path) == marker:
+                    return replaced
+                return real_lstat(path, *args, **kwargs)
+
+            with mock.patch.object(os, "stat", side_effect=stat_for):
+                with mock.patch.object(
+                    os,
+                    "fstatvfs",
+                    return_value=mock.Mock(f_flag=os.ST_RDONLY),
+                ):
+                    with mock.patch.object(os, "lstat", side_effect=lstat_for):
+                        with self.assertRaisesRegex(
+                            ValueError, "cannot resolve Git repository"
+                        ):
+                            context_for({"cwd": str(root)})
+
+    def test_git_marker_descriptor_close_failure_fails_closed(self):
+        functions = runpy.run_path(str(DISPATCH))
+        context_for = functions["project_context"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            marker = root / ".git"
+            marker.mkdir()
+            real_open = os.open
+            real_close = os.close
+            real_stat = os.stat
+            marker_fds = []
+
+            def open_for(path, flags, *args, **kwargs):
+                fd = real_open(path, flags, *args, **kwargs)
+                if Path(path) == marker:
+                    marker_fds.append(fd)
+                return fd
+
+            def close_for(fd):
+                if fd in marker_fds:
+                    marker_fds.remove(fd)
+                    real_close(fd)
+                    raise OSError("close failed")
+                return real_close(fd)
+
+            def stat_for(path, *args, dir_fd=None, **kwargs):
+                if dir_fd is not None and path == "..":
+                    return mock.Mock(st_dev=-999, st_ino=-999)
+                return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=open_for):
+                with mock.patch.object(os, "close", side_effect=close_for):
+                    with mock.patch.object(os, "stat", side_effect=stat_for):
+                        with mock.patch.object(
+                            os,
+                            "fstatvfs",
+                            return_value=mock.Mock(f_flag=os.ST_RDONLY),
+                        ):
+                            with self.assertRaisesRegex(
+                                ValueError, "cannot release Git repository marker"
+                            ):
+                                context_for({"cwd": str(root)})
+
     def test_inaccessible_git_repository_marker_fails_closed(self):
         functions = runpy.run_path(str(DISPATCH))
         marker = functions["git_repository_marker"]
