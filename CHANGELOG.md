@@ -15,6 +15,9 @@ This file records user-visible changes to the portable coding-agent system.
 
 ### Changed
 
+- Recognize public SQLite FTS5 tokenizer options during review secret scanning,
+  without exempting credential assignments or token patterns elsewhere.
+
 - Allow hooks to ignore empty, read-only mounted `.git` placeholders while
   keeping ordinary malformed repository markers fail-closed.
 - Require fresh verification, prompt repair of verified review findings, and

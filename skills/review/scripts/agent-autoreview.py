@@ -140,6 +140,21 @@ def secret_findings(text: str) -> list[str]:
         quoted = match.group("quoted") is not None
         value = match.group("quoted") or match.group("bare") or ""
         lowered = value.lower()
+        # FTS5 tokenizer options are not credential assignments. Keep the
+        # exception scoped to a complete statement and known public options.
+        if (
+            match.group("name").lower() == "tokenize"
+            and re.fullmatch(r"unicode61(?: remove_diacritics [012])?", value)
+            and any(
+                statement.start() <= match.start() < statement.end()
+                for statement in re.finditer(
+                    r"CREATE\s+VIRTUAL\s+TABLE\b[^;]*\bUSING\s+fts5\s*\([^;]*\)\s*;",
+                    text,
+                    re.IGNORECASE,
+                )
+            )
+        ):
+            continue
         if len(value) < 8 or any(marker in lowered for marker in PLACEHOLDERS):
             continue
         if not quoted and value[0] in "{[(":
