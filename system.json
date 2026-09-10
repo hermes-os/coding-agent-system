@@ -41,6 +41,7 @@
     {"name": "agent-system-doctor", "source": "bin/agent-system-doctor"},
     {"name": "agent-trash", "source": "bin/agent-trash"},
     {"name": "committer", "source": "bin/committer"},
-    {"name": "docs-list", "source": "bin/docs-list"}
+    {"name": "docs-list", "source": "bin/docs-list"},
+    {"name": "tirith-install", "source": "bin/tirith-install"}
   ]
 }
