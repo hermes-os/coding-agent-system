@@ -15,6 +15,9 @@ This file records user-visible changes to the portable coding-agent system.
 
 ### Changed
 
+- Replace the long global `AGENTS.md` with a short working agreement: the code is
+  the context, workers commit after every change, agents write no specs, plans,
+  or notes, and the 55 percent context handoff rule is gone.
 - Skip unmanaged symlinks in the global skill root instead of blocking every
   hook event; their hooks never register.
 - Recognize public SQLite FTS5 tokenizer options during review secret scanning,

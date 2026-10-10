@@ -457,7 +457,7 @@ def main() -> int:
     elif agents.is_symlink():
         errors.append(f"repository guide must not be a symlink: {agents}")
     elif is_system_repo:
-        if first_content_line(agents) != "# Global Engineering System":
+        if first_content_line(agents) != "# Working agreement":
             errors.append("canonical system AGENTS.md has an unexpected heading")
     elif first_content_line(agents) != GLOBAL_POINTER:
         errors.append("AGENTS.md must begin with the canonical global pointer")

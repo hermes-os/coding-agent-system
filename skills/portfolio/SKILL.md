@@ -99,9 +99,9 @@ owner decisions, or qualified refill work remain, and disable it when the
 portfolio is complete or the owner stops orchestration.
 
 Track only the current phase: `queued`, `implementing`, `validating`,
-`reviewing`, `ready`, `publishing`, `waiting`, `verified`, or `blocked`. Use the
-repository plan for durable multi-session decisions, `handoff` when pausing,
-and `pickup` when resuming. Never create a global append-only ledger.
+`reviewing`, `ready`, `publishing`, `waiting`, `verified`, or `blocked`. Use
+`handoff` when pausing and `pickup` when resuming. Never create a global
+append-only ledger.
 
 For an owner decision, present the exact repository and URL, current evidence,
 the smallest decision being asked, realistic options and tradeoffs, a

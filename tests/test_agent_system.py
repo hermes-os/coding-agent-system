@@ -885,7 +885,7 @@ class AgentSystemTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn("extend: default", kimi_spec)
-            self.assertIn("# Global Engineering System", kimi_spec)
+            self.assertIn("# Working agreement", kimi_spec)
             self.assertIn("subagents: {}", kimi_spec)
             self.assertIn("managed-policy-sha256:", kimi_spec)
             self.assertEqual(
@@ -1327,7 +1327,7 @@ class AgentSystemTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("# Global Engineering System", rule.read_text(encoding="utf-8"))
+            self.assertIn("# Working agreement", rule.read_text(encoding="utf-8"))
 
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)

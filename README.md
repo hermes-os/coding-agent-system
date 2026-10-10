@@ -118,8 +118,8 @@ READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing).
 ```
 
 `CLAUDE.md` is a symlink to `AGENTS.md`. Product-specific skills live under
-`.agents/skills`. Cross-session work uses one mutable `docs/plan/<project>.md`;
-ordinary work uses no tracker.
+`.agents/skills`. Agents write no plan, spec, or hand-off files unless the owner
+asks for one.
 
 Run the deterministic repository check before delivery:
 

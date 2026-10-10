@@ -17,5 +17,4 @@ Inspect current evidence and return concise bullets in this order:
 7. Risks: flaky checks, credentials, feature flags, brittle areas, and
    irreversible boundaries.
 
-Do not create a diary or append-only handoff file. Update an existing active
-project plan only when its durable status, milestones, or open questions changed.
+Do not create a diary, a plan, or a handoff file. Return the bullets in the reply.
