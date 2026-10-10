@@ -15,6 +15,8 @@ This file records user-visible changes to the portable coding-agent system.
 
 ### Changed
 
+- Skip unmanaged symlinks in the global skill root instead of blocking every
+  hook event; their hooks never register.
 - Recognize public SQLite FTS5 tokenizer options during review secret scanning,
   without exempting credential assignments or token patterns elsewhere.
 

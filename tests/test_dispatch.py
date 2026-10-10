@@ -215,6 +215,30 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
+    def test_unmanaged_global_skill_symlink_is_skipped_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "repo"
+            home = base / "home"
+            external = base / "external"
+            root.mkdir()
+            self.repo_with_blocking_hook(external)
+            skill_root = home / ".agents" / "skills"
+            skill_root.mkdir(parents=True)
+            (skill_root / "omarchy-app").symlink_to(
+                external / ".agents" / "skills" / "example",
+                target_is_directory=True,
+            )
+            result = self.run_dispatch(
+                root,
+                "claude",
+                "Stop",
+                home=home,
+                repository=False,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
     def test_non_repository_home_does_not_rediscover_global_skills(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp) / "home"

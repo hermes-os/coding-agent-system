@@ -337,7 +337,7 @@ def global_hook_owners(agents_home: Path) -> list[HookOwner]:
                 or Path(entry["target"]).resolve(strict=False) != expected.resolve(strict=False)
                 or directory.resolve(strict=False) != expected.resolve(strict=False)
             ):
-                raise ValueError(f"unmanaged global skill symlink: {directory}")
+                continue
         elif not directory.is_dir():
             continue
         skill_file = directory / "SKILL.md"
