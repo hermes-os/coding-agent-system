@@ -37,9 +37,11 @@ for the reviewer actually used; never make an identity an acceptance rule.
 7. Stop when the validator records a pass for the exact fingerprint. Do not run
    redundant reviews for a nicer verdict.
 
-If a finding would double the original surface, alter a public contract, cross
-an owner boundary, or fails to converge after two repair cycles, stop expanding
-and report the scope break. Pair this source-aware review with
+If a finding would double the original surface, alter a public contract, or cross
+an owner boundary, stop that expansion and report the scope break. Repeated
+repair failures require better diagnosis or a different bounded approach, not
+parking based on a review count. Continue authorized repairs and fresh review
+until the candidate passes; do not waive material findings. Pair this review with
 `behavior-validator` when user-visible behavior needs independent proof.
 
 For an authorized GitHub workflow, `agent-autoreview publish` records an

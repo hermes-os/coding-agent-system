@@ -65,5 +65,8 @@ Worker reports are evidence, not acceptance.
 2. Run or directly verify the narrow proof.
 3. Check forbidden files, tests, generated baselines, and public contracts.
 4. Resume the same session for bounded corrections.
-5. After two failed repair rounds, stop the loop and reassess scope.
+5. Repeated failed repair rounds trigger reassessment of the reproduction,
+   diagnosis, and implementation approach, not a review-count stop. Continue
+   bounded corrections and fresh review within the authorized scope until the
+   candidate passes; escalate only actual missing authority or dependencies.
 6. Use `review` for a non-trivial candidate before delivery.
