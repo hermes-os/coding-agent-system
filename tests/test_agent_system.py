@@ -666,7 +666,18 @@ class AgentSystemTests(unittest.TestCase):
             shutil.copytree(
                 SYSTEM_ROOT,
                 legacy,
-                ignore=shutil.ignore_patterns(".git", "__pycache__"),
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    "__pycache__",
+                    "*.py[cod]",
+                    ".coverage",
+                    ".mypy_cache",
+                    ".pytest_cache",
+                    ".ruff_cache",
+                    ".DS_Store",
+                    "*.log",
+                    "*.tmp",
+                ),
             )
             shutil.copy2(legacy / "host" / "local" / "bin" / "agent-claude", legacy / "bin")
             shutil.copy2(legacy / "host" / "local" / "bin" / "agent-codex", legacy / "bin")

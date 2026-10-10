@@ -22,6 +22,13 @@ def load_trash_module():
     return module
 
 
+def home_only_env(home):
+    # A host may export XDG_DATA_HOME; the trash must then land under the test HOME.
+    env = {**os.environ, "HOME": str(home)}
+    env.pop("XDG_DATA_HOME", None)
+    return env
+
+
 class TrashTests(unittest.TestCase):
     def test_moves_file_to_platform_trash_and_refuses_home(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -31,7 +38,7 @@ class TrashTests(unittest.TestCase):
             work.mkdir()
             source = work / "obsolete.txt"
             source.write_text("recoverable\n", encoding="utf-8")
-            env = {**os.environ, "HOME": str(home)}
+            env = home_only_env(home)
             moved = subprocess.run(
                 [str(TRASH), str(source)],
                 cwd=work,
@@ -66,7 +73,7 @@ class TrashTests(unittest.TestCase):
             second.mkdir()
             (first / "same.txt").write_text("first\n", encoding="utf-8")
             (second / "same.txt").write_text("second\n", encoding="utf-8")
-            env = {**os.environ, "HOME": str(home)}
+            env = home_only_env(home)
             subprocess.run(
                 [str(TRASH), str(first / "same.txt"), str(second / "same.txt")],
                 env=env,
@@ -88,7 +95,7 @@ class TrashTests(unittest.TestCase):
             second.mkdir()
             (first / "same.txt").write_text("first\n", encoding="utf-8")
             (second / "same.txt").write_text("second\n", encoding="utf-8")
-            env = {**os.environ, "HOME": str(home)}
+            env = home_only_env(home)
             processes = [
                 subprocess.Popen(
                     [str(TRASH), str(directory / "same.txt")],
@@ -117,7 +124,7 @@ class TrashTests(unittest.TestCase):
             ancestor.symlink_to(root, target_is_directory=True)
             final_link = work / "home-link"
             final_link.symlink_to(home, target_is_directory=True)
-            env = {**os.environ, "HOME": str(home)}
+            env = home_only_env(home)
 
             refused = subprocess.run(
                 [str(TRASH), str(ancestor / "home")],
