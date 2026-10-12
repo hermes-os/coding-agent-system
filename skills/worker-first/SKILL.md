@@ -67,6 +67,8 @@ Worker reports are evidence, not acceptance.
 2. Run or directly verify the narrow proof.
 3. Check forbidden files, tests, generated baselines, public contracts,
    `CHANGELOG.md` entries, and `issues.md`.
-4. Record the harness or tooling issues workers report; they do not belong in
-   a product repository's `issues.md`.
+4. Record the harness or tooling issues workers report in coding-agent-system's
+   `issues.md`, the coordinator's tooling log; they do not belong in a product
+   repository's `issues.md`. The commit that fixes one, in whichever repository
+   or host file owns it, is followed by removing its entry here.
 5. Report to the owner in plain words: what changed, checks, issues, next step.

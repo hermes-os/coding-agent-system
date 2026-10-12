@@ -18,8 +18,7 @@ behavior is suitable only when its named dependency or task exists. `Excluded`
 means it is specific to Peter's environment or conflicts with this system.
 
 Control-plane proof is owned by the OpenClaw workspace's `ORCHESTRATION.md`,
-`scripts/repo-worker`, `scripts/orchestrator-watch`, and
-`scripts/validate-workspace`. Repository checks can validate the policy side
+`scripts/repo-worker` and `scripts/validate-workspace`. Repository checks can validate the policy side
 but intentionally cannot inspect that private memory boundary.
 
 ## Policy And Helpers
@@ -27,8 +26,8 @@ but intentionally cannot inspect that private memory boundary.
 | Upstream surface | Local result |
 | --- | --- |
 | concise shared `AGENTS.MD` plus repo pointer | Repository equivalent: canonical global policy and managed host pointers |
-| coordinator delegates build work and verifies it | Repository-adapted: provider-neutral `worker-first` |
-| fresh session for a new work order | Control-plane adapted across three providers |
+| coordinator delegates build work and verifies it | Repository-adapted: `worker-first`, workers on the Hermes harness via `repo-worker` |
+| fresh session for a new work order | Control-plane adapted: one fresh Hermes-harness run per task |
 | capture session ID and deterministic resume | Retired: a crashed worker is not resumed; a fresh run finishes the task |
 | harness-visible background task | Control-plane adapted as a transient user service with durable status and logs |
 | liveness watchdog | Control-plane adapted with activity age; a crashed run is replaced by a fresh run |

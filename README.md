@@ -1,7 +1,9 @@
 # Coding Agent System
 
 A portable, model-neutral engineering system for Codex, Claude Code, Kimi CLI, Cursor,
-and other coding-agent hosts. It keeps policy terse, loads workflows as skills,
+and other coding-agent hosts. The coordinator skills (`worker-first`, `review`,
+`land`) assume workers run on the Hermes harness through `repo-worker`, which
+this repository does not ship. It keeps policy terse, loads workflows as skills,
 dispatches skill-owned hooks, reconstructs work from repository evidence, and
 uses deterministic checks for the parts that should not depend on judgment.
 

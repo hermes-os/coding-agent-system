@@ -21,7 +21,7 @@ acting.
    the repository's required gate, then recheck the final diff.
 5. Commit with `committer` and exact paths. The same commit adds the
    `CHANGELOG.md` entry for a user-visible fix and removes the issue's
-   `issues.md` entry. Other issues found on the way go in `issues.md`.
+   `issues.md` entry. Other issues found on the way go in `issues.md`, in their own commit.
 6. A fresh reviewer reads the commit range (`review`). Push, merge, deploy, or
    close the issue only after review approves, and only as the coordinator
    through `land`; a repository worker never does these.

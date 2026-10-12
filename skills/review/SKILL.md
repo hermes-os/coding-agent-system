@@ -30,7 +30,8 @@ The review order names:
    documentation when external behavior matters.
 4. Reject speculative edge cases and rewrites that do not fix a concrete risk
    introduced by the range.
-5. Grade findings `P0` through `P3` and mark a finding that would double the
+5. Grade findings `BLOCKER` (must fix before push), `FIX` (should fix now) or
+   `NIT` (small), each with file, line and exact fix, and mark a finding that would double the
    surface, alter a public contract, or cross an owner boundary as a scope break.
 6. Stop at `APPROVE`. Do not run redundant reviews for a nicer verdict.
 

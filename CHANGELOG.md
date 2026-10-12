@@ -4,12 +4,6 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
-- The working agreement now tells every agent to add a CHANGELOG.md entry
-  for each user-visible change in the same commit, to log unfixed bugs and
-  gaps in a repo-root issues.md (issue only, fix ideas go in the report), to
-  end each task with `git status` clean, and to report issues with a
-  suggested fix. The commit log, CHANGELOG.md and issues.md are the only
-  allowed records.
 - Add constrained GitHub peer handoffs with local host identity, bounded queue
   discovery without stale-label starvation, recipient-wide signals,
   immutable transition binding, canonical host authorization, post-lease PR
@@ -21,6 +15,16 @@ This file records user-visible changes to the portable coding-agent system.
 
 ### Changed
 
+- The working agreement now tells every agent to add a CHANGELOG.md entry
+  for each user-visible change in the same commit, to log unfixed bugs and
+  gaps in a repo-root issues.md (issue only, fix ideas go in the report), to
+  end each task with `git status` clean, and to report issues with a
+  suggested fix. The commit log, CHANGELOG.md and issues.md are the only
+  allowed records.
+- `land` commits the release heading before the push so it is part of the
+  reviewed range; `worker-first` names coding-agent-system's `issues.md` as
+  the coordinator's tooling log; README and the parity doc say workers run on
+  the Hermes harness.
 - Align the coordinator skills with the commit-first workflow: each task is a
   fresh worker run on the Hermes harness (no persistent project sessions, no
   resume of a crashed worker), workers commit their own changes with

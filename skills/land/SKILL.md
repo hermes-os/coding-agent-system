@@ -19,14 +19,16 @@ and changelog conventions without asking for the same approval again.
    checks plus the required gate. Do not land known failures or present old
    evidence as current.
 3. Commit anything left only through `committer "<message>" <path>...`, and
-   then review it before pushing.
+   then review it before pushing. When this landing deploys, the same rule
+   covers the release heading: turn the `CHANGELOG.md` `## Unreleased` section
+   into the heading the file's format uses (none yet: `## YYYY-MM-DD`), commit
+   it, and include it in the reviewed range before step 5.
 4. Synchronize without discarding work. Fast-forward clean branches; rebase or
    merge only when the repository convention requires it. Rebased commits need
    their range checked again.
 5. Push, then observe required CI.
 6. Deploy through the repository's release path, dry run first where it has
-   one. When deploying, turn the `CHANGELOG.md` `## Unreleased` section into the
-   release heading the file's format uses. Run the narrowest useful live smoke.
+   one. Run the narrowest useful live smoke.
 7. Return to the expected branch and state, and report commit range, remote,
    checks, deployment, and risk.
 

@@ -1,6 +1,6 @@
 # Issues
 
-Known problems with the agent tools and the worker harness. Issue only; fixes are proposed in reports. The commit that fixes an issue removes its entry.
+The coordinator's tooling log: known problems with the agent tools and the worker harness, wherever their code lives. Issue only; fixes are proposed in reports. When the fix lands in the owning repository or host file, a commit here removes the entry.
 
 ## No working CI runner
 - Where: Forgejo Actions for every hermes repo; GitHub Actions on the mirror.
@@ -8,12 +8,12 @@ Known problems with the agent tools and the worker harness. Issue only; fixes ar
 - Found: portfolio delivery check, 2026-10-12.
 
 ## Usage watch resumes runs the coordinator ended on purpose
-- Where: `~/.hermes/profiles/cal/workspace/state/model-usage-watch` (`model-usage-watch-v20260930.py`, every 5 minutes).
+- Where: `~/.hermes/profiles/cal/scripts/model-usage-watch-v20260930.py` (every 5 minutes); its ledger is `~/.hermes/profiles/cal/workspace/state/model-usage-watch/ledger.json`.
 - What happens: it calls `repo-worker --resume-run` on any run it reads as limit-killed unless the runId is in the ledger's `not_limit` list. A run whose task a fresh worker already finished was restarted on a moved main.
 - Found: ashwren run 6b3f57c9 resumed itself after its task was done, 2026-10-11.
 
 ## Launcher origin check accepts only one form of the Forgejo URL
-- Where: `repo-worker` launcher origin check.
+- Where: origin check in the cal copy `~/.hermes/profiles/cal/workspace/scripts/repo-worker` (the libexec copy accepts all forms).
 - What happens: `git.ashwren.com` is accepted only as `git@host:owner/repo`, not as an https or ssh:// URL, and the refusal message still says "GitHub URL".
 - Found: skill audit against the launcher code, 2026-10-12.
 
@@ -38,6 +38,6 @@ Known problems with the agent tools and the worker harness. Issue only; fixes ar
 - Found: skill audit, 2026-10-12.
 
 ## Stale policy copies outside the repo
-- Where: `~/.agents/kimi/agent.yaml` (both homes) and the installed Cursor commands and global rule.
-- What happens: they carry the August policy; `agent-system-doctor` flags them.
+- Where: `~/.agents/kimi/agent.yaml` (both homes), the installed Cursor commands and global rule, `tirith-install` helpers, Claude and Codex model pins, `.bashrc` invocation blocks, and the skill catalog hash.
+- What happens: they drift from the repository; `agent-system-doctor` reports each one.
 - Found: skill audit, 2026-10-12.
