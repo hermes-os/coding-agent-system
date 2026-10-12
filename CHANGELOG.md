@@ -21,6 +21,8 @@ This file records user-visible changes to the portable coding-agent system.
   end each task with `git status` clean, and to report issues with a
   suggested fix. The commit log, CHANGELOG.md and issues.md are the only
   allowed records.
+- Workers do not add a release heading (the coordinator does when landing),
+  and tooling issues go to coding-agent-system's `issues.md`.
 - `land` commits the release heading before the push so it is part of the
   reviewed range; `worker-first` names coding-agent-system's `issues.md` as
   the coordinator's tooling log; README and the parity doc say workers run on
