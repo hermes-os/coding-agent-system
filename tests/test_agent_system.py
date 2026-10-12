@@ -677,6 +677,8 @@ class AgentSystemTests(unittest.TestCase):
                     ".DS_Store",
                     "*.log",
                     "*.tmp",
+                    # Ignored host state would make the fixture's checkout dirty.
+                    "settings.local.json",
                 ),
             )
             shutil.copy2(legacy / "host" / "local" / "bin" / "agent-claude", legacy / "bin")
