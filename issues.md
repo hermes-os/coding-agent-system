@@ -56,3 +56,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `skills/review/scripts/agent-autoreview.py` (lines 502, 725).
 - What happens: it still requires P0-P3 severities, while the review skill grades BLOCKER/FIX/NIT and the CHANGELOG says review no longer uses autoreview bundles.
 - Found: round 2 review of b7990cd.
+
+## Host gate cannot install packages in a checkout a worker built in
+- Where: shared checkouts after a write run, e.g. `rpo-wellness/wellness/node_modules` (owned by agent-worker).
+- What happens: a repo's pre-commit gate run as hermes fails on `pnpm install` with EACCES (exit 243), so lint, typecheck, test and build cannot run in the shared folder.
+- Found: rpo-wellness precommit gate for commit 6a133b2, 2026-10-12.
