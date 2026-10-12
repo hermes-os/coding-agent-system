@@ -41,3 +41,18 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `~/.agents/kimi/agent.yaml` (both homes), the installed Cursor commands and global rule, `tirith-install` helpers, Claude and Codex model pins, `.bashrc` invocation blocks, and the skill catalog hash.
 - What happens: they drift from the repository; `agent-system-doctor` reports each one.
 - Found: skill audit, 2026-10-12.
+
+## Parity doc drops a script that still exists
+- Where: `docs/steipete-agent-scripts-parity.md` line 21 (control-plane proof sentence).
+- What happens: it no longer names `scripts/orchestrator-watch`, but the cal workspace still ships it: `ORCHESTRATION.md` refers to it, `validate-workspace` requires it, and its cron job is paused, not removed.
+- Found: round 2 review of b7990cd.
+
+## CHANGELOG misses two skill changes
+- Where: `CHANGELOG.md` `### Changed`.
+- What happens: it does not say that `review` now grades findings BLOCKER/FIX/NIT or that `fix-issue` puts found issues in their own commit.
+- Found: round 2 review of b7990cd.
+
+## Autoreview script still ships with the old severity scale
+- Where: `skills/review/scripts/agent-autoreview.py` (lines 502, 725).
+- What happens: it still requires P0-P3 severities, while the review skill grades BLOCKER/FIX/NIT and the CHANGELOG says review no longer uses autoreview bundles.
+- Found: round 2 review of b7990cd.
