@@ -61,3 +61,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: shared checkouts after a write run, e.g. `rpo-wellness/wellness/node_modules` (owned by agent-worker).
 - What happens: a repo's pre-commit gate run as hermes fails on `pnpm install` with EACCES (exit 243), so lint, typecheck, test and build cannot run in the shared folder.
 - Found: rpo-wellness precommit gate for commit 6a133b2, 2026-10-12.
+
+## Staged-diff fingerprint depends on the user's git diff config
+- Where: rpo-wellness `.agents/skills/rpo-quality-gates/scripts/lib/review-common.sh` (`staged_candidate_fingerprint` and other fingerprint call sites).
+- What happens: the fingerprint hashes `git diff --cached` output, which changes with global `diff.mnemonicPrefix` and `diff.algorithm`, so the same staged change can fingerprint differently for a worker and for the host user.
+- Found: rpo-wellness fix worker fe6843cb, 2026-10-12.
