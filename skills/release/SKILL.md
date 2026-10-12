@@ -16,7 +16,9 @@ hosting provider, version scheme, or artifact format.
 2. Define the release version, included commits, expected artifacts, target
    channels, and observable post-release checks. Resolve genuine ambiguity once.
 3. Update version and release notes only where the project requires them.
-   Preserve contributor credit and generated-file conventions.
+   Turn the `CHANGELOG.md` `## Unreleased` section into the release heading the
+   file's format uses. Preserve contributor credit and generated-file
+   conventions.
 4. Run the complete release gate and build artifacts from the exact candidate
    commit. Verify signatures, checksums, or provenance when the project uses
    them.

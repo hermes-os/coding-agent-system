@@ -5,7 +5,8 @@ description: "Package unfinished engineering work for a clean continuation sessi
 
 # Handoff
 
-Inspect current evidence and return concise bullets in this order:
+Commit finished changes first; the commit log is the record. Then inspect
+current evidence and return concise bullets in this order:
 
 1. Scope and status: objective, completed work, pending work, and blockers.
 2. Working tree: `git status -sb` summary and unpushed local commits.
@@ -17,4 +18,5 @@ Inspect current evidence and return concise bullets in this order:
 7. Risks: flaky checks, credentials, feature flags, brittle areas, and
    irreversible boundaries.
 
-Do not create a diary, a plan, or a handoff file. Return the bullets in the reply.
+Do not create a diary, a plan, or a handoff file. Return the bullets in the
+reply. Unfixed issues go in `issues.md`, not in the handoff.

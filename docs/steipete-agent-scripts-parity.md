@@ -29,15 +29,15 @@ but intentionally cannot inspect that private memory boundary.
 | concise shared `AGENTS.MD` plus repo pointer | Repository equivalent: canonical global policy and managed host pointers |
 | coordinator delegates build work and verifies it | Repository-adapted: provider-neutral `worker-first` |
 | fresh session for a new work order | Control-plane adapted across three providers |
-| capture session ID and deterministic resume | Control-plane adopted for Codex, Claude Code, and policy-current Kimi sessions |
+| capture session ID and deterministic resume | Retired: a crashed worker is not resumed; a fresh run finishes the task |
 | harness-visible background task | Control-plane adapted as a transient user service with durable status and logs |
-| liveness watchdog | Control-plane adapted with activity age and explicit resume |
-| one project thread per repository | Control-plane adopted |
+| liveness watchdog | Control-plane adapted with activity age; a crashed run is replaced by a fresh run |
+| one project thread per repository | Retired: each task is a fresh worker run |
 | support subagents are read-only | Control-plane adopted |
-| project workers never create task workers | Control-plane adopted |
-| five-minute root activation watch | Control-plane adopted |
+| project workers never create task workers | Adopted as: repository workers never start another coding worker |
+| five-minute root activation watch | Retired for Hermes's repositories: the coordinator waits on each run |
 | queue refill and owner decision briefs | Control-plane adapted to the private owner boundary |
-| exact-head serialized public actions | Repository equivalent: `portfolio` leases |
+| exact-head serialized public actions | Retired for Hermes's repositories: the coordinator pushes only after review approves; `agent-lease` remains for cross-host peers |
 | `committer` | Repository equivalent |
 | `docs-list` | Repository equivalent |
 | recoverable trash | Repository equivalent: `agent-trash` |

@@ -1,58 +1,49 @@
 ---
 name: review
-description: "Freeze, independently review, and validate a code change, plan, or implementation."
+description: "Independently review a committed change range and return VERDICT: APPROVE or CHANGES."
 ---
 
 # Review
 
-Use an independently assigned reviewer. Judge the frozen candidate and relevant
-source, never a success summary. For non-trivial code, use the deterministic
-bundle and result validator:
+Review happens after the worker commits. A fresh, read-only reviewer judges the
+commit range and the relevant source, never a success summary. The reviewer
+does not edit, commit, push, or deploy.
 
-```bash
-agent-autoreview prepare --base <target-ref> --intent "<requested outcome>"
-agent-autoreview validate --bundle <bundle-dir> --result <result.json> --record
-```
+## Input
 
-`prepare` requires a committed candidate, fails closed on sensitive paths or
-secret-like patch text, snapshots changed source files, and prints the bundle
-path. Give only that bundle plus the role assignment to a fresh reviewer. The
-reviewer writes `result.json` from the generated template. Record provenance
-for the reviewer actually used; never make an identity an acceptance rule.
+The review order names:
+
+- the base and head commits (`git log <base>..<head>`, `git diff <base> <head>`);
+- what the change does, in two lines, and the owner boundary;
+- the defect classes to hunt;
+- gates that already fail on the base, as known and not to be raised;
+- on a re-review, the findings from earlier rounds, to check first.
 
 ## Contract
 
-1. Freeze the request, target branch, intended behavior, owner boundary,
-   changed files, candidate SHA, and available proof.
-2. Inspect correctness, regressions, security and privacy, data behavior,
+1. Inspect correctness, regressions, security and privacy, data behavior,
    broken contracts, unnecessary complexity, and missing tests.
-3. Verify candidate findings against source, tests, types, and current primary
+2. Check that each user-visible change has its `CHANGELOG.md` entry in the same
+   commit, that unfixed issues the workers found are in `issues.md`, and that a
+   fixing commit removed its issue entry.
+3. Verify each finding against source, tests, types, and current primary
    documentation when external behavior matters.
 4. Reject speculative edge cases and rewrites that do not fix a concrete risk
-   introduced by the candidate.
-5. Classify findings as `blocker`, `follow-up`, or `scope-break` and use
-   severities `P0` through `P3`.
-6. Verify accepted findings in the real checkout before editing. If code
-   changes, rerun focused proof and review a newly frozen bundle.
-7. Stop when the validator records a pass for the exact fingerprint. Do not run
-   redundant reviews for a nicer verdict.
+   introduced by the range.
+5. Grade findings `P0` through `P3` and mark a finding that would double the
+   surface, alter a public contract, or cross an owner boundary as a scope break.
+6. Stop at `APPROVE`. Do not run redundant reviews for a nicer verdict.
 
-If a finding would double the original surface, alter a public contract, or cross
-an owner boundary, stop that expansion and report the scope break. Repeated
-repair failures require better diagnosis or a different bounded approach, not
-parking based on a review count. Continue authorized repairs and fresh review
-until the candidate passes; do not waive material findings. Pair this review with
-`behavior-validator` when user-visible behavior needs independent proof.
-
-For an authorized GitHub workflow, `agent-autoreview publish` records an
-idempotent fingerprint-specific commit status after validation. Acquire the
-public mutation lease from `portfolio` only for that publish, then release it
-immediately. Read `references/cursor-automation.md` only when configuring
-Cursor Automations.
+On `CHANGES`, a fresh worker fixes the findings in new commits and a fresh
+reviewer reads the whole range again. Repeated repair failures call for better
+diagnosis or a different bounded approach, not parking based on a review count.
+Do not waive material findings. Pair this review with `behavior-validator` when
+user-visible behavior needs independent proof.
 
 ## Output
 
-- Findings first, ordered by severity, with file and line references.
-- State impact, evidence, classification, and the smallest correction.
-- Then open questions, verification, and residual risk.
+- First line: `VERDICT: APPROVE` or `VERDICT: CHANGES`.
+- Findings ordered by severity, with file and line references, impact,
+  evidence, and the smallest correction.
+- Then open questions, checks run, and residual risk.
 - Say clearly when no actionable findings remain.

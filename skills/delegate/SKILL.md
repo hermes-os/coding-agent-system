@@ -17,6 +17,11 @@ Include:
 - expected verification and output contract
 - external actions that are or are not in scope
 
+One task per order; each order starts a fresh run. A review order also names
+the base and head commits, what the change does in two lines, the defect
+classes to hunt, gates already failing on the base, and the required
+`VERDICT: APPROVE|CHANGES` first line.
+
 Assign the job, never a model identity. Ask the receiving agent to inspect the
 real repository and challenge stale assumptions before editing. Do not include
 secrets, raw environment values, giant conversation dumps, or unrelated history.

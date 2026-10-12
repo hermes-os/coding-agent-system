@@ -15,6 +15,15 @@ This file records user-visible changes to the portable coding-agent system.
 
 ### Changed
 
+- Align the coordinator skills with the commit-first workflow: each task is a
+  fresh worker run on the Hermes harness (no persistent project sessions, no
+  resume of a crashed worker), workers commit their own changes with
+  `CHANGELOG.md` entries and record unfixed issues in `issues.md`, a fresh
+  read-only reviewer returns `VERDICT: APPROVE|CHANGES` on the commit range,
+  and only the coordinator pushes and deploys after approval. `review` no
+  longer uses `agent-autoreview` bundles, `land` and `portfolio` no longer use
+  leases for Hermes's repositories, and the Cursor Automation references and
+  the completed parity plan are gone.
 - Replace the long global `AGENTS.md` with a short working agreement: the code is
   the context, workers commit after every change, agents write no specs, plans,
   or notes, and the 55 percent context handoff rule is gone.

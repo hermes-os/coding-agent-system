@@ -1,12 +1,13 @@
 ---
 name: fix-issue
-description: "Resolve a tracked issue through reproduction, root-cause repair, tests, and authorized delivery."
+description: "Resolve a tracked issue through reproduction, root-cause repair, tests, and commit-first review."
 ---
 
 # Fix Issue
 
-Use this workflow for an issue reference, bug report, or request to fix a known
-defect. Read global and repository instructions before acting.
+Use this workflow for an issue reference, an `issues.md` entry, a bug report, or
+a request to fix a known defect. Read global and repository instructions before
+acting.
 
 ## Workflow
 
@@ -16,16 +17,16 @@ defect. Read global and repository instructions before acting.
    Distinguish confirmed facts from assumptions and stale reports.
 3. Trace the owning path and fix the root cause with the smallest coherent
    change. Preserve unrelated work and established architecture.
-4. Add focused regression coverage when practical. Update canonical docs or a
-   changelog only when the repository uses them and behavior changed.
-5. Run narrow checks, an independent `review` for non-trivial risk, and the
-   repository's required gate. Recheck the final diff.
-6. If the request includes land, ship, push, merge, close, or equivalent
-   delivery intent, activate `land` and complete that authorized sequence.
-   Comment on or close the issue only after remote state and proof agree.
+4. Add a regression test that failed before the fix. Run the narrow checks and
+   the repository's required gate, then recheck the final diff.
+5. Commit with `committer` and exact paths. The same commit adds the
+   `CHANGELOG.md` entry for a user-visible fix and removes the issue's
+   `issues.md` entry. Other issues found on the way go in `issues.md`.
+6. A fresh reviewer reads the commit range (`review`). Push, merge, deploy, or
+   close the issue only after review approves, and only as the coordinator
+   through `land`; a repository worker never does these.
 
-A request to fix authorizes implementation and verification. Delivery language
-authorizes the matching external sequence once; do not insert repeated gates.
+A request to fix authorizes implementation, verification, and commits.
 
 ## Output
 

@@ -118,8 +118,10 @@ READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing).
 ```
 
 `CLAUDE.md` is a symlink to `AGENTS.md`. Product-specific skills live under
-`.agents/skills`. Agents write no plan, spec, or hand-off files unless the owner
-asks for one.
+`.agents/skills`. The records are the commit log, `CHANGELOG.md` (an entry for
+each user-visible change, under `## Unreleased`), and a root `issues.md` that
+lists known issues no commit has fixed yet. Agents write no plan, spec, or
+hand-off files unless the owner asks for one.
 
 Run the deterministic repository check before delivery:
 
