@@ -67,11 +67,6 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - What happens: from 2026-10-01 the mirror cron logged `PushMirrorsIterate: context canceled` every 10 minutes and pushed nothing; GitHub stayed at 2026-09-28 for every repo while each mirror showed no `last_error`. A Forgejo restart cleared it. Nothing alerts when GitHub falls behind Forgejo.
 - Found: imessage-sidecar remote setup, 2026-10-12.
 
-## Live worker system is not installed from git yet
-- Where: `/usr/local/libexec/agent-worker-*`, `/etc/agent-worker/defaults.json`, `/etc/sudoers.d/portfolio-worker-coordination`, the `agent-worker-*` units in `/etc/systemd/system`, and the client copies in `~/.hermes/profiles/cal/{workspace/scripts,scripts}`, `~/.hermes/profiles/foreman/scripts` and the `foreman-method` skill.
-- What happens: `worker-host/` holds their source, but the live files are still separate copies until `worker-host/install.sh --apply` runs; `install.sh --check` lists 2 installed files and 24 client paths that drift. The installed runner (`/usr/local/libexec/agent-worker-runner`) and the client launcher (`~/.hermes/profiles/cal/workspace/scripts/repo-worker`) differ from the reconciled `worker-host/libexec/agent-worker-runner`: the installed runner lacks the two-run cap, and the installed runner and broker still accept `git.ashwren.com`. The other entries in `~/.hermes/profiles/cal/workspace/scripts/` (153 entries in all, many one-off dated launch scripts and `.bak-*` copies) and `~/.hermes/profiles/foreman/{SOUL.md,skills}` are still outside git.
-- Found: git coverage check, skill audit and a diff of the live copies against `worker-host/`, 2026-10-12; `worker-host/install.sh --check`.
-
 ## Runtime-policy test probes the retired OpenClaw runtime
 - Where: `worker-host/tests/test-agent-runtime-policy` (moved from the cal workspace).
 - What happens: it reads `~/.hermes/profiles/cal/openclaw.json`, root's Claude and Codex sign-ins and the Codex Remote Control supervisor; the OpenClaw config is gone, so it fails with FileNotFoundError. `worker-host/tests/run-tests` does not run it.
