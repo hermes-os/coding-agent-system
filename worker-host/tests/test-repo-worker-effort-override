@@ -16,8 +16,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-WORKSPACE = Path(__file__).resolve().parents[1]
-LAUNCHER = WORKSPACE / "scripts" / "repo-worker"
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
+LAUNCHER = WORKER_HOST / "libexec" / "agent-worker-runner"
 # Aliases whose catalog default differs from the effort requested below, so a
 # surviving floor or a silently-dropped override is visible in the readback.
 CASES = (("luna", "xhigh"), ("opus-5", "xhigh"), ("sol", "medium"))
@@ -35,6 +36,7 @@ def load_launcher():
     module = importlib.util.module_from_spec(spec)
     sys.modules["repo_worker_under_test"] = module
     spec.loader.exec_module(module)
+    module.CLIENT_MODEL_POLICY = WORKER_HOST / "etc" / "agent-worker" / "defaults.json"
     return module
 
 

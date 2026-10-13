@@ -8,10 +8,15 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-loader = SourceFileLoader("worker_routing_test", str(Path(__file__).with_name("repo-worker")))
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
+loader = SourceFileLoader(
+    "worker_routing_test", str(WORKER_HOST / "libexec" / "agent-worker-runner")
+)
 spec = spec_from_loader(loader.name, loader)
 core = module_from_spec(spec)
 loader.exec_module(core)
+core.CLIENT_MODEL_POLICY = WORKER_HOST / "etc" / "agent-worker" / "defaults.json"
 
 
 class ExplicitRoutingTests(unittest.TestCase):
@@ -31,7 +36,10 @@ class ExplicitRoutingTests(unittest.TestCase):
                         def submit(_):
                             self.fail("Explicit assignment launched an unauthorized replacement")
                         result = core.apply_launch_fallback(args, summary, submit=submit, read_status=lambda _: dict(failure))
-                    self.assertEqual(result, failure)
+                    # An explicit --model returns the launch summary at once
+                    # (owner rule 2026-10-07: never swap a worker's model);
+                    # session-bound runs wait and return the failure as is.
+                    self.assertEqual(result, summary if assignment == "model" else failure)
                     self.assertNotIn("fallbackFrom", result)
 
     def test_unassigned_task_keeps_existing_fallback_behavior(self):
@@ -45,7 +53,8 @@ class ExplicitRoutingTests(unittest.TestCase):
         with patch.object(core, "LAUNCH_GRACE_SECONDS", 1), patch.object(core, "LAUNCH_POLL_SECONDS", 0), patch.object(core, "time") as clock:
             clock.monotonic.return_value = 0
             result = core.apply_launch_fallback(args, {"runId": "initial-run", "agent": "claude"}, submit=submit, read_status=status)
-        self.assertEqual(submitted, ["codex"])
+        expected = next(name for name in core.fallback_agent_order() if name != "claude")
+        self.assertEqual(submitted, [expected])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["fallbackFrom"][0]["runId"], "initial-run")
 

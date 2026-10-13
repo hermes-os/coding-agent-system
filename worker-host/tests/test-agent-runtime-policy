@@ -12,11 +12,8 @@ import subprocess
 import sys
 
 
-WORKSPACE = Path(__file__).resolve().parents[1]
-if sys.platform == "darwin":
-    adapter = WORKSPACE / "scripts" / "test-agent-runtime-policy-macos"
-    os.execv(sys.executable, [sys.executable, str(adapter), *sys.argv[1:]])
-CONFIG = WORKSPACE.parent / "openclaw.json"
+# A live-host probe, not a test of repository files: it reads the Cal profile.
+CONFIG = Path("/home/hermes/.hermes/profiles/cal/openclaw.json")
 CLAUDE_LAUNCHER = Path("/root/.agents/bin/agent-claude")
 CODEX_AUTH = Path("/root/.codex/auth.json")
 CLAUDE_AUTH = Path("/root/.claude/.credentials.json")

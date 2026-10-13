@@ -7,7 +7,8 @@ from pathlib import Path
 import sys
 
 
-workspace = Path(__file__).resolve().parents[1]
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
 
 
 def load(name: str, path: Path):
@@ -21,8 +22,9 @@ def load(name: str, path: Path):
     return module
 
 
-broker = load("agent_worker_broker_resume_test", workspace / "scripts" / "agent-worker-broker")
-launcher = load("repo_worker_resume_test", workspace / "scripts" / "repo-worker")
+broker = load("agent_worker_broker_resume_test", WORKER_HOST / "libexec" / "agent-worker-broker")
+launcher = load("repo_worker_resume_test", WORKER_HOST / "libexec" / "agent-worker-runner")
+launcher.CLIENT_MODEL_POLICY = WORKER_HOST / "etc" / "agent-worker" / "defaults.json"
 
 origin = "a654a47d-bf61-455d-abf9-8b36bb949bf5"
 prior_run = "6105be1c-6e87-4975-9d47-39aebc566af0"

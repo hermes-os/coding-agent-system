@@ -31,6 +31,14 @@ This file records user-visible changes to the portable coding-agent system.
   `~/.hermes/profiles/cal/workspace/scripts/repo-worker` can become a symlink
   into `worker-host/`. `worker-pane.sh` and `chain-workers.sh` find their
   sibling tools next to their resolved location in `worker-host/bin/`.
+- `validate.sh` runs the worker-host tests (`worker-host/tests/run-tests`)
+  against the repository copies. Tests that need root run through `sudo -n`
+  when available and are skipped otherwise. The default-model and fallback
+  tests now follow the policy's `workerDefault` and order instead of pinning
+  Opus 5.5, and the explicit-routing test expects an explicit `--model` to
+  return at once (no model swap), matching the code since 2026-10-07.
+  `test-agent-runtime-policy` moved too but is not run (it probes the retired
+  OpenClaw runtime).
 
 ### Changed
 

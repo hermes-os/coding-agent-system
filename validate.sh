@@ -10,7 +10,12 @@ bash -n \
   "$ROOT/host/local/bin/agent-claude" \
   "$ROOT/host/local/bin/agent-codex" \
   "$ROOT/host/local/bin/agent-kimi" \
-  "$ROOT/host/local/shell/default-invocations.sh"
+  "$ROOT/host/local/shell/default-invocations.sh" \
+  "$ROOT/worker-host/tests/run-tests" \
+  "$ROOT/worker-host/bin/chain-workers.sh" \
+  "$ROOT/worker-host/bin/wait-for-workers.sh" \
+  "$ROOT/worker-host/bin/worker-pane.sh" \
+  "$ROOT/worker-host/bin/worker-watchdog.sh"
 while IFS= read -r -d '' script; do
   python3 - "$script" <<'PY'
 import ast
@@ -43,6 +48,7 @@ done
   --model-neutral
 "$ROOT/bin/agent-repo-check" --repo "$ROOT" --strict
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
+"$ROOT/worker-host/tests/run-tests"
 git -C "$ROOT" diff --check
 
 echo "Agent system validation passed."

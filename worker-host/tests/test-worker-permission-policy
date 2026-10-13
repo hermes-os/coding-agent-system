@@ -12,17 +12,16 @@ import sys
 import tempfile
 
 
-WORKSPACE = Path(__file__).resolve().parents[1]
-if sys.platform == "darwin":
-    adapter = WORKSPACE / "scripts" / "test-worker-permission-policy-macos"
-    os.execv(sys.executable, [sys.executable, str(adapter), *sys.argv[1:]])
-WORKER_PATH = WORKSPACE / "scripts" / "repo-worker"
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
+WORKER_PATH = WORKER_HOST / "libexec" / "agent-worker-runner"
 loader = SourceFileLoader("repo_worker_permission_test", str(WORKER_PATH))
 spec = spec_from_loader(loader.name, loader)
 if spec is None:
     raise SystemExit("could not load repo-worker")
 worker = module_from_spec(spec)
 loader.exec_module(worker)
+worker.CLIENT_MODEL_POLICY = WORKER_HOST / "etc" / "agent-worker" / "defaults.json"
 
 worker.command_path = lambda name: f"/native/{name}"
 worker.prepare_kimi_runtime = lambda: None

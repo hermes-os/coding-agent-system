@@ -9,10 +9,12 @@ from pathlib import Path
 import sys
 
 
-WORKSPACE = Path(__file__).resolve().parents[1]
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
 core = SourceFileLoader(
-    "repo_worker_fallback_gate", str(WORKSPACE / "scripts/repo-worker")
+    "repo_worker_fallback_gate", str(WORKER_HOST / "libexec" / "agent-worker-runner")
 ).load_module()
+core.CLIENT_MODEL_POLICY = WORKER_HOST / "etc" / "agent-worker" / "defaults.json"
 
 
 def check_classifier() -> None:
@@ -48,16 +50,14 @@ def check_classifier() -> None:
 
 def check_shared_model_policy() -> None:
     assert core.fallback_agent_order() == ("hermes", "codex", "kimi", "claude")
-    assert core.resolve_worker_selection(None, None, None) == (
-        "hermes",
-        "claude-opus-5.5",
-        "xhigh",
-    )
-    assert core.resolve_worker_selection("hermes", None, None) == (
-        "hermes",
-        "claude-opus-5.5",
-        "xhigh",
-    )
+    # The default follows the policy's workerDefault (owner-tuned), not a
+    # model pinned here.
+    policy = core.model_policy()
+    default = policy["models"][policy["workerDefault"]]["worker"]
+    assert default["agent"] == "hermes"
+    expected_default = ("hermes", default["model"], default["effort"])
+    assert core.resolve_worker_selection(None, None, None) == expected_default
+    assert core.resolve_worker_selection("hermes", None, None) == expected_default
     assert core.resolve_worker_selection(None, "luna", None) == (
         "codex",
         "gpt-5.6-luna",

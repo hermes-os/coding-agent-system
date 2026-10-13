@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Run the worker-host tests against the repository copies.
+# Tests that need root (root-owned trust state, uid-0 policy files) run through
+# `sudo -n` when this user has it and are skipped otherwise, e.g. inside a
+# worker sandbox. test-agent-runtime-policy is not run: it probes the retired
+# OpenClaw runtime on the live host, not files in this repository.
+set -euo pipefail
+
+TESTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONDONTWRITEBYTECODE=1
+# The run-cap test asserts the default limit.
+unset REPO_WORKER_MAX_ACTIVE AGENT_WORKER_PRIVATE_PROFILE_ROOT AGENT_WORKER_MANAGED
+
+if [[ "$(uname -s)" != Linux ]]; then
+  echo "worker-host tests: SKIP (Linux host only)"
+  exit 0
+fi
+
+user_tests=(
+  test-repo-worker-run-cap
+  test-repo-worker-effort-override
+  test-repo-worker-symlink-client
+  test-worker-broker-session-id
+  test-worker-hermes-resume-runtime
+  test-worker-provider-fallback
+  test-worker-explicit-routing
+  test-worker-codex-auth-sync
+)
+root_tests=(
+  test-worker-broker-policy
+  test-worker-permission-policy
+)
+
+failed=0
+run_test() {
+  local name=$1
+  shift
+  local output
+  if output=$("$@" "$TESTS/$name" 2>&1); then
+    echo "PASS $name"
+  else
+    echo "FAIL $name"
+    printf '%s\n' "$output" | tail -20
+    failed=1
+  fi
+}
+
+for name in "${user_tests[@]}"; do
+  run_test "$name" python3 -B
+done
+for name in "${root_tests[@]}"; do
+  if [[ $EUID -eq 0 ]]; then
+    run_test "$name" python3 -B
+  elif sudo -n true 2>/dev/null; then
+    run_test "$name" sudo -n python3 -B
+  else
+    echo "SKIP $name (needs root; sudo -n unavailable)"
+  fi
+done
+
+if [[ $failed -ne 0 ]]; then
+  echo "worker-host tests failed." >&2
+  exit 1
+fi
+echo "worker-host tests passed."

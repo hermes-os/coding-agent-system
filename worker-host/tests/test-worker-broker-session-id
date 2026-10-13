@@ -6,8 +6,9 @@ from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
 
 
-workspace = Path(__file__).resolve().parents[1]
-source = workspace / "scripts" / "agent-worker-broker"
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
+source = WORKER_HOST / "libexec" / "agent-worker-broker"
 loader = SourceFileLoader("agent_worker_broker_session_test", str(source))
 spec = spec_from_loader(loader.name, loader)
 if spec is None:

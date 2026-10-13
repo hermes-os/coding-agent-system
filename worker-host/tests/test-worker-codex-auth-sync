@@ -11,7 +11,9 @@ import tempfile
 import time
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parent / "agent-worker-codex-auth-sync"
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
+SCRIPT = WORKER_HOST / "libexec" / "agent-worker-codex-auth-sync"
 loader = importlib.machinery.SourceFileLoader("codex_auth_sync", str(SCRIPT))
 spec = importlib.util.spec_from_loader("codex_auth_sync", loader)
 assert spec is not None
