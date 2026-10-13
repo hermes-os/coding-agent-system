@@ -45,6 +45,9 @@ This file records user-visible changes to the portable coding-agent system.
   owner and mode, client paths replaced by symlinks into `worker-host/`,
   `daemon-reload` only when a unit changed, and a refusal while a run is
   active or the reboot hold is set.
+- `worker-host/install.sh` with `WORKER_HOST_PREFIX` set (a scratch test
+  tree) never calls sudo or systemctl: files keep the caller as owner and
+  each systemctl command is printed as `would run: ...` instead.
 
 ### Changed
 

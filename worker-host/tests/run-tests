@@ -26,6 +26,7 @@ user_tests=(
   test-worker-explicit-routing
   test-worker-codex-auth-sync
   test-install-check
+  test-install-apply
 )
 root_tests=(
   test-worker-broker-policy

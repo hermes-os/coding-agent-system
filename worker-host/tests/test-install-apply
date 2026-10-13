@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""install.sh --apply on a scratch WORKER_HOST_PREFIX tree, from a committed copy."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+WORKER_HOST = Path(__file__).resolve().parents[1]
+BROKER = "libexec/agent-worker-broker"
+SOCKET_UNIT = "systemd/agent-worker-broker.socket"
+RELOAD = "would run: sudo -n systemctl daemon-reload"
+RESTART = "would run: sudo -n systemctl try-restart agent-worker-broker.service"
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"FAIL: {message}")
+
+
+def git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.name=test",
+            "-c", "user.email=test@localhost",
+            "-c", "commit.gpgsign=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-C", str(repo),
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+class Host:
+    def __init__(self, base: Path) -> None:
+        self.base = base
+        self.repo = base / "repo" / "worker-host"
+        self.prefix = base / "root"
+        self.home = base / "home"
+        self.state = base / "launcher"
+        self.fakebin = base / "fakebin"
+        self.calls = base / "calls.log"
+        shutil.copytree(
+            WORKER_HOST, self.repo, symlinks=True,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        # The client launcher becomes a stub, so --list --active never reaches
+        # the live broker: it prints runs, then promotes runs-next (a run that
+        # starts during the apply).
+        self.state.mkdir()
+        self.set_runs("[]")
+        (self.repo / "libexec/agent-worker-runner").write_text(
+            "#!/bin/sh\n"
+            f"cat '{self.state}/runs'\n"
+            f"[ ! -f '{self.state}/runs-next' ] || mv '{self.state}/runs-next' '{self.state}/runs'\n"
+        )
+        git(self.repo.parent, "init", "-q")
+        git(self.repo.parent, "add", "-A")
+        git(self.repo.parent, "commit", "-q", "-m", "copy")
+        # A prefix run must never reach sudo or systemctl.
+        self.fakebin.mkdir()
+        for tool in ("sudo", "systemctl"):
+            stub = self.fakebin / tool
+            stub.write_text(f"#!/bin/sh\necho {tool} \"$@\" >> '{self.calls}'\nexit 1\n")
+            stub.chmod(0o755)
+
+    def set_runs(self, now: str, later: str | None = None) -> None:
+        (self.state / "runs").write_text(now + "\n")
+        if later is not None:
+            (self.state / "runs-next").write_text(later + "\n")
+
+    def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        env = {
+            **os.environ,
+            "PATH": f"{self.fakebin}:{os.environ['PATH']}",
+            "WORKER_HOST_PREFIX": str(self.prefix),
+            "WORKER_HOST_HOME": str(self.home),
+        }
+        return subprocess.run(
+            ["bash", str(self.repo / "install.sh"), *args],
+            env=env, text=True, capture_output=True, check=False, timeout=60,
+        )
+
+    def manifest(self) -> tuple[dict[str, Path], dict[str, Path]]:
+        result = self.run("--check")
+        system, links = {}, {}
+        for line in result.stdout.splitlines():
+            match = re.match(r"DRIFT missing\s+(\S+) \(repo (.+)\)$", line)
+            if match:
+                system[match.group(2)] = Path(match.group(1))
+            match = re.match(r"DRIFT missing\s+(\S+) \(link to (.+)\)$", line)
+            if match:
+                links[match.group(1)] = self.repo / match.group(2)
+        if len(system) != 14:
+            fail(f"installed-file map is wrong: {result.stdout}")
+        return system, links
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as temporary:
+        host = Host(Path(temporary).resolve())
+        system, links = host.manifest()
+        if any(Path(path).name == "test-install-apply" for path in links):
+            fail("test-install-apply is linked into the cal workspace")
+        for path, source in links.items():
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).symlink_to(source)
+        for rel, target in system.items():
+            if rel == SOCKET_UNIT:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(host.repo / rel, target)
+        system[BROKER].write_text("#!/bin/sh\necho old broker\n")
+
+        applied = host.run("--apply")
+        output = applied.stdout + applied.stderr
+        if applied.returncode != 0:
+            fail(f"apply failed: {output}")
+        if RELOAD not in applied.stdout or RESTART not in applied.stdout:
+            fail(f"systemctl was not echoed: {output}")
+        if host.calls.exists():
+            fail(f"a prefix apply called {host.calls.read_text()}")
+        for rel in (BROKER, SOCKET_UNIT):
+            if system[rel].read_bytes() != (host.repo / rel).read_bytes():
+                fail(f"{rel} was not installed")
+        backups = list((host.prefix / "var/backups/agent-worker").glob(f"*/**/{Path(BROKER).name}"))
+        if len(backups) != 1 or backups[0].read_text() != "#!/bin/sh\necho old broker\n":
+            fail(f"the old broker was not backed up: {backups}")
+        clean = host.run("--check")
+        if clean.returncode != 0 or "DRIFT" in clean.stdout:
+            fail(f"tree still drifts after apply: {clean.stdout}{clean.stderr}")
+    print("PASS: install.sh --apply on a prefix installs, backs up and only echoes systemctl")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

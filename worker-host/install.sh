@@ -13,6 +13,9 @@
 #
 # WORKER_HOST_PREFIX (system targets) and WORKER_HOST_HOME (client paths) exist
 # so tests can run against a scratch tree; leave them unset on the live host.
+# Under WORKER_HOST_PREFIX the tree belongs to the caller: nothing goes through
+# sudo, installed files keep the caller as owner, and systemctl commands are
+# printed, never run.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,7 +72,7 @@ for test in "$REPO"/tests/test-*; do
   name=$(basename "$test")
   # Only tests that lived in the cal workspace go back there as symlinks.
   case "$name" in
-    test-repo-worker-symlink-client|test-install-check) continue ;;
+    test-repo-worker-symlink-client|test-install-check|test-install-apply) continue ;;
   esac
   CLIENT_LINKS+=("tests/$name|$W/$name")
 done
@@ -87,13 +90,37 @@ case "${1:-}" in
 esac
 [[ $# -le 1 ]] || usage
 
+as_root() {
+  if [[ -n $PREFIX ]]; then "$@"; else sudo -n "$@"; fi
+}
+
 # Root-only paths (/etc/agent-worker, /etc/sudoers.d) are read through sudo -n.
 as_reader() {
-  if [[ -r "${*: -1}" ]]; then "$@"; else sudo -n "$@"; fi
+  if [[ -r "${*: -1}" ]]; then "$@"; else as_root "$@"; fi
 }
 
 target_exists() {
-  [[ -e "$1" ]] || sudo -n test -e "$1" 2>/dev/null
+  [[ -e "$1" ]] || as_root test -e "$1" 2>/dev/null
+}
+
+# install_as <owner> <group> <mode> <install arguments>; a scratch prefix
+# cannot chown to root, so there the caller keeps ownership.
+install_as() {
+  local owner=$1 group=$2 mode=$3
+  shift 3
+  if [[ -n $PREFIX ]]; then
+    install -m "$mode" "$@"
+  else
+    sudo -n install -o "$owner" -g "$group" -m "$mode" "$@"
+  fi
+}
+
+run_systemctl() {
+  if [[ -n $PREFIX ]]; then
+    echo "would run: sudo -n systemctl $*"
+  else
+    sudo -n systemctl "$@"
+  fi
 }
 
 sha_of() {
@@ -198,7 +225,7 @@ require_idle
 for entry in "${SYSTEM_FILES[@]}"; do
   IFS='|' read -r rel _ <<<"$entry"
   if [[ $rel == etc/sudoers.d/* ]]; then
-    sudo -n visudo -cf "$REPO/$rel" >/dev/null || {
+    as_root visudo -cf "$REPO/$rel" >/dev/null || {
       echo "refusing: visudo rejects $rel" >&2
       exit 1
     }
@@ -207,12 +234,12 @@ done
 
 stamp=$(date +%Y%m%d-%H%M%S)
 backup=$BACKUP_ROOT/$stamp
-sudo -n install -d -o root -g root -m 0700 "$backup"
+install_as root root 0700 -d "$backup"
 
 back_up() {
-  if [[ -e "$1" || -L "$1" ]] || sudo -n test -e "$1"; then
-    sudo -n mkdir -p "$backup$(dirname "$1")"
-    sudo -n cp -a "$1" "$backup$1"
+  if [[ -e "$1" || -L "$1" ]] || as_root test -e "$1"; then
+    as_root mkdir -p "$backup$(dirname "$1")"
+    as_root cp -a "$1" "$backup$1"
   fi
 }
 
@@ -221,13 +248,13 @@ broker_changed=0
 for entry in "${changed_system[@]}"; do
   IFS='|' read -r rel target default <<<"$entry"
   if target_exists "$target"; then
-    read -r owner group perm < <(sudo -n stat -c '%U %G %a' "$target")
+    read -r owner group perm < <(as_root stat -c '%U %G %a' "$target")
   else
     IFS=':' read -r owner group perm <<<"$default"
-    sudo -n install -d -o root -g root -m 0755 "$(dirname "$target")"
+    install_as root root 0755 -d "$(dirname "$target")"
   fi
   back_up "$target"
-  sudo -n install -o "$owner" -g "$group" -m "$perm" "$REPO/$rel" "$target"
+  install_as "$owner" "$group" "$perm" "$REPO/$rel" "$target"
   echo "installed $target ($owner:$group $perm)"
   case "$rel" in
     systemd/*) unit_changed=1 ;;
@@ -254,13 +281,13 @@ for entry in "${changed_links[@]}"; do
 done
 
 if [[ $unit_changed -eq 1 ]]; then
-  sudo -n systemctl daemon-reload
+  run_systemctl daemon-reload
   echo "systemd daemon-reload done"
 fi
 if [[ $broker_changed -eq 1 ]]; then
   # The socket stays up; only the service process reloads the new broker.
   require_idle
-  sudo -n systemctl try-restart agent-worker-broker.service
+  run_systemctl try-restart agent-worker-broker.service
   echo "agent-worker-broker.service restarted (socket untouched)"
 fi
 echo "backups in $backup"
