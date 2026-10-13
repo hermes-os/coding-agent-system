@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Validate that the ChatGPT sign-in sync keeps every holder on the newest pair."""
+
+import base64
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parent / "agent-worker-codex-auth-sync"
+loader = importlib.machinery.SourceFileLoader("codex_auth_sync", str(SCRIPT))
+spec = importlib.util.spec_from_loader("codex_auth_sync", loader)
+assert spec is not None
+sync_module = importlib.util.module_from_spec(spec)
+loader.exec_module(sync_module)
+
+ACCOUNT = "acct-shared"
+
+
+def jwt(issued: float, account: str = ACCOUNT) -> str:
+    def part(value: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    claims = {
+        "iat": int(issued),
+        "exp": int(issued) + 10 * 86400,
+        "https://api.openai.com/auth": {"chatgpt_account_id": account},
+    }
+    return f"{part({'alg': 'none'})}.{part(claims)}.sig"
+
+
+def hermes_store(access: str, refresh: str, *, pool_status: str | None = None) -> dict:
+    return {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "id_token": f"id-{refresh}",
+                    "account_id": ACCOUNT,
+                },
+            }
+        },
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": f"entry-{refresh}",
+                    "source": "device_code",
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "last_status": pool_status,
+                    "last_error_reason": "usage_limit_reached" if pool_status else None,
+                }
+            ],
+            "openrouter": [{"id": "or-1", "access_token": "or-key"}],
+        },
+    }
+
+
+def codex_store(access: str, refresh: str) -> dict:
+    return {
+        "OPENAI_API_KEY": None,
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": access,
+            "refresh_token": refresh,
+            "id_token": f"id-{refresh}",
+            "account_id": ACCOUNT,
+        },
+        "last_refresh": "2026-01-01T00:00:00Z",
+    }
+
+
+def write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+
+
+def read(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def configure(root: Path) -> tuple[Path, Path, Path, Path]:
+    primary = root / "home/.hermes/auth.json"
+    worker = root / "worker/.hermes/auth.json"
+    codex = root / "home/.codex/auth.json"
+    worker_codex = root / "worker/.codex/auth.json"
+    sync_module.PRIMARY = primary
+    sync_module.HERMES_STORES = (primary, worker)
+    sync_module.CODEX_STORES = (codex, worker_codex)
+    sync_module.LOCK_TIMEOUT_SECONDS = 30
+    return primary, worker, codex, worker_codex
+
+
+def check_stale_worker_adopts_primary(root: Path) -> None:
+    primary, worker, codex, worker_codex = configure(root)
+    now = time.time()
+    fresh, stale = jwt(now - 3600), jwt(now - 9 * 86400)
+    write(primary, hermes_store(fresh, "rt-fresh"))
+    write(codex, codex_store(fresh, "rt-fresh"))
+    write(worker, hermes_store(stale, "rt-spent", pool_status="exhausted"))
+    write(worker_codex, codex_store(stale, "rt-spent"))
+    primary_before = primary.read_text()
+
+    pair, changed, entry_id = sync_module.sync()
+
+    assert pair["refresh_token"] == "rt-fresh"
+    assert entry_id == "entry-rt-fresh"
+    assert set(changed) == {worker, worker_codex}, changed
+    assert primary.read_text() == primary_before, "sync rewrote the up-to-date primary store"
+    stored = read(worker)
+    tokens = stored["providers"]["openai-codex"]["tokens"]
+    assert tokens["refresh_token"] == "rt-fresh" and tokens["access_token"] == fresh
+    assert tokens["id_token"] == "id-rt-fresh"
+    entry = stored["credential_pool"]["openai-codex"][0]
+    assert entry["refresh_token"] == "rt-fresh"
+    assert entry["last_status"] is None and entry["last_error_reason"] is None
+    assert stored["credential_pool"]["openrouter"] == [{"id": "or-1", "access_token": "or-key"}]
+    cli = read(worker_codex)
+    assert cli["tokens"]["refresh_token"] == "rt-fresh" and "OPENAI_API_KEY" in cli
+    assert cli["last_refresh"] != "2026-01-01T00:00:00Z"
+    assert oct(worker.stat().st_mode & 0o777) == "0o600"
+
+    _, changed_again, _ = sync_module.sync()
+    assert changed_again == [], "a converged sync still rewrote stores"
+
+
+def check_newest_rotation_wins_from_any_holder(root: Path) -> None:
+    primary, worker, codex, worker_codex = configure(root)
+    now = time.time()
+    older, newest = jwt(now - 2 * 86400), jwt(now - 60)
+    write(primary, hermes_store(older, "rt-older"))
+    write(codex, codex_store(older, "rt-older"))
+    write(worker, hermes_store(older, "rt-older"))
+    write(worker_codex, codex_store(newest, "rt-rotated-by-worker-codex"))
+
+    pair, changed, _ = sync_module.sync()
+
+    assert pair["refresh_token"] == "rt-rotated-by-worker-codex"
+    assert set(changed) == {primary, codex, worker}
+    for path in (primary, worker):
+        stored = read(path)
+        assert stored["providers"]["openai-codex"]["tokens"]["refresh_token"] == pair["refresh_token"]
+        assert stored["credential_pool"]["openai-codex"][0]["refresh_token"] == pair["refresh_token"]
+    assert read(codex)["tokens"]["refresh_token"] == pair["refresh_token"]
+
+
+def check_other_account_is_left_alone(root: Path) -> None:
+    primary, worker, codex, worker_codex = configure(root)
+    now = time.time()
+    fresh = jwt(now - 60)
+    foreign = jwt(now, account="acct-other")
+    write(primary, hermes_store(fresh, "rt-fresh"))
+    write(codex, codex_store(foreign, "rt-foreign"))
+    write(worker, hermes_store(jwt(now - 86400), "rt-old"))
+    write(worker_codex, codex_store(jwt(now - 86400), "rt-old"))
+    foreign_before = codex.read_text()
+
+    pair, changed, _ = sync_module.sync()
+
+    assert pair["refresh_token"] == "rt-fresh", "a different account's newer pair won"
+    assert codex not in changed and codex.read_text() == foreign_before
+
+
+def check_waits_for_hermes_lock(root: Path) -> None:
+    primary, worker, codex, worker_codex = configure(root)
+    now = time.time()
+    write(primary, hermes_store(jwt(now - 60), "rt-fresh"))
+    write(codex, codex_store(jwt(now - 60), "rt-fresh"))
+    write(worker, hermes_store(jwt(now - 86400), "rt-old"))
+    write(worker_codex, codex_store(jwt(now - 86400), "rt-old"))
+    before = worker.read_text()
+    lock_path = worker.with_suffix(".lock")
+    lock_path.touch()
+    sync_module.LOCK_TIMEOUT_SECONDS = 0.5
+    with lock_path.open("a+") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        try:
+            sync_module.sync()
+        except SystemExit as exc:
+            assert "timed out waiting" in str(exc)
+        else:
+            raise AssertionError("sync wrote while a Hermes process held the auth lock")
+    assert worker.read_text() == before
+
+
+def check_refresh_timing() -> None:
+    now = time.time()
+    assert not sync_module.refresh_due({"access_token": jwt(now - 4 * 86400)}, now)
+    assert sync_module.refresh_due({"access_token": jwt(now - 5 * 86400 - 60)}, now)
+
+
+def check_missing_primary_sign_in_fails(root: Path) -> None:
+    primary, *_ = configure(root)
+    write(primary, {"version": 1, "providers": {}})
+    try:
+        sync_module.sync()
+    except SystemExit as exc:
+        assert "no ChatGPT sign-in" in str(exc)
+    else:
+        raise AssertionError("sync ran without a primary sign-in")
+
+
+for check in (
+    check_stale_worker_adopts_primary,
+    check_newest_rotation_wins_from_any_holder,
+    check_other_account_is_left_alone,
+    check_waits_for_hermes_lock,
+    check_missing_primary_sign_in_fails,
+):
+    with tempfile.TemporaryDirectory() as temporary:
+        check(Path(temporary))
+check_refresh_timing()
+print("Validated ChatGPT sign-in sync across Hermes and Codex holders.")

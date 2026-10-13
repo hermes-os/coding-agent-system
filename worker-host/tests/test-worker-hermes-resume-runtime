@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Verify Hermes resumes reuse the runtime that owns the session."""
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+import sys
+
+
+workspace = Path(__file__).resolve().parents[1]
+
+
+def load(name: str, path: Path):
+    loader = SourceFileLoader(name, str(path))
+    spec = spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise SystemExit(f"could not load {path.name}")
+    module = module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+broker = load("agent_worker_broker_resume_test", workspace / "scripts" / "agent-worker-broker")
+launcher = load("repo_worker_resume_test", workspace / "scripts" / "repo-worker")
+
+origin = "a654a47d-bf61-455d-abf9-8b36bb949bf5"
+prior_run = "6105be1c-6e87-4975-9d47-39aebc566af0"
+new_run = "de305d54-75b4-431b-adb2-eb6b9e546014"
+session = "20260919_205414_a0ee4b"
+
+prior = {
+    "runId": prior_run,
+    "agent": "hermes",
+    "repo": "/repo",
+    "cwd": "/repo",
+    "access": "write",
+    "mode": "task",
+    "model": "gpt-6-astra",
+    "effort": "xhigh",
+    "provider": "openai-codex",
+    "sessionId": session,
+    "runtimeRunId": origin,
+}
+metadata = {
+    **{key: value for key, value in prior.items() if key != "runtimeRunId"},
+    "runId": new_run,
+    "resumeSession": True,
+    "resumedFrom": prior_run,
+}
+broker.load_trust_record = lambda run_id: prior
+broker.load_run_metadata = lambda run_id: {"status": "completed", "unit": None}
+broker.bind_resume(metadata)
+if metadata.get("runtimeRunId") != origin:
+    raise SystemExit("broker did not preserve the original Hermes runtime across a resume chain")
+
+command = launcher.child_command(
+    metadata,
+    requested_repo=Path("/repo"),
+    output_path=Path("/tmp/unused"),
+)
+runtime_home = command[command.index("--runtime-home") + 1]
+if runtime_home != str(launcher.HERMES_RUNTIME_ROOT / origin):
+    raise SystemExit("launcher did not select the Hermes session owner's runtime")
+
+legacy = dict(prior)
+legacy.pop("runtimeRunId")
+metadata = {
+    **legacy,
+    "runId": new_run,
+    "resumeSession": True,
+    "resumedFrom": prior_run,
+}
+broker.load_trust_record = lambda run_id: legacy
+broker.bind_resume(metadata)
+if metadata.get("runtimeRunId") != prior_run:
+    raise SystemExit("broker did not preserve compatibility with pre-fix Hermes runs")
+
+print("Validated durable Hermes resume runtime selection.")

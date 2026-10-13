@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""Validate broker request boundaries without launching a provider."""
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+if sys.platform == "darwin":
+    adapter = WORKSPACE / "scripts" / "test-worker-broker-policy-macos"
+    os.execv(sys.executable, [sys.executable, str(adapter), *sys.argv[1:]])
+BROKER_PATH = WORKSPACE / "scripts" / "agent-worker-broker"
+loader = SourceFileLoader("agent_worker_broker_test", str(BROKER_PATH))
+spec = spec_from_loader(loader.name, loader)
+if spec is None:
+    raise SystemExit("could not load worker broker")
+broker = module_from_spec(spec)
+loader.exec_module(broker)
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SystemExit(message)
+
+
+def expect_rejected(request: dict[str, object], message: str) -> None:
+    try:
+        broker.validate_launch(request)
+    except broker.RequestError:
+        return
+    raise SystemExit(message)
+
+
+def write_run_metadata(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value))
+    broker.os.chown(path, 0, broker.grp.getgrnam(broker.CALLER_NAME).gr_gid)
+    path.chmod(0o640)
+
+
+with tempfile.TemporaryDirectory() as temporary:
+    test_root = Path(temporary).resolve()
+    broker.REPOSITORY_ROOTS = (test_root,)
+    broker.TRUST_ROOT = test_root / "trust"
+    broker.TRUST_RUNS = broker.TRUST_ROOT / "runs"
+    broker.RUNS_DIR = test_root / "runtime" / "runs"
+    broker.DEFAULTS_PATH = test_root / "defaults.json"
+    broker.DEFAULTS_PATH.write_text(
+        (WORKSPACE / "config" / "agent-worker-defaults.json").read_text()
+    )
+    broker.DEFAULTS_PATH.chmod(0o644)
+    repo = test_root / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/project.git",
+        ],
+        check=True,
+    )
+    run_id = str(uuid.uuid4())
+    request = {
+        "action": "launch",
+        "metadata": {
+            "runId": run_id,
+            "agent": "codex",
+            "repo": str(repo),
+            "cwd": str(repo),
+            "access": "write",
+            "mode": "task",
+            "role": "implementation owner",
+            "model": None,
+            "effort": None,
+            "sessionId": None,
+            "resumedFrom": None,
+            "resumeSession": False,
+        },
+        "packet": "bounded repository task",
+    }
+    metadata, packet = broker.validate_launch(request)
+    require(packet == request["packet"], "broker changed packet content")
+    require(metadata["repo"] == str(repo), "broker changed repository identity")
+    require(
+        metadata["workerRepo"]
+        == str(broker.WORKSPACES_DIR / broker.project_key(repo)),
+        "broker generated an unexpected worker mount",
+    )
+    require(
+        metadata["permissionProfile"] == "bypass",
+        "write request lost its permission profile",
+    )
+    require(
+        metadata["model"] == "gpt-5.6-luna"
+        and metadata["effort"] == "max"
+        and metadata["modelSource"] == "host-policy"
+        and metadata["effortSource"] == "host-policy",
+        "broker did not apply the shared worker model policy",
+    )
+
+    explicit_sol = json.loads(json.dumps(request))
+    explicit_sol["metadata"].update(
+        {"runId": str(uuid.uuid4()), "model": "sol"}
+    )
+    explicit_metadata, _ = broker.validate_launch(explicit_sol)
+    require(
+        explicit_metadata["model"] == "gpt-5.6-sol"
+        and explicit_metadata["effort"] == "medium"
+        and explicit_metadata["modelSource"] == "request",
+        "broker rejected an explicit configured model outside the default order",
+    )
+
+    unknown_model = json.loads(json.dumps(request))
+    unknown_model["metadata"].update(
+        {"runId": str(uuid.uuid4()), "model": "unconfigured-model"}
+    )
+    expect_rejected(unknown_model, "broker accepted an unconfigured worker model")
+
+    def hermes_launch(model: str, effort: str | None = None) -> dict[str, object]:
+        value = json.loads(json.dumps(request))
+        value["metadata"].update(
+            {
+                "runId": str(uuid.uuid4()),
+                "agent": "hermes",
+                "model": model,
+                "effort": effort,
+            }
+        )
+        return value
+
+    for model, provider in (
+        ("gpt-6-luna", "openai-codex"),
+        ("claude-opus-9", "anthropic"),
+        ("z-ai/glm-6", "openrouter"),
+    ):
+        open_metadata, _ = broker.validate_launch(hermes_launch(model))
+        require(
+            open_metadata["model"] == model
+            and open_metadata["provider"] == provider
+            and open_metadata["effort"] == "max"
+            and open_metadata["effortSource"] == "host-policy",
+            f"broker did not route unlisted Hermes model {model} to {provider}",
+        )
+    default_hermes = hermes_launch("placeholder")
+    default_hermes["metadata"]["model"] = None
+    default_metadata, _ = broker.validate_launch(default_hermes)
+    require(
+        default_metadata["model"] == "claude-opus-5.5"
+        and default_metadata["provider"] == "anthropic"
+        and default_metadata["effort"] == "xhigh"
+        and default_metadata["modelSource"] == "host-policy",
+        "broker did not default Hermes workers to Opus 5.5 at xhigh",
+    )
+    listed_metadata, _ = broker.validate_launch(hermes_launch("hermes-astra"))
+    require(
+        listed_metadata["model"] == "gpt-6-astra"
+        and listed_metadata["provider"] == "openai-codex"
+        and listed_metadata["effort"] == "low",
+        "broker stopped applying a listed Hermes model's policy",
+    )
+    expect_rejected(
+        hermes_launch("unconfigured-model"),
+        "broker accepted a Hermes model with no provider route",
+    )
+    expect_rejected(
+        hermes_launch("gpt-6-luna --yolo"),
+        "broker accepted an unsafe Hermes model name",
+    )
+    codex_open = hermes_launch("gpt-6-luna")
+    codex_open["metadata"]["agent"] = "codex"
+    expect_rejected(codex_open, "broker opened unlisted models to the Codex CLI")
+
+    capped_luna = json.loads(json.dumps(request))
+    capped_luna["metadata"].update(
+        {"runId": str(uuid.uuid4()), "model": "luna", "effort": "high"}
+    )
+    expect_rejected(capped_luna, "broker accepted Luna below max effort")
+
+    invalid_agent = json.loads(json.dumps(request))
+    invalid_agent["metadata"]["agent"] = "shell"
+    expect_rejected(invalid_agent, "broker accepted an unsupported provider")
+
+    invalid_access = json.loads(json.dumps(request))
+    invalid_access["metadata"]["access"] = "admin"
+    expect_rejected(invalid_access, "broker accepted an unsupported access mode")
+
+    invalid_run = json.loads(json.dumps(request))
+    invalid_run["metadata"]["runId"] = "../../escape"
+    expect_rejected(invalid_run, "broker accepted an unsafe run ID")
+
+    unsafe_path = test_root / "repo with space"
+    unsafe_path.mkdir()
+    subprocess.run(["git", "init", "-q", str(unsafe_path)], check=True)
+    unsafe_path_request = json.loads(json.dumps(request))
+    unsafe_path_request["metadata"].update(
+        {
+            "runId": str(uuid.uuid4()),
+            "repo": str(unsafe_path),
+            "cwd": str(unsafe_path),
+        }
+    )
+    expect_rejected(
+        unsafe_path_request,
+        "broker accepted a path systemd can reinterpret",
+    )
+
+    direct_repo = test_root / "direct-repository"
+    direct_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(direct_repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(direct_repo),
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:HERMES-OS/CODING-AGENT-SYSTEM.git",
+        ],
+        check=True,
+    )
+    direct_request = json.loads(json.dumps(request))
+    direct_request["metadata"].update(
+        {
+            "runId": str(uuid.uuid4()),
+            "repo": str(direct_repo),
+            "cwd": str(direct_repo),
+        }
+    )
+    expect_rejected(
+        direct_request,
+        "broker accepted a direct control-plane repository",
+    )
+
+    missing_origin_repo = test_root / "missing-origin"
+    missing_origin_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(missing_origin_repo)], check=True)
+    missing_origin_request = json.loads(json.dumps(request))
+    missing_origin_request["metadata"].update(
+        {
+            "runId": str(uuid.uuid4()),
+            "repo": str(missing_origin_repo),
+            "cwd": str(missing_origin_repo),
+        }
+    )
+    expect_rejected(
+        missing_origin_request,
+        "broker accepted a repository without an origin",
+    )
+
+    noncanonical_origin_repo = test_root / "noncanonical-origin"
+    noncanonical_origin_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(noncanonical_origin_repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(noncanonical_origin_repo),
+            "remote",
+            "add",
+            "origin",
+            f"file://{noncanonical_origin_repo}",
+        ],
+        check=True,
+    )
+    noncanonical_origin_request = json.loads(json.dumps(request))
+    noncanonical_origin_request["metadata"].update(
+        {
+            "runId": str(uuid.uuid4()),
+            "repo": str(noncanonical_origin_repo),
+            "cwd": str(noncanonical_origin_repo),
+        }
+    )
+    expect_rejected(
+        noncanonical_origin_request,
+        "broker accepted a noncanonical origin",
+    )
+
+    broker.save_trust_record(metadata)
+    prior_session = str(uuid.uuid4())
+    prior_metadata = dict(metadata)
+    prior_metadata.update(
+        {
+            "status": "completed",
+            "returnCode": 0,
+            "sessionId": prior_session,
+        }
+    )
+    prior_path = broker.RUNS_DIR / run_id / "metadata.json"
+    write_run_metadata(prior_path, prior_metadata)
+
+    resume = json.loads(json.dumps(request))
+    resume["metadata"].update(
+        {
+            "runId": str(uuid.uuid4()),
+            "sessionId": prior_session,
+            "resumedFrom": run_id,
+            "resumeSession": True,
+        }
+    )
+    resumed_metadata, _ = broker.validate_launch(resume)
+    require(
+        resumed_metadata["sessionId"] == prior_session,
+        "broker did not bind a discovered provider session to its prior run",
+    )
+
+    changed_access = json.loads(json.dumps(resume))
+    changed_access["metadata"]["runId"] = str(uuid.uuid4())
+    changed_access["metadata"]["access"] = "read"
+    expect_rejected(changed_access, "broker accepted access escalation on resume")
+
+    changed_model = json.loads(json.dumps(resume))
+    changed_model["metadata"].update(
+        {"runId": str(uuid.uuid4()), "model": "sol", "effort": "high"}
+    )
+    expect_rejected(changed_model, "broker accepted a model change on resume")
+
+    missing_prior = json.loads(json.dumps(resume))
+    missing_prior["metadata"]["runId"] = str(uuid.uuid4())
+    missing_prior["metadata"]["resumedFrom"] = None
+    expect_rejected(missing_prior, "broker accepted an unbound resume session")
+
+
+    broker.save_trust_record(resumed_metadata)
+    resumed_run_id = str(resumed_metadata["runId"])
+    active_path = broker.RUNS_DIR / resumed_run_id / "metadata.json"
+    write_run_metadata(
+        active_path,
+        {
+            "runId": resumed_run_id,
+            "status": "queued",
+            "updatedAt": broker.utc_now(),
+            "unit": "active-session.service",
+            "repo": str(repo),
+            "access": "read",
+        },
+    )
+    original_unit_is_active = broker.unit_is_active
+    broker.unit_is_active = lambda _unit: True
+    competing = dict(resumed_metadata)
+    competing["runId"] = str(uuid.uuid4())
+    try:
+        try:
+            broker.assert_session_available(competing)
+        except broker.RequestError:
+            pass
+        else:
+            raise SystemExit("broker accepted concurrent use of one provider session")
+        try:
+            broker.assert_available(repo, "read")
+        except broker.RequestError:
+            pass
+        else:
+            raise SystemExit("broker accepted a second read run on one repository")
+    finally:
+        broker.unit_is_active = original_unit_is_active
+
+    reused_session = json.loads(json.dumps(request))
+    reused_session["metadata"].update(
+        {
+            "runId": str(uuid.uuid4()),
+            "sessionId": prior_session,
+            "resumedFrom": None,
+            "resumeSession": False,
+        }
+    )
+    expect_rejected(reused_session, "broker accepted a reused session as a new run")
+
+    arbitrary_codex_session = json.loads(json.dumps(request))
+    arbitrary_codex_session["metadata"].update(
+        {
+            "runId": str(uuid.uuid4()),
+            "sessionId": str(uuid.uuid4()),
+        }
+    )
+    expect_rejected(
+        arbitrary_codex_session,
+        "broker accepted a client-selected session for a new Codex run",
+    )
+
+    with tempfile.TemporaryDirectory() as outside_temporary:
+        outside = Path(outside_temporary)
+        subprocess.run(["git", "init", "-q", str(outside)], check=True)
+        outside_request = json.loads(json.dumps(request))
+        outside_request["metadata"].update(
+            {
+                "runId": str(uuid.uuid4()),
+                "repo": str(outside),
+                "cwd": str(outside),
+            }
+        )
+        expect_rejected(outside_request, "broker accepted a repository outside its roots")
+
+original_launch = broker.launch
+active_launches = 0
+maximum_launches = 0
+counter_lock = threading.Lock()
+
+
+def fake_launch(_request: dict[str, object]) -> dict[str, object]:
+    global active_launches, maximum_launches
+    with counter_lock:
+        active_launches += 1
+        maximum_launches = max(maximum_launches, active_launches)
+    time.sleep(0.05)
+    with counter_lock:
+        active_launches -= 1
+    return {}
+
+
+broker.launch = fake_launch
+threads = [
+    threading.Thread(target=broker.handle_request, args=({"action": "launch"},))
+    for _ in range(4)
+]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+broker.launch = original_launch
+require(maximum_launches == 1, "broker launch admission is not serialized")
+
+print("Validated dedicated worker broker request policy.")

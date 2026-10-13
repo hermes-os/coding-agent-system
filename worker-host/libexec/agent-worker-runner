@@ -1,0 +1,2212 @@
+#!/usr/bin/env python3
+"""Launch and supervise a memory-isolated, natively resumable repository worker."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import grp
+import hashlib
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit
+import uuid
+
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+RUNTIME_HOME = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+PRIVATE_PROFILE_ROOT = Path(
+    os.environ.get("AGENT_WORKER_PRIVATE_PROFILE_ROOT", str(WORKSPACE.parent))
+).resolve()
+MANAGED_MACOS = (
+    sys.platform == "darwin"
+    and os.environ.get("AGENT_WORKER_PLATFORM") == "macos"
+)
+REPOSITORY_ROOTS = tuple(
+    Path(value).resolve()
+    for value in os.environ.get(
+        "AGENT_WORKER_REPOSITORY_ROOTS",
+        "/Users/Josh/Projects/hermes-os" if MANAGED_MACOS else "/home/hermes/Projects",
+    ).split(os.pathsep)
+    if value
+)
+WORKER_NAME = "_agentworker" if MANAGED_MACOS else "agent-worker"
+MACOS_WORKER_UID = os.environ.get("AGENT_WORKER_UID", "490")
+MACOS_WORKER_GID = os.environ.get("AGENT_WORKER_GID", "490")
+MACOS_WORKER_GROUPS = os.environ.get("AGENT_WORKER_GROUPS", "490")
+TRUST_RUNS = Path(
+    os.environ.get(
+        "AGENT_WORKER_TRUST_RUNS",
+        (
+            "/var/db/openclaw-agent-worker/trust/runs"
+            if MANAGED_MACOS
+            else "/var/lib/agent-worker/.broker/runs"
+        ),
+    )
+)
+SCRATCH_ROOT = Path(
+    os.environ.get(
+        "AGENT_WORKER_SCRATCH_ROOT",
+        (
+            "/var/db/openclaw-agent-worker/scratch"
+            if MANAGED_MACOS
+            else "/var/lib/agent-worker-scratch"
+        ),
+    )
+)
+KIMI_ADAPTER = Path(
+    os.environ.get(
+        "AGENT_WORKER_KIMI_ADAPTER",
+        str(Path.home() / ".agents" / "bin" / "agent-kimi"),
+    )
+)
+HERMES_ADAPTER = Path(
+    "/usr/local/libexec/agent-worker-hermes/host/bin/agent-hermes-worker"
+)
+HERMES_RUNTIME_ROOT = RUNTIME_HOME / ".hermes-worker"
+WORKER_PYTHON = Path(
+    os.environ.get(
+        "AGENT_WORKER_PYTHON",
+        (
+            "/Library/Developer/CommandLineTools/usr/bin/python3"
+            if MANAGED_MACOS
+            else "/usr/bin/python3"
+        ),
+    )
+)
+MACOS_DROPPER = Path(
+    "/Library/PrivilegedHelperTools/openclaw-agent-worker/dropper"
+)
+MACOS_TEMPLATE_POLICY = MACOS_DROPPER.with_name(
+    "agent-worker-template-policy-macos"
+)
+_MACOS_TEMPLATE_POLICY_MODULE = None
+DEDICATED_RUNTIME_ROOT = Path(
+    "/var/lib/agent-worker/.local/state/agent-workers"
+)
+RUNTIME_ROOT = Path(
+    os.environ.get(
+        "AGENT_WORKER_STATE_DIR",
+        str(DEDICATED_RUNTIME_ROOT),
+    )
+).expanduser()
+EVENT_LOG = RUNTIME_ROOT / "worker-runs.jsonl"
+RUNS_DIR = RUNTIME_ROOT / "runs"
+PROJECTS_DIR = RUNTIME_ROOT / "projects"
+LOCKS_DIR = RUNTIME_ROOT / "locks"
+KIMI_RUNTIME = RUNTIME_HOME / (".kimi-code" if MANAGED_MACOS else ".kimi")
+PROMPT_DIR = Path(
+    os.environ.get(
+        "AGENT_WORKER_PROMPT_DIR",
+        (
+            "/private/var/run/openclaw-agent-worker/prompts"
+            if MANAGED_MACOS
+            else "/run/agent-worker/prompts"
+        ),
+    )
+)
+BROKER_SOCKET = Path("/run/agent-worker/broker.sock")
+WORKER_WORKSPACES = Path(
+    os.environ.get(
+        "AGENT_WORKER_WORKSPACES",
+        (
+            "/var/db/openclaw-agent-worker/workspaces"
+            if MANAGED_MACOS
+            else "/var/lib/agent-worker/workspaces"
+        ),
+    )
+)
+MANAGED_RUNTIME = os.environ.get("AGENT_WORKER_MANAGED") == "1"
+MAX_PACKET_FIELD_CHARS = 20_000
+ACTIVE_STATES = {"starting", "queued", "running"}
+TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted"}
+FINAL_OUTCOME_RE = re.compile(r"^OUTCOME: (COMPLETED|BLOCKED)$")
+BOUNDARY_FIXTURE_RE = re.compile(r"^\.agent-worker-boundary-[0-9a-f]{32}$")
+SESSION_RE = re.compile(
+    r"(?:session id:|To resume this session:\s+kimi\s+-r)\s*"
+    r"([0-9a-fA-F-]{36})",
+    re.IGNORECASE,
+)
+# Both forge identities: the repositories moved to Forgejo but the GitHub
+# mirrors still resolve, and this guard must match either origin.
+DIRECT_REPOSITORIES = {
+    "hermes-os/openclaw-workspace",
+    "hermes-os/coding-agent-system",
+    "hermes/openclaw-workspace",
+    "hermes/coding-agent-system",
+}
+OWNER_DM_WAIT_ERROR = (
+    "repo-worker: refusing --wait in the shared owner BlueBubbles turn; "
+    "launch workers only and let the Maintainer Orchestrator Watch poll them."
+)
+
+
+class WorkerInterrupted(Exception):
+    pass
+
+
+def macos_template_policy():
+    global _MACOS_TEMPLATE_POLICY_MODULE
+    if _MACOS_TEMPLATE_POLICY_MODULE is not None:
+        return _MACOS_TEMPLATE_POLICY_MODULE
+    try:
+        loader = SourceFileLoader(
+            "repo_worker_template_policy_macos",
+            str(MACOS_TEMPLATE_POLICY),
+        )
+        spec = spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise ImportError("template policy has no import specification")
+        module = module_from_spec(spec)
+        loader.exec_module(module)
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("repository template policy is unavailable") from exc
+    _MACOS_TEMPLATE_POLICY_MODULE = module
+    return module
+
+
+def require_macos_repository_templates(metadata: dict[str, object]) -> None:
+    if not MANAGED_MACOS:
+        return
+    policy = macos_template_policy()
+    try:
+        repository = Path(str(metadata["repo"]))
+        policy.require_worker_alias(
+            Path(str(metadata["workerRepo"])),
+            repository,
+        )
+        policy.require_unchanged(
+            repository,
+            metadata.get("repositoryTemplateSnapshot"),
+        )
+    except (KeyError, policy.TemplatePolicyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--agent", choices=("codex", "claude", "kimi", "hermes"))
+    parser.add_argument("--repo", type=Path)
+    parser.add_argument("--role")
+    task = parser.add_mutually_exclusive_group()
+    task.add_argument("--task")
+    task.add_argument("--task-file", type=Path)
+    parser.add_argument("--constraint", action="append", default=[])
+    parser.add_argument("--success", action="append", default=[])
+    parser.add_argument("--access", choices=("read", "write"))
+    parser.add_argument("--mode", choices=("task", "project"), default="task")
+    parser.add_argument("--model")
+    parser.add_argument(
+        "--effort", choices=("low", "medium", "high", "xhigh", "max")
+    )
+    parser.add_argument("--resume-run")
+    parser.add_argument("--foreground", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--active", action="store_true")
+    parser.add_argument("--recent-terminal-seconds", type=int, default=0)
+    parser.add_argument("--terminal-limit", type=int, default=32)
+    parser.add_argument("--status", metavar="RUN_ID")
+    parser.add_argument("--wait", metavar="RUN_ID")
+    parser.add_argument("--output", metavar="RUN_ID")
+    parser.add_argument("--timeout", type=float, default=0)
+    parser.add_argument("--stale-after", type=int, default=300)
+    parser.add_argument("--internal-run", help=argparse.SUPPRESS)
+    parser.add_argument("--packet-file", type=Path, help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def is_shared_owner_cli_session(
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    values = os.environ if environment is None else environment
+    channel = (
+        values.get("OPENCLAW_MCP_MESSAGE_CHANNEL")
+        or values.get("OPENCLAW_MCP_CURRENT_CHANNEL_ID")
+        or ""
+    ).strip().casefold()
+    session_key = values.get("OPENCLAW_MCP_SESSION_KEY", "").strip().casefold()
+    return channel == "bluebubbles" and session_key.startswith(
+        "agent:main:bluebubbles:direct:"
+    )
+
+
+def reject_shared_owner_wait(
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    if is_shared_owner_cli_session(environment):
+        raise SystemExit(OWNER_DM_WAIT_ERROR)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def utc_from_epoch(value: float) -> str:
+    return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value: str) -> float:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def ensure_private_dir(path: Path) -> None:
+    managed_path = MANAGED_RUNTIME and (path == RUNTIME_ROOT or RUNTIME_ROOT in path.parents)
+    mode = 0o750 if managed_path else 0o700
+    path.mkdir(mode=mode, parents=True, exist_ok=True)
+    if managed_path:
+        return
+    os.chmod(path, mode)
+
+
+def atomic_json(path: Path, value: dict[str, object]) -> None:
+    ensure_private_dir(path.parent)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o640 if MANAGED_RUNTIME else 0o600)
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if MANAGED_MACOS:
+            os.chown(
+                temporary,
+                0,
+                int(os.environ["AGENT_WORKER_CALLER_GID"]),
+            )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def seal_trust_session(metadata: dict[str, object], session_id: str) -> None:
+    if not MANAGED_RUNTIME or os.geteuid() != 0:
+        return
+    path = TRUST_RUNS / f"{metadata['runId']}.json"
+    with file_lock(TRUST_RUNS.parent / ".sessions.lock"):
+        try:
+            state = path.lstat()
+            trusted = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("cannot read the broker trust record") from exc
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or state.st_uid != 0
+            or state.st_mode & 0o077
+            or not isinstance(trusted, dict)
+            or trusted.get("runId") != metadata["runId"]
+        ):
+            raise RuntimeError("invalid broker trust record")
+        for field in ("agent", "repo", "cwd", "access", "mode", "origin"):
+            if trusted.get(field) != metadata.get(field):
+                raise RuntimeError(f"broker trust record changed {field}")
+        for other in TRUST_RUNS.glob("*.json"):
+            if other == path:
+                continue
+            try:
+                other_state = other.lstat()
+                reservation = json.loads(other.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "cannot validate provider session reservations"
+                ) from exc
+            if (
+                other.is_symlink()
+                or not other.is_file()
+                or other_state.st_uid != 0
+                or other_state.st_mode & 0o077
+                or not isinstance(reservation, dict)
+            ):
+                raise RuntimeError("invalid provider session reservation")
+            if reservation.get("sessionId") == session_id:
+                raise RuntimeError("provider session is already reserved")
+        existing = trusted.get("sessionId")
+        allowed = {None, session_id}
+        if MANAGED_MACOS and str(metadata.get("agent")) == "kimi":
+            # The Kimi Code CLI names its own sessions; the launch-time
+            # reservation is a placeholder this run may replace.
+            allowed.add(str(metadata.get("sessionId")))
+        if existing not in allowed:
+            raise RuntimeError("provider session conflicts with the broker trust record")
+        if existing == session_id:
+            return
+        trusted["sessionId"] = session_id
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(trusted, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chown(temporary, 0, 0)
+            temporary.chmod(0o600)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def provider_process_command(command: list[str]) -> list[str]:
+    if not MANAGED_RUNTIME:
+        return command
+    if MANAGED_MACOS:
+        return [
+            str(WORKER_PYTHON),
+            str(MACOS_DROPPER),
+            MACOS_WORKER_UID,
+            MACOS_WORKER_GID,
+            MACOS_WORKER_GROUPS,
+            "--",
+            *command,
+        ]
+    return [
+        "/usr/bin/setpriv",
+        f"--reuid={WORKER_NAME}",
+        f"--regid={WORKER_NAME}",
+        "--clear-groups",
+        "--no-new-privs",
+        "--bounding-set=-all",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--",
+        *command,
+    ]
+
+
+def managed_worker_uid() -> int:
+    if MANAGED_MACOS:
+        try:
+            worker_uid = int(MACOS_WORKER_UID)
+        except ValueError as exc:
+            raise SystemExit("repo-worker: invalid managed worker identity") from exc
+        if worker_uid <= 0:
+            raise SystemExit("repo-worker: invalid managed worker identity")
+        return worker_uid
+    return pwd.getpwnam(WORKER_NAME).pw_uid
+
+
+@contextmanager
+def file_lock(path: Path, *, shared: bool = False, blocking: bool = True):
+    ensure_private_dir(path.parent)
+    handle = path.open("a+", encoding="utf-8")
+    os.chmod(path, 0o600)
+    operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    if not blocking:
+        operation |= fcntl.LOCK_NB
+    try:
+        fcntl.flock(handle.fileno(), operation)
+        yield handle
+    finally:
+        handle.close()
+
+
+def append_event(event: dict[str, object]) -> None:
+    ensure_private_dir(RUNTIME_ROOT)
+    lock = LOCKS_DIR / "worker-events.lock"
+    with file_lock(lock):
+        with EVENT_LOG.open("a", encoding="utf-8") as handle:
+            secure_runtime_file(EVENT_LOG)
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def secure_runtime_file(path: Path) -> None:
+    os.chmod(path, 0o640 if MANAGED_RUNTIME else 0o600)
+    if MANAGED_MACOS:
+        os.chown(path, 0, int(os.environ["AGENT_WORKER_CALLER_GID"]))
+
+
+def run_dir(run_id: str) -> Path:
+    return RUNS_DIR / validate_run_id(run_id)
+
+
+def metadata_path(run_id: str) -> Path:
+    return run_dir(run_id) / "metadata.json"
+
+
+def validate_run_id(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise SystemExit(f"repo-worker: invalid run ID: {value}") from exc
+
+
+def load_metadata(run_id: str) -> dict[str, object]:
+    path = metadata_path(run_id)
+    try:
+        state = path.lstat()
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(f"repo-worker: run not found: {run_id}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"repo-worker: invalid run metadata: {path}") from exc
+    if MANAGED_RUNTIME:
+        expected_gid = (
+            int(os.environ["AGENT_WORKER_CALLER_GID"])
+            if MANAGED_MACOS
+            else grp.getgrnam("hermes").gr_gid
+        )
+        if (
+            path.is_symlink()
+            or state.st_uid != 0
+            or state.st_gid != expected_gid
+            or state.st_mode & 0o777 != 0o640
+        ):
+            raise SystemExit(f"repo-worker: unsafe run metadata: {path}")
+    if not isinstance(value, dict) or value.get("runId") != validate_run_id(run_id):
+        raise SystemExit(f"repo-worker: invalid run metadata: {path}")
+    return value
+
+
+def save_metadata(metadata: dict[str, object]) -> None:
+    metadata["updatedAt"] = utc_now()
+    atomic_json(metadata_path(str(metadata["runId"])), metadata)
+
+
+def command_path(name: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        raise SystemExit(f"repo-worker: required executable not found: {name}")
+    return path
+
+
+def broker_request(request: dict[str, object]) -> dict[str, object]:
+    payload = (json.dumps(request, separators=(",", ":")) + "\n").encode()
+    if len(payload) > 256 * 1024:
+        raise SystemExit("repo-worker: broker request exceeds size limit")
+    response = bytearray()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(310)
+            connection.connect(str(BROKER_SOCKET))
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            while True:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if len(response) > 256 * 1024:
+                    raise SystemExit("repo-worker: broker response exceeds size limit")
+    except OSError as exc:
+        raise SystemExit(f"repo-worker: worker broker unavailable: {exc}") from exc
+    try:
+        value = json.loads(response)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("repo-worker: worker broker returned invalid JSON") from exc
+    if not isinstance(value, dict) or value.get("ok") is not True:
+        detail = value.get("error") if isinstance(value, dict) else None
+        raise SystemExit(f"repo-worker: worker broker rejected request: {detail or 'unknown error'}")
+    result = value.get("result")
+    if not isinstance(result, dict):
+        raise SystemExit("repo-worker: worker broker returned an invalid result")
+    return result
+
+
+def self_test() -> int:
+    try:
+        result = broker_request({"action": "probe"})
+        broker_checks = result.get("checks")
+        checks = {"broker": True}
+        if isinstance(broker_checks, dict):
+            checks.update({str(key): bool(value) for key, value in broker_checks.items()})
+        else:
+            checks["brokerProbe"] = False
+    except SystemExit as exc:
+        checks = {"broker": False}
+        result = {"error": str(exc), "runtimeRoot": str(RUNTIME_ROOT)}
+    report = {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "runtimeRoot": result.get("runtimeRoot", str(RUNTIME_ROOT)),
+        "workerUid": result.get("workerUid"),
+    }
+    if "error" in result:
+        report["brokerDetail"] = result["error"]
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
+def required(value: object, name: str) -> None:
+    if value is None:
+        raise SystemExit(f"repo-worker: {name} is required")
+
+
+def bounded_text(value: str, name: str) -> str:
+    text = value.strip()
+    if not text:
+        raise SystemExit(f"repo-worker: {name} must not be empty")
+    if "\x00" in text or len(text) > MAX_PACKET_FIELD_CHARS:
+        raise SystemExit(
+            f"repo-worker: {name} must be at most {MAX_PACKET_FIELD_CHARS} characters"
+        )
+    return text
+
+
+def github_repository(root: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        return None
+    value = result.stdout.strip()
+    scp = re.fullmatch(
+        r"(?:[^@/:]+@)?(?:github\.com|git\.imhermes\.dev|git\.ashwren\.com):([^/?#]+)/([^/?#]+)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if scp:
+        owner, repository = scp.groups()
+    else:
+        parsed = urlsplit(value)
+        if (
+            parsed.hostname is None
+            or parsed.hostname.casefold() not in {"github.com", "git.imhermes.dev", "git.ashwren.com"}
+            or parsed.scheme.casefold() not in {"https", "ssh", "git"}
+            or parsed.query
+            or parsed.fragment
+            or "%" in parsed.path
+        ):
+            return None
+        parts = [item for item in parsed.path.split("/") if item]
+        if len(parts) != 2:
+            return None
+        owner, repository = parts
+    if repository.casefold().endswith(".git"):
+        repository = repository[:-4]
+    return (
+        f"{owner.casefold()}/{repository.casefold()}"
+        if owner and repository
+        else None
+    )
+
+
+def resolve_repo(path: Path) -> tuple[Path, Path]:
+    requested = path.expanduser().resolve()
+    if not requested.is_dir():
+        raise SystemExit(f"repo-worker: repository directory not found: {requested}")
+    if requested == PRIVATE_PROFILE_ROOT or PRIVATE_PROFILE_ROOT in requested.parents:
+        raise SystemExit("repo-worker: refusing to start inside Cal's private profile")
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "safe.directory=*",
+            "-C",
+            str(requested),
+            "rev-parse",
+            "--show-toplevel",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(f"repo-worker: target is not a Git repository: {requested}")
+    root = Path(result.stdout.strip()).resolve()
+    if root == PRIVATE_PROFILE_ROOT or PRIVATE_PROFILE_ROOT in root.parents:
+        raise SystemExit("repo-worker: refusing a Cal-profile-owned Git repository")
+    if not any(allowed == root or allowed in root.parents for allowed in REPOSITORY_ROOTS):
+        raise SystemExit("repo-worker: repository is outside the approved project roots")
+    repository = github_repository(root)
+    if repository is None:
+        raise SystemExit(
+            "repo-worker: repository origin must be a canonical GitHub URL"
+        )
+    if repository in DIRECT_REPOSITORIES:
+        raise SystemExit("repo-worker: direct control-plane repositories cannot be delegated")
+    return requested, root
+
+
+def read_task(args: argparse.Namespace) -> str:
+    if args.task is not None:
+        return bounded_text(args.task, "task")
+    if args.task_file is None:
+        raise SystemExit("repo-worker: --task or --task-file is required")
+    path = args.task_file.expanduser().resolve()
+    if path == PRIVATE_PROFILE_ROOT or PRIVATE_PROFILE_ROOT in path.parents:
+        raise SystemExit("repo-worker: task files must not come from Cal's private profile")
+    try:
+        return bounded_text(path.read_text(encoding="utf-8"), "task file")
+    except OSError as exc:
+        raise SystemExit(f"repo-worker: cannot read task file: {exc}") from exc
+
+
+def task_packet(
+    *,
+    run_id: str,
+    role: str,
+    task: str,
+    requested_repo: Path,
+    repo_root: Path,
+    access: str,
+    mode: str,
+    constraints: list[str],
+    success: list[str],
+) -> str:
+    constraint_lines = constraints or ["Follow the global and repository instructions."]
+    success_lines = success or [
+        "Complete the objective within scope.",
+        "Run the narrowest relevant verification.",
+    ]
+    project_rules = (
+        [
+            "- You are the repository's single execution owner for this project queue.",
+            "- Process assigned work serially and do not create mutation-owning subagents or coding-agent sessions.",
+        ]
+        if mode == "project"
+        else ["- Do not delegate this deliverable to another coding-agent CLI."]
+    )
+    permission_rule = (
+        "- Write access uses provider permission bypass; that removes prompts, not task or repository scope."
+        if access == "write"
+        else "- Read access disables provider bypass and repository writes are denied by the host boundary."
+    )
+    return "\n".join(
+        [
+            "# Repository Worker Task",
+            "",
+            f"Run ID: {run_id}",
+            f"Role: {role}",
+            f"Access: {access}",
+            f"Session mode: {mode}",
+            f"Working directory: {requested_repo}",
+            f"Git root: {repo_root}",
+            "",
+            "## Objective",
+            "",
+            task,
+            "",
+            "## Constraints",
+            "",
+            *(f"- {item}" for item in constraint_lines),
+            "- Work only on this objective and repository.",
+            "- Read the global and repository instructions, then inspect current evidence.",
+            "- Do not read, inspect, mention, or invoke /home/hermes/.hermes/profiles/cal.",
+            "- Do not seek personal-assistant memory or Cal's private context.",
+            "- Do not send messages, publish content, or perform unrelated external actions.",
+            "- Preserve changes you did not make.",
+            permission_rule,
+            *project_rules,
+            "",
+            "## Success Criteria",
+            "",
+            *(f"- {item}" for item in success_lines),
+            "",
+            "## Final Response",
+            "",
+            "The first nonblank line must be exactly one of:",
+            "OUTCOME: COMPLETED",
+            "OUTCOME: BLOCKED",
+            "Use COMPLETED only when every stated success criterion is actually met.",
+            "Use BLOCKED when a required tool, proof surface, decision, or other hard",
+            "gate remains unavailable. Then name the exact blocker and the safest resume",
+            "point. After that marker, report changed or reviewed files, checks and results,",
+            "and any remaining risk. Do not include personal context.",
+            "",
+        ]
+    )
+
+
+def reported_outcome(final_text: str | None) -> str | None:
+    """Return the worker's explicit terminal declaration, if it is valid.
+
+    Provider CLIs normally exit zero when an agent gives a prose answer, even
+    when that answer says a required verification could not run.  Keep the
+    declaration deliberately narrow: a missing or embellished marker is not a
+    successful result and must be reconciled by the orchestrator.
+    """
+    if not isinstance(final_text, str):
+        return None
+    for line in final_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = FINAL_OUTCOME_RE.fullmatch(stripped)
+        return match.group(1).lower() if match else None
+    return None
+
+
+def terminal_result(
+    *,
+    return_code: int,
+    interrupted: bool,
+    final_text: str | None,
+) -> tuple[str, str, str | None]:
+    """Map provider completion into a trustworthy worker lifecycle result."""
+    if interrupted:
+        return "interrupted", "interrupted", None
+    if return_code != 0:
+        return "failed", "failed", None
+    outcome = reported_outcome(final_text)
+    if outcome == "completed":
+        return "completed", outcome, None
+    if outcome == "blocked":
+        return "blocked", outcome, "worker reported an unmet hard gate"
+    return (
+        "blocked",
+        "unverified",
+        "worker exited without a machine-readable terminal outcome",
+    )
+
+
+def project_key(repo_root: Path) -> str:
+    return hashlib.sha256(str(repo_root).encode()).hexdigest()
+
+
+def worker_paths(requested_repo: Path, repo_root: Path) -> tuple[Path, Path]:
+    worker_root = WORKER_WORKSPACES / project_key(repo_root)
+    return worker_root / requested_repo.relative_to(repo_root), worker_root
+
+
+def project_path(repo_root: Path) -> Path:
+    return PROJECTS_DIR / f"{project_key(repo_root)}.json"
+
+
+def load_project(repo_root: Path) -> dict[str, object] | None:
+    path = project_path(repo_root)
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"repo-worker: invalid project session metadata: {path}") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("repo") != str(repo_root)
+        or not isinstance(value.get("sessionId"), str)
+    ):
+        raise SystemExit(f"repo-worker: invalid project session metadata: {path}")
+    return value
+
+
+def save_project(metadata: dict[str, object]) -> None:
+    if metadata.get("mode") != "project" or not metadata.get("sessionId"):
+        return
+    repo = Path(str(metadata["repo"]))
+    value = {
+        "schemaVersion": 1,
+        "repo": str(repo),
+        "agent": metadata["agent"],
+        "sessionId": metadata["sessionId"],
+        "lastRunId": metadata["runId"],
+        "updatedAt": utc_now(),
+    }
+    atomic_json(project_path(repo), value)
+
+
+def unit_state(unit: object) -> dict[str, object]:
+    if not isinstance(unit, str) or not unit:
+        return {"activeState": None, "subState": None, "mainPid": None}
+    result = subprocess.run(
+        [
+            "systemctl",
+            "show",
+            unit,
+            "--property",
+            "LoadState",
+            "--property",
+            "ActiveState",
+            "--property",
+            "SubState",
+            "--property",
+            "MainPID",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        return {"activeState": "inactive", "subState": "not-found", "mainPid": None}
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key] = value
+    try:
+        main_pid = int(properties.get("MainPID", "")) or None
+    except ValueError:
+        main_pid = None
+    return {
+        "loadState": properties.get("LoadState") or None,
+        "activeState": properties.get("ActiveState") or None,
+        "subState": properties.get("SubState") or None,
+        "mainPid": main_pid,
+    }
+
+
+def run_is_active(metadata: dict[str, object]) -> bool:
+    if metadata.get("status") not in ACTIVE_STATES:
+        return False
+    state = unit_state(metadata.get("unit"))
+    if state.get("activeState") in {"active", "activating", "reloading"}:
+        return True
+    supervisor_pid = metadata.get("supervisorPid")
+    if not metadata.get("unit") and isinstance(supervisor_pid, int):
+        try:
+            os.kill(supervisor_pid, 0)
+            return True
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return True
+    try:
+        age = time.time() - parse_time(str(metadata["updatedAt"]))
+    except (KeyError, ValueError):
+        age = 60
+    return age < 15
+
+
+def all_runs() -> list[dict[str, object]]:
+    if not RUNS_DIR.is_dir():
+        return []
+    runs: list[dict[str, object]] = []
+    for path in RUNS_DIR.glob("*/metadata.json"):
+        try:
+            value = load_metadata(path.parent.name)
+        except SystemExit:
+            continue
+        runs.append(value)
+    return sorted(runs, key=lambda item: str(item.get("createdAt", "")), reverse=True)
+
+
+def assert_available(repo_root: Path, _access: str) -> None:
+    for existing in all_runs():
+        if existing.get("repo") != str(repo_root) or not run_is_active(existing):
+            continue
+        raise SystemExit(
+            "repo-worker: repository already has an active run: "
+            f"{repo_root} ({existing.get('runId')})"
+        )
+
+
+FAILURE_DETAIL_SCAN_BYTES = 65536
+
+# Provider availability, not task failure: a launch that dies because the
+# provider is dry relaunches on the next configured agent. Task failures
+# never match — a wrong answer on one provider is not fixed by another.
+LAUNCH_GRACE_SECONDS = 60
+LAUNCH_POLL_SECONDS = 3
+AVAILABILITY_CLASSES = (
+    (
+        "usage-limit",
+        re.compile(
+            r"usage limit|out of credits|purchase more credits|credit balance"
+            r"|quota (?:exceeded|exhausted)|billing",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "rate-limit",
+        re.compile(r"rate limit|\b429\b|overloaded", re.IGNORECASE),
+    ),
+    (
+        "auth",
+        re.compile(
+            r"failed to authenticate|oauth|\b401\b|unauthorized"
+            r"|invalid api key|(?:session|token) expired"
+            r"|organization has disabled claude subscription access",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def availability_class(detail: str | None) -> str | None:
+    if not detail:
+        return None
+    for name, pattern in AVAILABILITY_CLASSES:
+        if pattern.search(detail):
+            return name
+    return None
+
+
+def model_policy() -> dict[str, object]:
+    if MANAGED_RUNTIME:
+        path = Path(
+            "/var/db/openclaw-agent-worker/config/defaults.json"
+            if MANAGED_MACOS
+            else "/etc/agent-worker/defaults.json"
+        )
+    else:
+        path = WORKSPACE / "config/agent-worker-defaults.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("repo-worker: model policy is unavailable") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schemaVersion") != 2
+        or value.get("thinkingDefault") != "max"
+        or not isinstance(value.get("order"), list)
+        or not isinstance(value.get("models"), dict)
+    ):
+        raise SystemExit("repo-worker: model policy is invalid")
+    worker_default = value.get("workerDefault")
+    if worker_default is not None and (
+        not isinstance(worker_default, str)
+        or worker_default not in value["models"]
+    ):
+        raise SystemExit("repo-worker: worker default is invalid")
+    return value
+
+
+def fallback_agent_order() -> tuple[str, ...]:
+    policy = model_policy()
+    providers = []
+    for alias in policy["order"]:
+        raw = policy["models"].get(alias)
+        worker = raw.get("worker") if isinstance(raw, dict) else None
+        provider = worker.get("agent") if isinstance(worker, dict) else None
+        if provider not in {"codex", "claude", "kimi", "hermes"}:
+            raise SystemExit("repo-worker: model policy order is invalid")
+        if provider not in providers:
+            providers.append(provider)
+    if not {"codex", "claude", "kimi"}.issubset(providers):
+        raise SystemExit("repo-worker: model policy omits a worker provider")
+    return tuple(providers)
+
+
+def resolve_worker_selection(
+    agent: str | None,
+    model: object,
+    effort: object,
+) -> tuple[str, str, str]:
+    policy = model_policy()
+    entries = []
+    for alias, raw in policy["models"].items():
+        worker = raw.get("worker") if isinstance(raw, dict) else None
+        if not isinstance(worker, dict):
+            raise SystemExit("repo-worker: model policy entry is invalid")
+        entries.append((alias, worker))
+    default_alias = policy.get("workerDefault", policy["order"][0])
+    if not isinstance(default_alias, str):
+        raise SystemExit("repo-worker: worker default is invalid")
+    default_worker = policy["models"].get(default_alias)
+    if not isinstance(default_worker, dict):
+        raise SystemExit("repo-worker: worker default is invalid")
+    default_worker = default_worker.get("worker")
+    if not isinstance(default_worker, dict):
+        raise SystemExit("repo-worker: worker default is invalid")
+    selected = None
+    if isinstance(model, str):
+        matches = [
+            (alias, worker)
+            for alias, worker in entries
+            if model in {alias, worker.get("model")}
+        ]
+        if agent is not None:
+            # Several aliases may share one provider model id (e.g. a claude-cli
+            # alias and a hermes-runtime alias); the requested agent breaks the tie.
+            preferred = [item for item in matches if item[1].get("agent") == agent]
+            if preferred:
+                matches = preferred
+        selected = matches[0] if matches else None
+        # Unlisted models run on the Hermes runtime; the broker routes them to
+        # ChatGPT, Anthropic, or OpenRouter and rejects anything else.
+        if (selected is None and agent in {None, "hermes"}) or (
+            agent == "hermes" and selected is not None and selected[1].get("agent") != agent
+        ):
+            return "hermes", model, str(effort or policy["thinkingDefault"])
+        if selected is None:
+            raise SystemExit(f"repo-worker: model is not configured: {model}")
+        if agent is not None and selected[1].get("agent") != agent:
+            raise SystemExit("repo-worker: --agent does not provide --model")
+    else:
+        if agent is None:
+            selected = next(item for item in entries if item[0] == default_alias)
+        elif default_worker.get("agent") == agent:
+            selected = (default_alias, default_worker)
+        else:
+            selected = next(
+                (
+                    (alias, policy["models"][alias]["worker"])
+                    for alias in policy["order"]
+                    if policy["models"][alias]["worker"].get("agent") == agent
+                ),
+                None,
+            )
+            if selected is None:
+                raise SystemExit(f"repo-worker: no configured model for {agent}")
+    alias, worker = selected
+    resolved_agent = str(worker["agent"])
+    resolved_model = str(worker["model"])
+    resolved_effort = str(effort or worker["effort"])
+    return resolved_agent, resolved_model, resolved_effort
+
+
+def apply_launch_fallback(args, summary, *, submit, read_status):
+    """Relaunch an unassigned availability-killed task on the next agent.
+
+    Watches the fresh run for LAUNCH_GRACE_SECONDS; a terminal failure whose
+    detail matches an availability class relaunches the same packet once per
+    remaining provider in the shared model order, recording each substitution in
+    fallbackFrom. The privileged broker is unchanged — the retry is entirely
+    caller-side."""
+    if args.agent == "hermes" or args.model is not None:
+        return summary
+    tried = [str(summary.get("agent"))]
+    events: list[dict[str, object]] = []
+    current = summary
+    while True:
+        run_id = str(current.get("runId"))
+        deadline = time.monotonic() + LAUNCH_GRACE_SECONDS
+        payload: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            payload = read_status(run_id)
+            if str(payload.get("status")) in TERMINAL_STATES:
+                break
+            time.sleep(LAUNCH_POLL_SECONDS)
+        if payload is None or str(payload.get("status")) not in TERMINAL_STATES:
+            if events:
+                current = dict(current)
+                current["fallbackFrom"] = events
+            return current
+        if str(payload.get("status")) != "failed":
+            if events:
+                payload["fallbackFrom"] = events
+            return payload
+    # a failed run: availability decides whether another agent gets the packet
+        detail = payload.get("failureDetail")
+        detail_text = str(detail) if isinstance(detail, str) else None
+        matched = availability_class(detail_text)
+        if matched is None:
+            if events:
+                payload["fallbackFrom"] = events
+            return payload
+        # Availability cannot override an explicit assignment or native session.
+        if args.model is not None or args.resume_run is not None or summary.get("resumeSession"):
+            return payload
+        events.append(
+            {
+                "agent": tried[-1],
+                "runId": run_id,
+                "class": matched,
+                "detail": (detail_text or "")[:200],
+            }
+        )
+        replacement = next(
+            (name for name in fallback_agent_order() if name not in tried),
+            None,
+        )
+        if replacement is None:
+            payload["fallbackFrom"] = events
+            payload["fallbackExhausted"] = True
+            return payload
+        tried.append(replacement)
+        next_args = argparse.Namespace(**vars(args))
+        next_args.agent = replacement
+        # Availability failures are provider-wide. A model selected for the
+        # failed provider must not leak into the replacement provider; its
+        # first route in the shared order becomes the replacement default.
+        next_args.model = None
+        next_args.effort = None
+        next_args.resume_run = None
+        try:
+            current = submit(next_args)
+        except SystemExit as exc:
+            if next_args.mode == "project" and "project session" in str(exc):
+                # The project session is pinned to the dry agent; the
+                # substitute runs the same packet as a bounded task instead
+                # of rebinding the repository's durable session.
+                next_args.mode = "task"
+                if next_args.access is None:
+                    next_args.access = str(payload.get("access") or "read")
+                current = submit(next_args)
+            else:
+                events.append(
+                    {
+                        "agent": replacement,
+                        "runId": None,
+                        "class": "launch-rejected",
+                        "detail": str(exc)[:200],
+                    }
+                )
+                replacement = next(
+                    (n for n in fallback_agent_order() if n not in tried),
+                    None,
+                )
+                if replacement is None:
+                    raise
+                tried.append(replacement)
+                next_args.agent = replacement
+                current = submit(next_args)
+
+
+def failure_detail(log_path: Path) -> str | None:
+    """Surface the provider's terminal error.
+
+    A worker that dies before producing output reports why only inside its
+    stream log; without this, a run killed by something as mundane as an
+    exhausted provider quota fails with no visible reason.
+    """
+    try:
+        size = log_path.stat().st_size
+        with log_path.open("rb") as handle:
+            handle.seek(max(0, size - FAILURE_DETAIL_SCAN_BYTES))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    fallback: str | None = None
+    error_message: str | None = None
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fallback = stripped
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "error" and isinstance(event.get("message"), str):
+            error_message = event["message"]
+        elif event.get("event") == "error" and isinstance(event.get("message"), str):
+            error_message = event["message"]
+        elif event.get("is_error") is True and isinstance(event.get("result"), str):
+            error_message = event["result"]
+    chosen = error_message or fallback
+    return chosen[:500] if chosen else None
+
+
+def status_payload(metadata: dict[str, object], stale_after: int) -> dict[str, object]:
+    payload = dict(metadata)
+    log = Path(str(metadata.get("logPath", "")))
+    activity_at: str | None = None
+    activity_age: int | None = None
+    if log.is_file():
+        modified = log.stat().st_mtime
+        activity_at = utc_from_epoch(modified)
+        activity_age = max(0, int(time.time() - modified))
+    payload["activityAt"] = activity_at
+    payload["activityAgeSeconds"] = activity_age
+    payload["stale"] = (
+        metadata.get("status") in ACTIVE_STATES
+        and activity_age is not None
+        and activity_age > stale_after
+    )
+    service = unit_state(metadata.get("unit"))
+    payload["service"] = service
+    try:
+        metadata_age = time.time() - parse_time(str(metadata["updatedAt"]))
+    except (KeyError, ValueError):
+        metadata_age = 60
+    payload["orphaned"] = (
+        metadata.get("status") in ACTIVE_STATES
+        and service.get("activeState") not in {"active", "activating", "reloading"}
+        and metadata_age >= 15
+    )
+    payload["active"] = run_is_active(metadata)
+    if metadata.get("status") == "failed":
+        detail = failure_detail(log)
+        if detail:
+            payload["failureDetail"] = detail
+    return payload
+
+
+def terminal_timestamp(value: dict[str, object]) -> float | None:
+    raw = value.get("completedAt") or value.get("updatedAt")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return parse_time(raw)
+    except ValueError:
+        return None
+
+
+def list_status(
+    *,
+    active_only: bool,
+    stale_after: int,
+    recent_terminal_seconds: int,
+    terminal_limit: int,
+) -> int:
+    statuses = [
+        status_payload(metadata, stale_after)
+        for metadata in all_runs()
+    ]
+    if not active_only:
+        values = statuses
+    else:
+        active = [value for value in statuses if value["active"]]
+        recent: list[tuple[float, dict[str, object]]] = []
+        if recent_terminal_seconds:
+            cutoff = time.time() - recent_terminal_seconds
+            for value in statuses:
+                timestamp = terminal_timestamp(value)
+                if (
+                    not value["active"]
+                    and value.get("status") in TERMINAL_STATES
+                    and timestamp is not None
+                    and timestamp >= cutoff
+                ):
+                    recent.append((timestamp, value))
+        recent.sort(key=lambda item: item[0], reverse=True)
+        values = active + [value for _, value in recent[:terminal_limit]]
+    print(json.dumps(values, indent=2, sort_keys=True))
+    return 0
+
+
+def show_status(run_id: str, stale_after: int) -> int:
+    print(json.dumps(status_payload(load_metadata(run_id), stale_after), indent=2, sort_keys=True))
+    return 0
+
+
+def wait_for_run(run_id: str, timeout: float, stale_after: int) -> int:
+    reject_shared_owner_wait()
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+    while True:
+        metadata = load_metadata(run_id)
+        if metadata.get("status") in TERMINAL_STATES:
+            print(json.dumps(status_payload(metadata, stale_after), indent=2, sort_keys=True))
+            return 0 if metadata.get("status") == "completed" else int(
+                metadata.get("returnCode") or 1
+            )
+        payload = status_payload(metadata, stale_after)
+        if payload["orphaned"]:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 125
+        if deadline is not None and time.monotonic() >= deadline:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 124
+        time.sleep(2)
+
+
+def show_output(run_id: str) -> int:
+    load_metadata(run_id)
+    path = run_dir(run_id) / "final.txt"
+    if not path.is_file():
+        raise SystemExit(f"repo-worker: final output is not available for run {run_id}")
+    sys.stdout.write(path.read_text(encoding="utf-8"))
+    if path.stat().st_size and not path.read_bytes().endswith(b"\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def prepare_kimi_runtime() -> None:
+    if MANAGED_RUNTIME:
+        if not KIMI_RUNTIME.is_dir():
+            raise SystemExit(
+                f"repo-worker: managed Kimi runtime is missing: {KIMI_RUNTIME}"
+            )
+        for name in ("config.toml", "device_id"):
+            path = KIMI_RUNTIME / name
+            if not path.is_file() or not os.access(path, os.R_OK):
+                raise SystemExit(f"repo-worker: managed Kimi runtime is incomplete: {path}")
+        return
+    ensure_private_dir(KIMI_RUNTIME)
+    source_root = Path.home() / ".kimi"
+    for name in ("credentials", "device_id"):
+        source = source_root / name
+        target = KIMI_RUNTIME / name
+        if not source.exists():
+            continue
+        if target.is_symlink() and target.resolve(strict=False) == source.resolve(strict=False):
+            continue
+        if target.exists() or target.is_symlink():
+            raise SystemExit(f"repo-worker: refusing to replace Kimi runtime path: {target}")
+        target.symlink_to(source)
+
+
+def permission_profile(access: str) -> str:
+    if access == "write":
+        return "bypass"
+    if access == "read":
+        return "read-only"
+    raise SystemExit(f"repo-worker: unsupported access mode: {access}")
+
+
+def provider_permission_arguments(agent: str, access: str) -> list[str]:
+    profile = permission_profile(access)
+    if agent == "codex":
+        if profile == "bypass":
+            return [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+            ]
+        return [
+            "--sandbox",
+            "danger-full-access",
+            "-c",
+            'approval_policy="never"',
+        ]
+    if agent == "claude":
+        if profile == "bypass":
+            return ["--permission-mode", "bypassPermissions"]
+        # dontAsk without an allowlist auto-denies every tool in headless
+        # mode; read lanes still need to inspect files and run the gate. The
+        # filesystem stays read-only through the Seatbelt profile and the
+        # read-only remount, never through provider prompts.
+        return [
+            "--permission-mode",
+            "dontAsk",
+            "--allowed-tools",
+            "Bash,Read,Grep,Glob,TodoWrite",
+        ]
+    if agent == "kimi":
+        return []
+    if agent == "hermes":
+        return []
+    raise SystemExit(f"repo-worker: unsupported agent: {agent}")
+
+
+def codex_execution_cwd(
+    metadata: dict[str, object], requested_repo: Path
+) -> Path:
+    """Resolve a managed macOS worker alias for Codex without widening access."""
+    if not MANAGED_MACOS:
+        return requested_repo
+    # Codex resolves its working directory before starting the turn. The
+    # root-created worker alias is intentionally protected, but that
+    # resolution currently fails with EACCES on macOS. The physical worktree
+    # is already independently allowlisted by the Seatbelt profile. Preserve
+    # a requested subdirectory and reject any alias escape.
+    worker_root = Path(str(metadata["workerRepo"]))
+    physical_root = Path(str(metadata["repo"]))
+    try:
+        relative_cwd = requested_repo.relative_to(worker_root)
+    except ValueError as exc:
+        raise SystemExit(
+            "repo-worker: managed Codex working directory is outside its alias"
+        ) from exc
+    if ".." in relative_cwd.parts:
+        raise SystemExit(
+            "repo-worker: managed Codex working directory escapes its alias"
+        )
+    return physical_root / relative_cwd
+
+
+def child_command(
+    metadata: dict[str, object],
+    *,
+    requested_repo: Path,
+    output_path: Path,
+) -> list[str]:
+    agent = str(metadata["agent"])
+    access = str(metadata["access"])
+    model = metadata.get("model")
+    effort = metadata.get("effort")
+    session_id = metadata.get("sessionId")
+    if agent == "hermes":
+        runtime_home = HERMES_RUNTIME_ROOT / str(
+            metadata.get("runtimeRunId", metadata["runId"])
+        )
+        session_args = (
+            ["--resume-session", str(session_id)]
+            if metadata.get("resumeSession")
+            else ["--fresh-session"]
+        )
+        return [
+            str(HERMES_ADAPTER),
+            "--provider",
+            str(metadata["provider"]),
+            "--model",
+            str(model),
+            "--effort",
+            str(effort),
+            "--access",
+            access,
+            "--runtime-home",
+            str(runtime_home),
+            "--broker-session-id",
+            str(metadata.get("runtimeRunId", metadata["runId"])),
+            *session_args,
+        ]
+    if agent == "codex":
+        codex_cwd = codex_execution_cwd(metadata, requested_repo)
+        permissions = provider_permission_arguments(agent, access)
+        if session_id:
+            if access == "read":
+                permissions = [
+                    "-c",
+                    'sandbox_mode="danger-full-access"',
+                    "-c",
+                    'approval_policy="never"',
+                ]
+            command = [
+                command_path("codex"),
+                "exec",
+                "resume",
+                str(session_id),
+                *permissions,
+                "--json",
+            ]
+        else:
+            command = [
+                command_path("codex"),
+                "exec",
+                *permissions,
+                "--json",
+                "-C",
+                str(codex_cwd),
+            ]
+        if model:
+            command.extend(["--model", str(model)])
+        if effort:
+            command.extend(["-c", f'model_reasoning_effort="{effort}"'])
+        command.append("-")
+        return command
+    if agent == "claude":
+        command = [
+            command_path("claude"),
+            "--print",
+            *provider_permission_arguments(agent, access),
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+        if metadata.get("resumeSession"):
+            command.extend(["--resume", str(session_id)])
+        else:
+            command.extend(["--session-id", str(session_id)])
+        if model:
+            command.extend(["--model", str(model)])
+        if effort:
+            command.extend(["--effort", str(effort)])
+        return command
+    prepare_kimi_runtime()
+    if MANAGED_MACOS and not KIMI_ADAPTER.is_file():
+        raise SystemExit(
+            "repo-worker: managed Kimi requires the agent-kimi prompt "
+            "transport adapter"
+        )
+    if MANAGED_MACOS:
+        # The vendored Kimi Code CLI (v2 engine) takes prompts only on
+        # argv. The packet stays in a worker-private scratch file and argv
+        # carries only this generic pointer.
+        task_file = kimi_task_file(str(metadata["runId"]))
+        command = [
+            str(KIMI_ADAPTER),
+            "-p",
+            (
+                "Read the file "
+                + str(task_file)
+                + " and execute the work order it contains."
+            ),
+            "--output-format",
+            "stream-json",
+        ]
+        if metadata.get("resumeSession"):
+            command.extend(["-S", str(session_id)])
+        # Prompt mode is already non-interactive, so the v2 CLI refuses
+        # --yolo and --auto alongside it. Access is enforced by the Seatbelt
+        # profile and the read-only remount, never by a provider flag.
+        if model:
+            command.extend(["-m", str(model)])
+        return command
+    kimi_work_dir = requested_repo
+    if access == "read":
+        if MANAGED_RUNTIME:
+            kimi_work_dir = SCRATCH_ROOT / str(metadata["sessionId"])
+            worker_uid = managed_worker_uid()
+            try:
+                state = kimi_work_dir.stat()
+            except OSError as exc:
+                raise SystemExit(
+                    f"repo-worker: managed Kimi scratch is missing: {kimi_work_dir}"
+                ) from exc
+            if (
+                not kimi_work_dir.is_dir()
+                or state.st_uid != worker_uid
+                or state.st_mode & 0o077
+            ):
+                raise SystemExit(
+                    f"repo-worker: managed Kimi scratch is unsafe: {kimi_work_dir}"
+                )
+        else:
+            kimi_work_dir = (
+                RUNTIME_ROOT / "scratch/kimi" / str(metadata["sessionId"])
+            )
+            ensure_private_dir(kimi_work_dir)
+    command = [
+        str(KIMI_ADAPTER),
+        "--work-dir",
+        str(kimi_work_dir),
+        "--session",
+        str(session_id),
+        "--print",
+        "--input-format",
+        "text",
+        "--output-format",
+        "stream-json",
+    ]
+    if MANAGED_MACOS and access == "write":
+        command.append("--yolo")
+    if kimi_work_dir != requested_repo:
+        command.extend(["--add-dir", str(requested_repo)])
+    if model:
+        command.extend(["--model", str(model)])
+    if effort in {"medium", "high", "xhigh"}:
+        command.append("--thinking")
+    elif effort == "low":
+        command.append("--no-thinking")
+    return command
+
+
+def sanitized_environment(agent: str, access: str) -> dict[str, str]:
+    permission_profile(access)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("OPENCLAW_")
+        and key
+        not in {
+            "KIMI_API_KEY",
+            "KIMI_PLUGIN_API_KEY",
+            "KIMI_CODE_API_KEY",
+        }
+    }
+    environment["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["AGENT_ACCESS_MODE"] = access
+    if MANAGED_MACOS:
+        environment["AGENT_WORKER_PRIVATE_PROBE"] = os.environ[
+            "AGENT_WORKER_PRIVATE_PROBE"
+        ]
+    if MANAGED_RUNTIME:
+        environment["XDG_STATE_HOME"] = str(
+            RUNTIME_HOME / (".local/state" if MANAGED_MACOS else ".state")
+        )
+    if agent == "claude":
+        environment["IS_SANDBOX"] = "1"
+    if agent == "kimi":
+        environment["KIMI_SHARE_DIR"] = str(KIMI_RUNTIME)
+        if MANAGED_MACOS:
+            environment["AGENT_KIMI_ENGINE"] = "v2"
+    return environment
+
+
+def kimi_task_file(run_id: str) -> Path:
+    return Path(
+        os.environ.get("TMPDIR", "/tmp")
+    ) / f"kimi-task-{run_id}.prompt"
+
+
+def parse_stream_line(
+    agent: str,
+    line: str,
+    final_parts: list[str],
+) -> tuple[str | None, str | None]:
+    session_id: str | None = None
+    final_text: str | None = None
+    if agent == "kimi":
+        match = SESSION_RE.search(line)
+        if match:
+            session_id = match.group(1)
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return session_id, final_text
+    if not isinstance(value, dict):
+        return session_id, final_text
+    candidate = (
+        value.get("session_id")
+        or value.get("thread_id")
+        or value.get("native_session_id")
+    )
+    if isinstance(candidate, str):
+        session_id = candidate
+    if agent == "hermes":
+        if value.get("event") == "final" and isinstance(value.get("result"), str):
+            final_text = value["result"]
+    elif agent == "codex":
+        item = value.get("item")
+        if (
+            value.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+        ):
+            final_text = item["text"]
+    elif agent == "claude":
+        if value.get("type") == "result" and isinstance(value.get("result"), str):
+            final_text = value["result"]
+    else:
+        content = value.get("content")
+        if value.get("role") == "assistant" and isinstance(content, list):
+            texts = [
+                item["text"]
+                for item in content
+                if isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ]
+            if texts:
+                final_text = "\n".join(texts)
+        # Kimi emits a plain string for a text-only answer; without this the
+        # final answer is never captured and every run reports no output.
+        elif value.get("role") == "assistant" and isinstance(content, str):
+            final_text = content
+    if final_text:
+        final_parts[:] = [final_text]
+    return session_id, final_text
+
+
+def update_session(metadata: dict[str, object], session_id: str) -> None:
+    if metadata.get("sessionId") == session_id:
+        return
+    seal_trust_session(metadata, session_id)
+    metadata["sessionId"] = session_id
+    save_metadata(metadata)
+    save_project(metadata)
+
+
+def macos_boundary_exercise_command(
+    metadata: dict[str, object],
+    requested_repo: Path,
+) -> list[str]:
+    """Return the fixed worker-side live proof for a broker-created fixture."""
+    raw = metadata.get("boundaryExercise")
+    if (
+        not MANAGED_MACOS
+        or not isinstance(raw, dict)
+        or set(raw) != {"fixture"}
+        or not isinstance(raw.get("fixture"), str)
+        or BOUNDARY_FIXTURE_RE.fullmatch(str(raw["fixture"])) is None
+    ):
+        raise RuntimeError("invalid root-owned boundary exercise metadata")
+    fixture = requested_repo / str(raw["fixture"])
+    try:
+        fixture_state = fixture.lstat()
+        physical_repo = Path(str(metadata["repo"])).resolve(strict=True)
+        issued_repo = requested_repo.resolve(strict=True)
+        physical_fixture = fixture.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("boundary exercise fixture is unavailable") from exc
+    if (
+        fixture.is_symlink()
+        or not fixture.is_dir()
+        or issued_repo != physical_repo
+        or physical_fixture.parent != physical_repo
+        or fixture_state.st_mode & 0o022
+    ):
+        raise RuntimeError("boundary exercise fixture is unsafe")
+    dotnet_root = Path(os.environ.get("DOTNET_ROOT", ""))
+    if not dotnet_root.is_absolute() or not (dotnet_root / "dotnet").is_file():
+        raise RuntimeError("root-owned .NET runtime is unavailable")
+    script = """set -eu
+test "$(/bin/pwd -P)" = "$1"
+/bin/cat "$2" >/dev/null
+/bin/cat "$3" >/dev/null
+/usr/bin/printf 'worker\\n' >> "$3"
+if /bin/cat "$4" >/dev/null 2>&1; then exit 41; fi
+if /bin/cat "$5" >/dev/null 2>&1; then exit 42; fi
+if /bin/cat "$6" >/dev/null 2>&1; then exit 43; fi
+info=$("$7" --info)
+case "$info" in
+  *".NET SDK:"*"$8"*) ;;
+  *) exit 44 ;;
+esac
+/usr/bin/printf '%s\\n' 'OUTCOME: COMPLETED'
+"""
+    return [
+        "/bin/sh",
+        "-c",
+        script,
+        "boundary-exercise",
+        str(physical_repo),
+        str(fixture / "source.py"),
+        str(fixture / ".env.example"),
+        str(fixture / ".env.local"),
+        str(fixture / "Secrets.plist"),
+        str(fixture / "credentials.py"),
+        str(dotnet_root / "dotnet"),
+        str(dotnet_root),
+    ]
+
+
+def internal_run(run_id: str, packet_file: Path) -> int:
+    run_id = validate_run_id(run_id)
+    metadata = load_metadata(run_id)
+
+    def fail_start(detail: str) -> int:
+        metadata["status"] = "failed"
+        metadata["outcome"] = "failed"
+        metadata["returnCode"] = 125
+        metadata["completedAt"] = utc_now()
+        metadata["launchError"] = detail[:1000]
+        save_metadata(metadata)
+        append_event(
+            {
+                "event": "failed",
+                "runId": run_id,
+                "at": metadata["completedAt"],
+                "agent": metadata["agent"],
+                "repo": metadata["repo"],
+                "returnCode": 125,
+                "sessionId": metadata.get("sessionId"),
+            }
+        )
+        print(f"repo-worker: {detail}", file=sys.stderr)
+        return 125
+
+    expected_prompt = PROMPT_DIR / f"{run_id}.prompt"
+    if packet_file.resolve(strict=False) != expected_prompt.resolve(strict=False):
+        return fail_start("invalid runtime packet path")
+    try:
+        packet = packet_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        return fail_start(f"cannot read runtime packet: {exc}")
+    try:
+        packet_file.unlink(missing_ok=True)
+    except OSError as exc:
+        return fail_start(f"cannot remove consumed runtime packet: {exc}")
+
+    requested_repo = Path(str(metadata["workerCwd"]))
+    repo_root = Path(str(metadata["workerRepo"]))
+    access = str(metadata["access"])
+    run_root = run_dir(run_id)
+    log_path = Path(str(metadata["logPath"]))
+    output_path = Path(str(metadata["outputPath"]))
+    lock_path = LOCKS_DIR / f"{project_key(repo_root)}.lock"
+    lock_shared = False
+
+    child: subprocess.Popen[str] | None = None
+    interrupted = False
+
+    def handle_stop(_signum, _frame):
+        raise WorkerInterrupted
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+
+    with file_lock(lock_path, shared=lock_shared):
+        metadata["status"] = "running"
+        metadata["startedAt"] = utc_now()
+        metadata["supervisorPid"] = os.getpid()
+        save_metadata(metadata)
+        save_project(metadata)
+        append_event(
+            {
+                "event": "started",
+                "runId": run_id,
+                "at": metadata["startedAt"],
+                "agent": metadata["agent"],
+                "repo": metadata["repo"],
+                "access": access,
+                "role": metadata["role"],
+                "mode": metadata["mode"],
+                "unit": metadata.get("unit"),
+            }
+        )
+        final_parts: list[str] = []
+        try:
+            require_macos_repository_templates(metadata)
+            if MANAGED_MACOS:
+                boundary_command = [
+                    "/bin/sh",
+                    "-c",
+                    'test ! -r "$AGENT_WORKER_PRIVATE_PROBE"',
+                ]
+            else:
+                boundary_command = [
+                    "/bin/sh",
+                    "-c",
+                    "test ! -x /home/hermes && "
+                    "test ! -e /home/hermes/.openclaw/openclaw.json",
+                ]
+            boundary_probe = subprocess.run(
+                provider_process_command(boundary_command),
+                env=sanitized_environment(str(metadata["agent"]), access),
+                check=False,
+            )
+            if boundary_probe.returncode:
+                raise RuntimeError("dedicated worker can traverse the private owner profile")
+            if access == "read":
+                if MANAGED_MACOS:
+                    write_probe = repo_root / f".agent-worker-read-probe-{run_id}"
+                    result = subprocess.run(
+                        provider_process_command(
+                            ["/usr/bin/touch", str(write_probe)]
+                        ),
+                        env=sanitized_environment(
+                            str(metadata["agent"]),
+                            access,
+                        ),
+                        check=False,
+                    )
+                    if result.returncode == 0 or write_probe.exists():
+                        write_probe.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            "read worker repository sandbox is writable"
+                        )
+                else:
+                    readonly_flag = getattr(os, "ST_RDONLY", 1)
+                    if not os.statvfs(repo_root).f_flag & readonly_flag:
+                        raise RuntimeError(
+                            "read worker repository mount is not read-only"
+                        )
+            boundary_exercise = metadata.get("boundaryExercise") is not None
+            command = provider_process_command(
+                (
+                    macos_boundary_exercise_command(
+                        metadata,
+                        requested_repo,
+                    )
+                    if boundary_exercise
+                    else child_command(
+                        metadata,
+                        requested_repo=requested_repo,
+                        output_path=output_path,
+                    )
+                )
+            )
+            if (
+                not boundary_exercise
+                and MANAGED_MACOS
+                and str(metadata["agent"]) == "kimi"
+            ):
+                task_file = kimi_task_file(str(metadata["runId"]))
+                task_file.write_text(packet, encoding="utf-8")
+                os.chown(
+                    task_file,
+                    int(MACOS_WORKER_UID),
+                    int(MACOS_WORKER_GID),
+                )
+                task_file.chmod(0o600)
+            with log_path.open("a", encoding="utf-8") as log:
+                secure_runtime_file(log_path)
+                require_macos_repository_templates(metadata)
+                process_cwd = requested_repo
+                if (
+                    MANAGED_MACOS
+                    and str(metadata["agent"]) == "codex"
+                ):
+                    process_cwd = codex_execution_cwd(metadata, requested_repo)
+                child = subprocess.Popen(
+                    command,
+                    cwd=process_cwd,
+                    env=sanitized_environment(
+                        str(metadata["agent"]),
+                        access,
+                    ),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,
+                )
+                metadata["workerPid"] = child.pid
+                save_metadata(metadata)
+                assert child.stdin is not None
+                child.stdin.write(packet)
+                child.stdin.close()
+                assert child.stdout is not None
+                for line in child.stdout:
+                    log.write(line)
+                    log.flush()
+                    if boundary_exercise:
+                        if line.strip() == "OUTCOME: COMPLETED":
+                            final_parts[:] = ["OUTCOME: COMPLETED"]
+                    else:
+                        session_id, _ = parse_stream_line(
+                            str(metadata["agent"]),
+                            line,
+                            final_parts,
+                        )
+                        if session_id:
+                            update_session(metadata, session_id)
+                return_code = child.wait()
+        except WorkerInterrupted:
+            interrupted = True
+            if child is not None and child.poll() is None:
+                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+            return_code = 143
+        except Exception as exc:
+            with log_path.open("a", encoding="utf-8") as log:
+                secure_runtime_file(log_path)
+                log.write(f"repo-worker supervisor error: {type(exc).__name__}: {exc}\n")
+            return_code = 125
+
+        final_text: str | None = None
+        if final_parts and not output_path.is_file():
+            final_text = final_parts[-1].rstrip()
+            output_path.write_text(final_text + "\n", encoding="utf-8")
+            secure_runtime_file(output_path)
+        elif output_path.is_file():
+            secure_runtime_file(output_path)
+            try:
+                final_text = output_path.read_text(encoding="utf-8")
+            except OSError:
+                final_text = None
+
+        metadata["returnCode"] = return_code
+        metadata["completedAt"] = utc_now()
+        status, outcome, blocker = terminal_result(
+            return_code=return_code,
+            interrupted=interrupted,
+            final_text=final_text,
+        )
+        metadata["status"] = status
+        metadata["outcome"] = outcome
+        if blocker:
+            metadata["blocker"] = blocker
+        else:
+            metadata.pop("blocker", None)
+        save_metadata(metadata)
+        save_project(metadata)
+        append_event(
+            {
+                "event": metadata["status"],
+                "runId": run_id,
+                "at": metadata["completedAt"],
+                "agent": metadata["agent"],
+                "repo": metadata["repo"],
+                "returnCode": return_code,
+                "outcome": outcome,
+                "sessionId": metadata.get("sessionId"),
+            }
+        )
+        return return_code
+
+
+def launch_service(metadata: dict[str, object], packet: str) -> dict[str, object]:
+    return broker_request(
+        {
+            "action": "launch",
+            "metadata": metadata,
+            "packet": packet,
+        }
+    )
+
+
+def prepare_launch(args: argparse.Namespace) -> tuple[dict[str, object], str]:
+    resumed: dict[str, object] | None = None
+    session_id: str | None = None
+    resume_session = False
+    if args.resume_run:
+        resumed = load_metadata(args.resume_run)
+        session = resumed.get("sessionId")
+        if not isinstance(session, str) or not session:
+            raise SystemExit(
+                f"repo-worker: run {args.resume_run} has no provider session to resume"
+            )
+        session_id = session
+        resume_session = True
+        if args.repo is not None:
+            _, requested_root = resolve_repo(args.repo)
+            if str(requested_root) != resumed.get("repo"):
+                raise SystemExit("repo-worker: --repo does not match the resumed run")
+        requested_repo = Path(str(resumed["cwd"]))
+        repo_root = Path(str(resumed["repo"]))
+        agent = str(resumed["agent"])
+        if args.agent is not None and args.agent != agent:
+            raise SystemExit("repo-worker: --agent does not match the resumed run")
+        role = bounded_text(args.role or str(resumed["role"]), "role")
+        access = str(resumed["access"])
+        if args.access is not None and args.access != access:
+            raise SystemExit("repo-worker: --access does not match the resumed run")
+        mode = str(resumed["mode"])
+        model = args.model if args.model is not None else resumed.get("model")
+        effort = args.effort if args.effort is not None else resumed.get("effort")
+    else:
+        required(args.repo, "--repo")
+        assert args.repo is not None
+        requested_repo, repo_root = resolve_repo(args.repo)
+        mode = args.mode
+        project = load_project(repo_root) if mode == "project" else None
+        if project:
+            agent = str(project["agent"])
+            session_id = str(project["sessionId"])
+            resume_session = True
+            prior_run = project.get("lastRunId")
+            if not isinstance(prior_run, str):
+                raise SystemExit("repo-worker: project session has no prior run")
+            resumed = load_metadata(prior_run)
+            if (
+                resumed.get("repo") != str(repo_root)
+                or resumed.get("agent") != agent
+                or resumed.get("sessionId") != session_id
+                or resumed.get("mode") != "project"
+            ):
+                raise SystemExit("repo-worker: project session does not match its prior run")
+            if args.agent is not None and args.agent != agent:
+                raise SystemExit(
+                    "repo-worker: project session already belongs to "
+                    f"{agent}; use that agent or explicitly resume a task run"
+                )
+            role = bounded_text(args.role or str(resumed["role"]), "role")
+            access = str(resumed["access"])
+            if args.access is not None and args.access != access:
+                raise SystemExit(
+                    "repo-worker: --access does not match the project session"
+                )
+            model = args.model if args.model is not None else resumed.get("model")
+            effort = (
+                args.effort if args.effort is not None else resumed.get("effort")
+            )
+        else:
+            agent, model, effort = resolve_worker_selection(
+                args.agent,
+                args.model,
+                args.effort,
+            )
+            role = bounded_text(args.role or "repository execution owner", "role")
+            access = args.access or "write"
+
+    agent, model, effort = resolve_worker_selection(agent, model, effort)
+    task = read_task(args)
+    constraints = [bounded_text(item, "constraint") for item in args.constraint]
+    success = [bounded_text(item, "success") for item in args.success]
+    run_id = str(uuid.uuid4())
+    if session_id is None and agent in {"claude", "kimi"}:
+        session_id = str(uuid.uuid4())
+    worker_cwd, worker_repo = worker_paths(requested_repo, repo_root)
+    packet = task_packet(
+        run_id=run_id,
+        role=role,
+        task=task,
+        requested_repo=worker_cwd,
+        repo_root=worker_repo,
+        access=access,
+        mode=mode,
+        constraints=constraints,
+        success=success,
+    )
+    unit = f"agent-worker-{run_id.replace('-', '')}.service"
+    root = run_dir(run_id)
+    metadata: dict[str, object] = {
+        "schemaVersion": 3,
+        "runId": run_id,
+        "createdAt": utc_now(),
+        "updatedAt": utc_now(),
+        "status": "starting",
+        "agent": agent,
+        "repo": str(repo_root),
+        "cwd": str(requested_repo),
+        "workerRepo": str(worker_repo),
+        "workerCwd": str(worker_cwd),
+        "access": access,
+        "permissionProfile": permission_profile(access),
+        "mode": mode,
+        "role": role,
+        "model": model,
+        "effort": effort,
+        "sessionId": session_id,
+        "resumedFrom": str(resumed["runId"]) if resumed else None,
+        "resumeSession": resume_session,
+        "unit": None if args.foreground else unit,
+        "logPath": str(root / "stream.log"),
+        "outputPath": str(root / "final.txt"),
+    }
+    return metadata, packet
+
+
+def launch(args: argparse.Namespace) -> int:
+    if args.foreground:
+        raise SystemExit(
+            "repo-worker: --foreground is unavailable with the dedicated worker broker"
+        )
+    metadata, packet = prepare_launch(args)
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "runId": metadata["runId"],
+                    "agent": metadata["agent"],
+                    "repo": metadata["repo"],
+                    "access": metadata["access"],
+                    "permissionProfile": metadata["permissionProfile"],
+                    "mode": metadata["mode"],
+                    "sessionId": metadata["sessionId"],
+                    "resumedFrom": metadata["resumedFrom"],
+                    "packet": packet,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    summary = launch_service(metadata, packet)
+
+    def submit(next_args: argparse.Namespace) -> dict[str, object]:
+        next_metadata, next_packet = prepare_launch(next_args)
+        return launch_service(next_metadata, next_packet)
+
+    def read_status(run_id: str) -> dict[str, object]:
+        return status_payload(load_metadata(run_id), args.stale_after)
+
+    summary = apply_launch_fallback(
+        args, summary, submit=submit, read_status=read_status
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+    return 0
+
+
+def main() -> int:
+    if sys.platform == "darwin" and not MANAGED_MACOS:
+        adapter = WORKSPACE / "scripts" / "repo-worker-macos"
+        os.execv(sys.executable, [sys.executable, str(adapter), *sys.argv[1:]])
+    args = parse_args()
+    if args.internal_run:
+        if args.packet_file is None:
+            raise SystemExit("repo-worker: --packet-file is required for internal runs")
+        return internal_run(args.internal_run, args.packet_file)
+    if args.self_test:
+        return self_test()
+    operations = sum(
+        bool(value)
+        for value in (args.list, args.status, args.wait, args.output)
+    )
+    if operations > 1:
+        raise SystemExit("repo-worker: choose only one status operation")
+    if args.recent_terminal_seconds < 0 or args.recent_terminal_seconds > 86_400:
+        raise SystemExit(
+            "repo-worker: --recent-terminal-seconds must be between 0 and 86400"
+        )
+    if args.terminal_limit < 1 or args.terminal_limit > 128:
+        raise SystemExit("repo-worker: --terminal-limit must be between 1 and 128")
+    if (args.recent_terminal_seconds or args.terminal_limit != 32) and not args.list:
+        raise SystemExit(
+            "repo-worker: recent-terminal options require --list"
+        )
+    if args.recent_terminal_seconds and not args.active:
+        raise SystemExit(
+            "repo-worker: --recent-terminal-seconds requires --active"
+        )
+    if args.list:
+        return list_status(
+            active_only=args.active,
+            stale_after=args.stale_after,
+            recent_terminal_seconds=args.recent_terminal_seconds,
+            terminal_limit=args.terminal_limit,
+        )
+    if args.status:
+        return show_status(args.status, args.stale_after)
+    if args.wait:
+        return wait_for_run(args.wait, args.timeout, args.stale_after)
+    if args.output:
+        return show_output(args.output)
+    return launch(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

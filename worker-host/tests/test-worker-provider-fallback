@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Validate the worker availability classifier and launch fallback driver."""
+
+from __future__ import annotations
+
+import argparse
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import sys
+
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+core = SourceFileLoader(
+    "repo_worker_fallback_gate", str(WORKSPACE / "scripts/repo-worker")
+).load_module()
+
+
+def check_classifier() -> None:
+    positive = {
+        "You've hit your usage limit. Visit https://chatgpt.com/codex/"
+        "settings/usage to purchase more credits or try again at 11:03 PM.": "usage-limit",
+        "Failed to authenticate: OAuth session expired and could not be "
+        "refreshed": "auth",
+        "Your credit balance is too low to access the Anthropic API": "usage-limit",
+        "quota exceeded for this billing period": "usage-limit",
+        "429 Too Many Requests": "rate-limit",
+        "server overloaded, retry later": "rate-limit",
+        "invalid api key provided": "auth",
+        "Your organization has disabled Claude subscription access for Claude Code · "
+        "Use an Anthropic API key instead, or ask your admin to enable access.": "auth",
+    }
+    negative = [
+        "repository directory unreadable during validation: a/token (EPERM)",
+        "exact-head fence failed: expected c3068ddb, found 1a45427a",
+        "AssertionError: expected 3 rows, found 2",
+        "repo-worker supervisor error: RuntimeError: repository directory "
+        "changed during validation",
+        None,
+        "",
+    ]
+    for detail, expected in positive.items():
+        actual = core.availability_class(detail)
+        assert actual == expected, f"classifier:{detail[:40]}:{actual}"
+    for detail in negative:
+        actual = core.availability_class(detail)
+        assert actual is None, f"classifier false positive:{detail}:{actual}"
+
+
+def check_shared_model_policy() -> None:
+    assert core.fallback_agent_order() == ("hermes", "codex", "kimi", "claude")
+    assert core.resolve_worker_selection(None, None, None) == (
+        "hermes",
+        "claude-opus-5.5",
+        "xhigh",
+    )
+    assert core.resolve_worker_selection("hermes", None, None) == (
+        "hermes",
+        "claude-opus-5.5",
+        "xhigh",
+    )
+    assert core.resolve_worker_selection(None, "luna", None) == (
+        "codex",
+        "gpt-5.6-luna",
+        "max",
+    )
+    assert core.resolve_worker_selection(None, "sol", None) == (
+        "codex",
+        "gpt-5.6-sol",
+        "medium",
+    )
+    assert core.resolve_worker_selection(None, "gpt-6-luna", None) == (
+        "hermes",
+        "gpt-6-luna",
+        "max",
+    )
+    assert core.resolve_worker_selection("hermes", "claude-opus-5", "high") == (
+        "hermes",
+        "claude-opus-5",
+        "high",
+    )
+    try:
+        core.resolve_worker_selection("codex", "gpt-6-luna", None)
+    except SystemExit as exc:
+        assert "model is not configured" in str(exc)
+    else:
+        raise AssertionError("Codex CLI accepted an unlisted model")
+
+
+def check_terminal_outcome_contract() -> None:
+    assert core.reported_outcome("OUTCOME: COMPLETED\nAll checks passed.\n") == "completed"
+    assert core.reported_outcome("\nOUTCOME: BLOCKED\n.NET is unavailable.\n") == "blocked"
+    assert core.reported_outcome("Outcome: completed\n") is None
+    assert core.reported_outcome("Checks passed, but phone proof remains.\n") is None
+    assert core.terminal_result(
+        return_code=0,
+        interrupted=False,
+        final_text="OUTCOME: COMPLETED\nDone.\n",
+    ) == ("completed", "completed", None)
+    assert core.terminal_result(
+        return_code=0,
+        interrupted=False,
+        final_text="OUTCOME: BLOCKED\nMissing required SDK.\n",
+    ) == ("blocked", "blocked", "worker reported an unmet hard gate")
+    assert core.terminal_result(
+        return_code=0,
+        interrupted=False,
+        final_text="Missing required SDK.\n",
+    ) == (
+        "blocked",
+        "unverified",
+        "worker exited without a machine-readable terminal outcome",
+    )
+    packet = core.task_packet(
+        run_id="11111111-1111-1111-1111-111111111111",
+        role="test owner",
+        task="Validate the contract.",
+        requested_repo=Path("/work/repository"),
+        repo_root=Path("/work/repository"),
+        access="read",
+        mode="task",
+        constraints=[],
+        success=["The contract is observable."],
+    )
+    assert "OUTCOME: COMPLETED" in packet and "OUTCOME: BLOCKED" in packet
+
+
+def make_args(agent: str, mode: str = "task") -> argparse.Namespace:
+    return argparse.Namespace(
+        agent=agent,
+        model=None,
+        effort="high",
+        mode=mode,
+        access="read",
+        resume_run=None,
+        stale_after=300,
+    )
+
+
+def check_driver_falls_back_once() -> None:
+    core.LAUNCH_GRACE_SECONDS = 1
+    core.LAUNCH_POLL_SECONDS = 0
+    statuses = {
+        "run-codex": {
+            "runId": "run-codex",
+            "status": "failed",
+            "failureDetail": (
+                "Your organization has disabled Claude subscription access for "
+                "Claude Code · Use an Anthropic API key instead, or ask your "
+                "admin to enable access."
+            ),
+            "access": "read",
+        },
+        "run-hermes": {"runId": "run-hermes", "status": "completed"},
+    }
+    submitted = []
+
+    def submit(next_args):
+        submitted.append((next_args.agent, next_args.model, next_args.effort))
+        return {"runId": f"run-{next_args.agent}", "agent": next_args.agent}
+
+    result = core.apply_launch_fallback(
+        make_args("codex"),
+        {"runId": "run-codex", "agent": "codex"},
+        submit=submit,
+        read_status=lambda run_id: dict(statuses[run_id]),
+    )
+    assert submitted == [("hermes", None, None)], f"submitted:{submitted}"
+    assert result["status"] == "completed", result
+    events = result["fallbackFrom"]
+    assert len(events) == 1, events
+    assert events[0]["agent"] == "codex", events
+    assert events[0]["class"] == "auth", events
+
+
+def check_driver_leaves_task_failures_alone() -> None:
+    core.LAUNCH_GRACE_SECONDS = 1
+    core.LAUNCH_POLL_SECONDS = 0
+
+    def submit(next_args):
+        raise AssertionError("task failure must not relaunch")
+
+    result = core.apply_launch_fallback(
+        make_args("claude"),
+        {"runId": "run-1", "agent": "claude"},
+        submit=submit,
+        read_status=lambda run_id: {
+            "runId": "run-1",
+            "status": "failed",
+            "failureDetail": "AssertionError: expected 3 rows, found 2",
+        },
+    )
+    assert result["status"] == "failed", result
+    assert "fallbackFrom" not in result, result
+
+
+def check_driver_exhaustion_is_explicit() -> None:
+    core.LAUNCH_GRACE_SECONDS = 1
+    core.LAUNCH_POLL_SECONDS = 0
+    dry = {
+        "status": "failed",
+        "failureDetail": "429 Too Many Requests",
+    }
+
+    def submit(next_args):
+        return {"runId": f"run-{next_args.agent}", "agent": next_args.agent}
+
+    result = core.apply_launch_fallback(
+        make_args("codex"),
+        {"runId": "run-codex", "agent": "codex"},
+        submit=submit,
+        read_status=lambda run_id: {"runId": run_id, **dry},
+    )
+    assert result.get("fallbackExhausted") is True, result
+    assert [e["agent"] for e in result["fallbackFrom"]] == [
+        "codex",
+        "hermes",
+        "kimi",
+        "claude",
+    ], result
+
+
+def check_driver_returns_survivor_untouched() -> None:
+    core.LAUNCH_GRACE_SECONDS = 0
+    core.LAUNCH_POLL_SECONDS = 0
+    result = core.apply_launch_fallback(
+        make_args("claude"),
+        {"runId": "run-1", "agent": "claude", "status": "queued"},
+        submit=lambda a: (_ for _ in ()).throw(AssertionError("no relaunch")),
+        read_status=lambda run_id: {"runId": run_id, "status": "running"},
+    )
+    assert result["status"] == "queued", result
+    assert "fallbackFrom" not in result, result
+
+
+def main() -> int:
+    check_classifier()
+    check_shared_model_policy()
+    check_terminal_outcome_contract()
+    check_driver_falls_back_once()
+    check_driver_leaves_task_failures_alone()
+    check_driver_exhaustion_is_explicit()
+    check_driver_returns_survivor_untouched()
+    print("Validated worker provider fallback.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

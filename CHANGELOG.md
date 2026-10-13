@@ -13,6 +13,14 @@ This file records user-visible changes to the portable coding-agent system.
   no-follow descriptor pinning, and fail-closed inode and metadata checks.
 - Report Xcode, `xcrun`, and simulator capabilities when available.
 
+### Added
+
+- `worker-host/` holds the live worker-host system as installed on
+  2026-10-12: the runner, broker, Hermes adapter and its read/write configs,
+  the Codex auth sync, the coordination probe and its sudoers rule, the model
+  policy (`/etc/agent-worker/defaults.json`), the systemd units, the client
+  tools (wait, watchdog, usage watch, pane, viewer, chain) and their tests.
+
 ### Changed
 
 - The working agreement now tells every agent to add a CHANGELOG.md entry

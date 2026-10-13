@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Verify provider-native session identifiers at the broker boundary."""
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+
+
+workspace = Path(__file__).resolve().parents[1]
+source = workspace / "scripts" / "agent-worker-broker"
+loader = SourceFileLoader("agent_worker_broker_session_test", str(source))
+spec = spec_from_loader(loader.name, loader)
+if spec is None:
+    raise SystemExit("could not load worker broker")
+broker = module_from_spec(spec)
+loader.exec_module(broker)
+
+native = "20260919_203242_0295d1"
+if broker.require_provider_session(native, "hermes", "metadata.sessionId") != native:
+    raise SystemExit("broker changed a valid Hermes session ID")
+
+for invalid in ("../../escape", "20260919_203242_deadbeef", "not-a-session"):
+    try:
+        broker.require_provider_session(invalid, "hermes", "metadata.sessionId")
+    except broker.RequestError:
+        pass
+    else:
+        raise SystemExit(f"broker accepted malformed Hermes session ID: {invalid}")
+
+print("Validated provider-native worker session identifiers.")

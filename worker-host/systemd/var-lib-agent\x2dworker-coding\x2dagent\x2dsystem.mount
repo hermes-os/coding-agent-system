@@ -1,0 +1,12 @@
+[Unit]
+Description=Canonical coding-agent system for repository workers
+Before=agent-worker-broker.service
+
+[Mount]
+What=/home/hermes/Projects/hermes-os/coding-agent-system
+Where=/var/lib/agent-worker/coding-agent-system
+Type=none
+Options=bind,ro,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1120 @@
+#!/usr/bin/env python3
+"""Validate repository work orders and launch isolated system workers."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import threading
+import traceback
+from urllib.parse import urlsplit
+import uuid
+
+
+WORKER_NAME = "agent-worker"
+CALLER_NAME = "hermes"
+WORKER_HOME = Path("/var/lib/agent-worker")
+WORKER_HERMES_HOME = WORKER_HOME / ".hermes"
+HERMES_RUNTIME_ROOT = WORKER_HOME / ".hermes-worker"
+HERMES_ADAPTER = Path(
+    "/usr/local/libexec/agent-worker-hermes/host/bin/agent-hermes-worker"
+)
+REPOSITORY_ROOTS = (Path("/home/hermes/Projects"),)
+TRUST_ROOT = WORKER_HOME / ".broker"
+TRUST_RUNS = TRUST_ROOT / "runs"
+SCRATCH_ROOT = Path("/var/lib/agent-worker-scratch")
+STATE_ROOT = WORKER_HOME / ".local/state/agent-workers"
+RUNS_DIR = STATE_ROOT / "runs"
+PROJECTS_DIR = STATE_ROOT / "projects"
+LOCKS_DIR = STATE_ROOT / "locks"
+ACL_DIR = STATE_ROOT / "repo-acl"
+WORKSPACES_DIR = WORKER_HOME / "workspaces"
+PROMPT_DIR = Path("/run/agent-worker/prompts")
+RUNNER = Path("/usr/local/libexec/agent-worker-runner")
+POLICY_ROOT = WORKER_HOME / "coding-agent-system"
+DEFAULTS_PATH = Path("/etc/agent-worker/defaults.json")
+MAX_REQUEST_BYTES = 256 * 1024
+MAX_PACKET_CHARS = 100_000
+ACTIVE_STATES = {"starting", "queued", "running"}
+CONFIG_LOCK = threading.Lock()
+LAUNCH_LOCK = threading.Lock()
+SYSTEMD_PATH_RE = re.compile(r"^/[A-Za-z0-9._/@+-]+$")
+EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+HERMES_SESSION_RE = re.compile(r"^[0-9]{8}_[0-9]{6}_[0-9a-f]{6}$")
+HERMES_PROVIDERS = frozenset({"openai-codex", "anthropic", "openrouter"})
+OPEN_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+# Both forge identities: the repositories moved to Forgejo but the GitHub
+# mirrors still resolve, and this guard must match either origin.
+# The portfolio migrated from GitHub to a self-hosted Forgejo. Both origins
+# resolve to the same owner/repository slug, so DIRECT_REPOSITORIES still
+# fences the control plane regardless of which host a checkout points at.
+FORGE_HOSTS = frozenset({"github.com", "git.imhermes.dev", "git.ashwren.com"})
+DIRECT_REPOSITORIES = {
+    "hermes-os/openclaw-workspace",
+    "hermes-os/coding-agent-system",
+    "hermes/openclaw-workspace",
+    "hermes/coding-agent-system",
+}
+
+
+class RequestError(Exception):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def require_string(
+    value: object,
+    name: str,
+    *,
+    maximum: int = 20_000,
+    optional: bool = False,
+) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise RequestError(f"{name} must be a non-empty string")
+    if len(value) > maximum:
+        raise RequestError(f"{name} exceeds {maximum} characters")
+    return value
+
+
+def require_uuid(value: object, name: str, *, optional: bool = False) -> str | None:
+    text = require_string(value, name, maximum=64, optional=optional)
+    if text is None:
+        return None
+    try:
+        parsed = str(uuid.UUID(text))
+    except ValueError as exc:
+        raise RequestError(f"{name} must be a UUID") from exc
+    if parsed != text.lower():
+        raise RequestError(f"{name} must use canonical UUID form")
+    return parsed
+
+
+def require_provider_session(
+    value: object,
+    agent: str,
+    name: str,
+    *,
+    optional: bool = False,
+) -> str | None:
+    if agent != "hermes":
+        return require_uuid(value, name, optional=optional)
+    text = require_string(value, name, maximum=64, optional=optional)
+    if text is not None and HERMES_SESSION_RE.fullmatch(text) is None:
+        raise RequestError(f"{name} must be a Hermes session ID")
+    return text
+
+
+def load_model_policy() -> dict[str, object]:
+    try:
+        state = DEFAULTS_PATH.lstat()
+        value = json.loads(DEFAULTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RequestError("worker model policy is unavailable") from exc
+    if (
+        DEFAULTS_PATH.is_symlink()
+        or not stat.S_ISREG(state.st_mode)
+        or state.st_uid != 0
+        or state.st_mode & 0o022
+        or not isinstance(value, dict)
+        or value.get("schemaVersion") != 2
+        or value.get("thinkingDefault") != "max"
+        or not isinstance(value.get("order"), list)
+        or not isinstance(value.get("models"), dict)
+    ):
+        raise RequestError("worker model policy is unsafe")
+    for alias, raw in value["models"].items():
+        worker = raw.get("worker") if isinstance(raw, dict) else None
+        if not isinstance(alias, str) or not isinstance(worker, dict):
+            raise RequestError("worker model policy entry is invalid")
+        model = require_string(
+            worker.get("model"), f"worker model {alias}.model", maximum=500
+        )
+        effort = require_string(
+            worker.get("effort"), f"worker model {alias}.effort", maximum=16
+        )
+        assert model is not None and effort is not None
+        if worker.get("agent") not in {"codex", "claude", "kimi", "hermes"}:
+            raise RequestError(f"unsupported worker provider: {alias}")
+        if worker.get("agent") == "hermes" and worker.get("provider") not in HERMES_PROVIDERS:
+            raise RequestError(f"unsupported Hermes provider: {alias}")
+        if effort not in EFFORT_LEVELS or (alias == "luna" and effort != "max"):
+            raise RequestError(f"unsupported worker effort policy: {alias}")
+    if any(alias not in value["models"] for alias in value["order"]):
+        raise RequestError("worker model order is invalid")
+    return value
+
+
+def load_provider_defaults() -> dict[str, dict[str, str]]:
+    policy = load_model_policy()
+    providers: dict[str, dict[str, str]] = {}
+    for alias in policy["order"]:
+        worker = policy["models"][alias]["worker"]
+        providers.setdefault(str(worker["agent"]), dict(worker))
+    if not {"codex", "claude", "kimi"}.issubset(providers):
+        raise RequestError("worker model order omits a provider")
+    return providers
+
+
+def open_hermes_provider(requested_model: str) -> str | None:
+    """Route an unlisted model to a provider the Hermes runtime is credentialed for.
+
+    gpt-* is ChatGPT, claude-* is Anthropic, and vendor/model is OpenRouter. The
+    name passes through unchanged so a resumed run resolves to the same route."""
+    if len(requested_model) > 200 or OPEN_MODEL_RE.fullmatch(requested_model) is None:
+        raise RequestError("requested worker model name is invalid")
+    if requested_model.startswith("gpt-"):
+        return "openai-codex"
+    if requested_model.startswith("claude-"):
+        return "anthropic"
+    if "/" in requested_model:
+        return "openrouter"
+    return None
+
+
+def resolve_worker_model(
+    agent: str,
+    requested_model: str | None,
+    requested_effort: str | None,
+) -> tuple[str, str, str, str, str | None]:
+    policy = load_model_policy()
+    selected = None
+    if requested_model is not None:
+        matches = [
+            (alias, raw["worker"])
+            for alias, raw in policy["models"].items()
+            if isinstance(raw, dict)
+            and requested_model in {alias, raw["worker"].get("model")}
+        ]
+        preferred = [item for item in matches if item[1].get("agent") == agent]
+        selected = (preferred or matches)[0] if matches else None
+        if agent == "hermes" and not preferred:
+            provider = open_hermes_provider(requested_model)
+            if provider is None:
+                raise RequestError("requested worker model has no Hermes provider")
+            effort = requested_effort or str(policy["thinkingDefault"])
+            if effort not in EFFORT_LEVELS:
+                raise RequestError(f"unsupported worker effort: {effort}")
+            effort_source = "request" if requested_effort is not None else "host-policy"
+            return requested_model, effort, "request", effort_source, provider
+        if selected is None or selected[1].get("agent") != agent:
+            raise RequestError("requested worker model is not allowlisted")
+        model_source = "request"
+    else:
+        defaults = load_provider_defaults()[agent]
+        selected = next(
+            (
+                (alias, raw["worker"])
+                for alias, raw in policy["models"].items()
+                if isinstance(raw, dict)
+                and raw["worker"].get("agent") == agent
+                and raw["worker"].get("model") == defaults["model"]
+            )
+        )
+        model_source = "host-policy"
+    alias, worker = selected
+    model = str(worker["model"])
+    effort = requested_effort or str(worker["effort"])
+    if effort not in EFFORT_LEVELS:
+        raise RequestError(f"unsupported worker effort: {effort}")
+    if alias == "luna" and effort != "max":
+        raise RequestError("Luna requires max effort")
+    effort_source = "request" if requested_effort is not None else "host-policy"
+    provider = None
+    if agent == "hermes":
+        provider = worker.get("provider")
+        if provider not in HERMES_PROVIDERS:
+            raise RequestError("Hermes worker model has no admitted provider")
+    return model, effort, model_source, effort_source, provider
+
+
+def resolve_git_paths(repo_value: object, cwd_value: object) -> tuple[Path, Path]:
+    repo_text = require_string(repo_value, "metadata.repo", maximum=4096)
+    cwd_text = require_string(cwd_value, "metadata.cwd", maximum=4096)
+    assert repo_text is not None and cwd_text is not None
+    repo = Path(repo_text).resolve()
+    cwd = Path(cwd_text).resolve()
+    if not SYSTEMD_PATH_RE.fullmatch(str(repo)) or not SYSTEMD_PATH_RE.fullmatch(
+        str(cwd)
+    ):
+        raise RequestError("repository paths contain unsupported systemd characters")
+    if not repo.is_dir() or not cwd.is_dir():
+        raise RequestError("repository and working directory must exist")
+    if repo != cwd and repo not in cwd.parents:
+        raise RequestError("working directory must be inside the repository")
+    if not any(root == repo or root in repo.parents for root in REPOSITORY_ROOTS):
+        raise RequestError("repository is outside the approved project roots")
+    openclaw = Path("/home/hermes/.openclaw")
+    if repo == openclaw or openclaw in repo.parents:
+        raise RequestError("OpenClaw paths cannot be worker repositories")
+    result = subprocess.run(
+        ["git", "-c", "safe.directory=*", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    if result.returncode:
+        raise RequestError("target is not a Git repository")
+    if Path(result.stdout.strip()).resolve() != repo:
+        raise RequestError("metadata.repo does not match the Git root")
+    repository = github_repository(repo)
+    if repository is None:
+        raise RequestError("repository origin must be a canonical forge URL")
+    if repository in DIRECT_REPOSITORIES:
+        raise RequestError("direct control-plane repositories cannot be delegated")
+    return repo, cwd
+
+
+def github_repository(root: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "-c", "safe.directory=*", "-C", str(root), "remote", "get-url", "origin"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    if result.returncode:
+        return None
+    value = result.stdout.strip()
+    hosts = "|".join(re.escape(host) for host in sorted(FORGE_HOSTS))
+    scp = re.fullmatch(
+        rf"(?:[^@/:]+@)?(?:{hosts}):([^/?#]+)/([^/?#]+)",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if scp:
+        owner, repository = scp.groups()
+    else:
+        parsed = urlsplit(value)
+        if (
+            parsed.hostname is None
+            or parsed.hostname.casefold() not in FORGE_HOSTS
+            or parsed.scheme.casefold() not in {"https", "ssh", "git"}
+            or parsed.query
+            or parsed.fragment
+            or "%" in parsed.path
+        ):
+            return None
+        parts = [item for item in parsed.path.split("/") if item]
+        if len(parts) != 2:
+            return None
+        owner, repository = parts
+    if repository.casefold().endswith(".git"):
+        repository = repository[:-4]
+    return (
+        f"{owner.casefold()}/{repository.casefold()}"
+        if owner and repository
+        else None
+    )
+
+
+def project_key(repo: Path) -> str:
+    return hashlib.sha256(str(repo).encode()).hexdigest()
+
+
+def worker_paths(repo: Path, cwd: Path) -> tuple[Path, Path]:
+    worker_repo = WORKSPACES_DIR / project_key(repo)
+    relative = cwd.relative_to(repo)
+    return worker_repo, worker_repo / relative
+
+
+def safe_chown(path: Path, user: str, group: str) -> None:
+    os.chown(path, pwd.getpwnam(user).pw_uid, grp.getgrnam(group).gr_gid)
+
+
+def ensure_directory(
+    path: Path,
+    *,
+    mode: int,
+    user: str,
+    group: str,
+) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise RequestError(f"unsafe runtime directory: {path}")
+    safe_chown(path, user, group)
+    path.chmod(mode)
+
+
+def ensure_runtime_directories() -> None:
+    expected = (
+        (Path("/run/agent-worker"), 0, grp.getgrnam(CALLER_NAME).gr_gid, 0o750),
+        (PROMPT_DIR, 0, 0, 0o700),
+    )
+    for path, uid, gid, mode in expected:
+        path.mkdir(mode=mode, parents=True, exist_ok=True)
+        state = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(state.st_mode)
+            or state.st_uid != uid
+            or state.st_gid != gid
+            or stat.S_IMODE(state.st_mode) != mode
+        ):
+            raise RequestError(f"unsafe broker runtime directory: {path}")
+
+
+def atomic_metadata(path: Path, value: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("x", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    safe_chown(temporary, "root", CALLER_NAME)
+    temporary.chmod(0o640)
+    temporary.replace(path)
+
+
+def trust_record_path(run_id: str) -> Path:
+    return TRUST_RUNS / f"{run_id}.json"
+
+
+def ensure_trust_directories() -> None:
+    for path in (TRUST_ROOT, TRUST_RUNS):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        state = path.stat()
+        if path.is_symlink() or state.st_uid != 0 or state.st_mode & 0o077:
+            raise RequestError(f"unsafe broker trust directory: {path}")
+        path.chmod(0o700)
+
+
+def load_trust_record(run_id: str) -> dict[str, object]:
+    path = trust_record_path(run_id)
+    try:
+        state = path.lstat()
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RequestError(f"trusted prior run not found: {run_id}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RequestError(f"invalid trusted prior run: {run_id}") from exc
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or state.st_uid != 0
+        or state.st_mode & 0o077
+        or not isinstance(value, dict)
+        or value.get("runId") != run_id
+    ):
+        raise RequestError(f"invalid trusted prior run: {run_id}")
+    return value
+
+
+def save_trust_record(metadata: dict[str, object]) -> None:
+    ensure_trust_directories()
+    run_id = str(metadata["runId"])
+    path = trust_record_path(run_id)
+    if path.exists() or path.is_symlink():
+        raise RequestError(f"run ID already exists: {run_id}")
+    record = {
+        "schemaVersion": 1,
+        "runId": run_id,
+        "createdAt": metadata["createdAt"],
+        "agent": metadata["agent"],
+        "repo": metadata["repo"],
+        "cwd": metadata["cwd"],
+        "access": metadata["access"],
+        "mode": metadata["mode"],
+        "model": metadata.get("model"),
+        "effort": metadata.get("effort"),
+        "provider": metadata.get("provider"),
+        "sessionId": metadata.get("sessionId"),
+        "resumedFrom": metadata.get("resumedFrom"),
+        "runtimeRunId": metadata.get("runtimeRunId"),
+    }
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("x", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chown(temporary, 0, 0)
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def load_run_metadata(run_id: str) -> dict[str, object]:
+    path = RUNS_DIR / run_id / "metadata.json"
+    try:
+        state = path.lstat()
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RequestError(f"invalid prior run metadata: {run_id}") from exc
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(state.st_mode)
+        or state.st_uid != 0
+        or state.st_gid != grp.getgrnam(CALLER_NAME).gr_gid
+        or stat.S_IMODE(state.st_mode) != 0o640
+        or not isinstance(value, dict)
+        or value.get("runId") != run_id
+    ):
+        raise RequestError(f"invalid prior run metadata: {run_id}")
+    return value
+
+
+def trusted_session_in_use(session_id: str) -> bool:
+    if not TRUST_RUNS.is_dir():
+        return False
+    for path in TRUST_RUNS.glob("*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and value.get("sessionId") == session_id:
+            return True
+    return False
+
+
+def bind_resume(metadata: dict[str, object]) -> None:
+    resume_session = bool(metadata["resumeSession"])
+    resumed_from = metadata.get("resumedFrom")
+    session_id = metadata.get("sessionId")
+    if not resume_session:
+        if resumed_from is not None:
+            raise RequestError("resumedFrom requires resumeSession")
+        if metadata.get("agent") == "codex" and session_id is not None:
+            raise RequestError("new Codex runs must let the provider assign the session ID")
+        if metadata.get("agent") in {"claude", "kimi"} and session_id is None:
+            raise RequestError("new Claude and Kimi runs require a fresh session ID")
+        if isinstance(session_id, str) and trusted_session_in_use(session_id):
+            raise RequestError("provider session ID is already assigned to a prior run")
+        if metadata.get("agent") == "hermes":
+            metadata["runtimeRunId"] = metadata["runId"]
+        return
+    if not isinstance(resumed_from, str) or not isinstance(session_id, str):
+        raise RequestError("resumeSession requires resumedFrom and sessionId")
+    prior = load_trust_record(resumed_from)
+    for field in ("agent", "repo", "cwd", "access", "mode"):
+        if metadata.get(field) != prior.get(field):
+            raise RequestError(f"resume request changes trusted {field}")
+        metadata[field] = prior[field]
+    for field in ("model", "effort", "provider"):
+        if metadata.get(field) != prior.get(field):
+            raise RequestError(f"resume request changes trusted {field}")
+    prior_metadata = load_run_metadata(resumed_from)
+    if (
+        prior_metadata.get("status") in ACTIVE_STATES
+        and unit_is_active(prior_metadata.get("unit"))
+    ):
+        raise RequestError("cannot resume an active provider session")
+    trusted_session = prior.get("sessionId")
+    if trusted_session is None:
+        trusted_session = require_provider_session(
+            prior_metadata.get("sessionId"),
+            str(metadata["agent"]),
+            "prior metadata.sessionId",
+        )
+    if session_id != trusted_session:
+        raise RequestError("resume request changes the trusted provider session")
+    metadata["sessionId"] = trusted_session
+    if metadata.get("agent") == "hermes":
+        metadata["runtimeRunId"] = require_uuid(
+            prior.get("runtimeRunId", resumed_from),
+            "prior runtimeRunId",
+        )
+
+
+def append_event(value: dict[str, object]) -> None:
+    path = STATE_ROOT / "worker-runs.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    safe_chown(path, "root", CALLER_NAME)
+    path.chmod(0o640)
+
+
+def unit_is_active(unit: object) -> bool:
+    if not isinstance(unit, str) or not unit:
+        return False
+    result = subprocess.run(
+        ["systemctl", "is-active", "--quiet", unit],
+        check=False,
+        timeout=10,
+    )
+    return result.returncode == 0
+
+
+def assert_available(repo: Path, _access: str) -> None:
+    if not RUNS_DIR.is_dir():
+        return
+    for path in RUNS_DIR.glob("*/metadata.json"):
+        try:
+            run_id = str(uuid.UUID(path.parent.name))
+            value = load_run_metadata(run_id)
+        except (RequestError, ValueError):
+            continue
+        if not isinstance(value, dict) or value.get("repo") != str(repo):
+            continue
+        if value.get("status") not in ACTIVE_STATES or not unit_is_active(value.get("unit")):
+            continue
+        raise RequestError(
+            f"repository already has an active run: {value.get('runId')}"
+        )
+
+
+def assert_session_available(metadata: dict[str, object]) -> None:
+    session_id = metadata.get("sessionId")
+    if not isinstance(session_id, str) or not TRUST_RUNS.is_dir():
+        return
+    run_id = metadata["runId"]
+    for path in TRUST_RUNS.glob("*.json"):
+        try:
+            trusted = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(trusted, dict)
+            or trusted.get("runId") == run_id
+            or trusted.get("sessionId") != session_id
+        ):
+            continue
+        prior_id = trusted.get("runId")
+        if not isinstance(prior_id, str):
+            raise RequestError("provider session has an invalid trust reservation")
+        try:
+            prior = load_run_metadata(prior_id)
+        except RequestError:
+            raise RequestError(
+                f"provider session is reserved by run without status: {prior_id}"
+            )
+        if prior.get("status") not in ACTIVE_STATES:
+            continue
+        if unit_is_active(prior.get("unit")):
+            raise RequestError(f"provider session already has an active run: {prior_id}")
+        try:
+            updated = datetime.fromisoformat(
+                str(prior["updatedAt"]).replace("Z", "+00:00")
+            )
+            age = (datetime.now(timezone.utc) - updated).total_seconds()
+        except (KeyError, ValueError):
+            age = 0
+        if age < 15:
+            raise RequestError(f"provider session is reserved by starting run: {prior_id}")
+
+
+def acl_marker_valid(repo: Path, marker: Path, permission: str) -> bool:
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        state = repo.stat()
+    except (OSError, json.JSONDecodeError):
+        return False
+    return value == {
+        "device": state.st_dev,
+        "inode": state.st_ino,
+        "permission": permission,
+    }
+
+
+def provision_repo_acl(repo: Path, access: str) -> None:
+    marker = ACL_DIR / f"{project_key(repo)}.json"
+    permission = "write" if access == "write" else "read"
+    if acl_marker_valid(repo, marker, permission):
+        return
+    if shutil.which("setfacl") is None:
+        raise RequestError("setfacl is required for repository worker access")
+    subprocess.run(
+        [
+            "setfacl",
+            "-R",
+            "-m",
+            f"u:{WORKER_NAME}:{'rwX' if access == 'write' else 'r-X'}",
+            "--",
+            str(repo),
+        ],
+        check=True,
+        timeout=300,
+    )
+    subprocess.run(
+        [
+            "find",
+            str(repo),
+            "-type",
+            "d",
+            "-exec",
+            "setfacl",
+            "-m",
+            (
+                f"d:u:{WORKER_NAME}:rwx,d:m::rwx"
+                if access == "write"
+                else f"d:u:{WORKER_NAME}:r-x,d:m::rwx"
+            ),
+            "{}",
+            "+",
+        ],
+        check=True,
+        timeout=300,
+    )
+    state = repo.stat()
+    atomic_metadata(
+        marker,
+        {"device": state.st_dev, "inode": state.st_ino, "permission": permission},
+    )
+
+
+def provision_safe_directory(worker_repo: Path) -> None:
+    config = WORKER_HOME / ".gitconfig"
+    with CONFIG_LOCK:
+        if config.is_symlink():
+            raise RequestError("unsafe worker Git configuration")
+        if config.exists() and config.stat().st_uid != 0:
+            raise RequestError("worker Git configuration is not root-owned")
+        result = subprocess.run(
+            ["git", "config", "--file", str(config), "--get-all", "safe.directory"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        existing = set(result.stdout.splitlines()) if result.returncode in {0, 1} else set()
+        if str(worker_repo) not in existing:
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "--file",
+                    str(config),
+                    "--add",
+                    "safe.directory",
+                    str(worker_repo),
+                ],
+                check=True,
+                timeout=20,
+            )
+        safe_chown(config, "root", "root")
+        config.chmod(0o644)
+
+
+def validate_launch(request: dict[str, object]) -> tuple[dict[str, object], str]:
+    raw = request.get("metadata")
+    if not isinstance(raw, dict):
+        raise RequestError("metadata must be an object")
+    packet = require_string(request.get("packet"), "packet", maximum=MAX_PACKET_CHARS)
+    assert packet is not None
+    run_id = require_uuid(raw.get("runId"), "metadata.runId")
+    assert run_id is not None
+    repo, cwd = resolve_git_paths(raw.get("repo"), raw.get("cwd"))
+    agent = require_string(raw.get("agent"), "metadata.agent", maximum=16)
+    access = require_string(raw.get("access"), "metadata.access", maximum=16)
+    mode = require_string(raw.get("mode"), "metadata.mode", maximum=16)
+    role = require_string(raw.get("role"), "metadata.role", maximum=2000)
+    if agent not in {"codex", "claude", "kimi", "hermes"}:
+        raise RequestError("unsupported agent")
+    if access not in {"read", "write"}:
+        raise RequestError("unsupported access mode")
+    if mode not in {"task", "project"}:
+        raise RequestError("unsupported session mode")
+    model = require_string(raw.get("model"), "metadata.model", maximum=500, optional=True)
+    effort = require_string(
+        raw.get("effort"),
+        "metadata.effort",
+        maximum=16,
+        optional=True,
+    )
+    model, effort, model_source, effort_source, provider = resolve_worker_model(
+        agent,
+        model,
+        effort,
+    )
+    session_id = require_provider_session(
+        raw.get("sessionId"), agent, "metadata.sessionId", optional=True
+    )
+    resumed_from = require_uuid(raw.get("resumedFrom"), "metadata.resumedFrom", optional=True)
+    resume_session = raw.get("resumeSession")
+    if not isinstance(resume_session, bool):
+        raise RequestError("metadata.resumeSession must be boolean")
+    unit = f"agent-worker-{run_id.replace('-', '')}.service"
+    worker_repo, worker_cwd = worker_paths(repo, cwd)
+    now = utc_now()
+    metadata: dict[str, object] = {
+        "schemaVersion": 4,
+        "runId": run_id,
+        "createdAt": now,
+        "updatedAt": now,
+        "status": "starting",
+        "agent": agent,
+        "repo": str(repo),
+        "cwd": str(cwd),
+        "workerRepo": str(worker_repo),
+        "workerCwd": str(worker_cwd),
+        "access": access,
+        "permissionProfile": "bypass" if access == "write" else "read-only",
+        "mode": mode,
+        "role": role,
+        "model": model,
+        "modelSource": model_source,
+        "effort": effort,
+        "effortSource": effort_source,
+        "provider": provider,
+        "sessionId": session_id,
+        "resumedFrom": resumed_from,
+        "resumeSession": resume_session,
+        "unit": unit,
+        "logPath": str(RUNS_DIR / run_id / "stream.log"),
+        "outputPath": str(RUNS_DIR / run_id / "final.txt"),
+    }
+    bind_resume(metadata)
+    return metadata, packet
+
+
+def launch(request: dict[str, object]) -> dict[str, object]:
+    metadata, packet = validate_launch(request)
+    repo = Path(str(metadata["repo"]))
+    worker_repo = Path(str(metadata["workerRepo"]))
+    run_id = str(metadata["runId"])
+    unit = str(metadata["unit"])
+    access = str(metadata["access"])
+    assert_available(repo, access)
+    assert_session_available(metadata)
+    save_trust_record(metadata)
+    provision_repo_acl(repo, access)
+    provision_safe_directory(worker_repo)
+    if metadata["agent"] == "hermes":
+        ensure_directory(
+            WORKER_HERMES_HOME,
+            mode=0o700,
+            user=WORKER_NAME,
+            group=WORKER_NAME,
+        )
+        ensure_directory(
+            HERMES_RUNTIME_ROOT,
+            mode=0o700,
+            user=WORKER_NAME,
+            group=WORKER_NAME,
+        )
+
+    ensure_directory(
+        worker_repo,
+        mode=0o700,
+        user=WORKER_NAME,
+        group=WORKER_NAME,
+    )
+    if metadata["agent"] == "kimi" and access == "read":
+        ensure_directory(
+            SCRATCH_ROOT / str(metadata["sessionId"]),
+            mode=0o700,
+            user=WORKER_NAME,
+            group=WORKER_NAME,
+        )
+    run_root = RUNS_DIR / run_id
+    ensure_directory(
+        run_root,
+        mode=0o2750,
+        user="root",
+        group=CALLER_NAME,
+    )
+    prompt_path = PROMPT_DIR / f"{run_id}.prompt"
+    with prompt_path.open("x", encoding="utf-8") as handle:
+        handle.write(packet)
+        handle.flush()
+        os.fsync(handle.fileno())
+    safe_chown(prompt_path, "root", "root")
+    prompt_path.chmod(0o600)
+    metadata["status"] = "queued"
+    metadata["updatedAt"] = utc_now()
+    atomic_metadata(run_root / "metadata.json", metadata)
+    bind_property = (
+        f"BindReadOnlyPaths={repo}:{worker_repo}"
+        if access == "read"
+        else f"BindPaths={repo}:{worker_repo}"
+    )
+    writable_paths = [
+        WORKER_HOME / ".cache",
+        WORKER_HOME / ".config",
+        STATE_ROOT,
+        WORKER_HOME / ".state",
+        WORKER_HOME / ".codex",
+        WORKER_HOME / ".claude",
+        WORKER_HOME / ".kimi",
+        WORKER_HERMES_HOME,
+        HERMES_RUNTIME_ROOT,
+        TRUST_ROOT,
+        SCRATCH_ROOT,
+        Path("/run/agent-worker"),
+    ]
+    if access == "write":
+        writable_paths.append(worker_repo)
+    read_write = "ReadWritePaths=" + " ".join(str(path) for path in writable_paths)
+    command = [
+        "systemd-run",
+        "--unit",
+        unit,
+        "--collect",
+        "--no-block",
+        "--quiet",
+        "--description",
+        f"Repository worker {run_id} ({metadata['agent']})",
+        "--uid",
+        "root",
+        "--gid",
+        "root",
+        "--working-directory",
+        str(metadata["workerCwd"]),
+        "--property",
+        "KillMode=control-group",
+        "--property",
+        "TimeoutStopSec=30s",
+        "--property",
+        "NoNewPrivileges=yes",
+        "--property",
+        "PrivateTmp=yes",
+        "--property",
+        "PrivateDevices=yes",
+        "--property",
+        "ProtectSystem=strict",
+        "--property",
+        "ProtectHome=yes",
+        "--property",
+        "ProtectKernelTunables=yes",
+        "--property",
+        "ProtectKernelModules=yes",
+        "--property",
+        "ProtectKernelLogs=yes",
+        "--property",
+        "ProtectControlGroups=yes",
+        "--property",
+        "RestrictSUIDSGID=yes",
+        "--property",
+        "LockPersonality=yes",
+        "--property",
+        "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_READ_SEARCH",
+        "--property",
+        "AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_READ_SEARCH",
+        "--property",
+        "UMask=0077",
+        "--property",
+        read_write,
+        "--property",
+        bind_property,
+        "--setenv",
+        f"HOME={WORKER_HOME}",
+        "--setenv",
+        f"XDG_CONFIG_HOME={WORKER_HOME / '.config'}",
+        "--setenv",
+        f"XDG_STATE_HOME={WORKER_HOME / '.local/state'}",
+        "--setenv",
+        f"XDG_CACHE_HOME={WORKER_HOME / '.cache'}",
+        "--setenv",
+        f"AGENT_WORKER_STATE_DIR={STATE_ROOT}",
+        "--setenv",
+        "AGENT_WORKER_MANAGED=1",
+        "--setenv",
+        "PATH=/var/lib/agent-worker/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        "/usr/bin/python3",
+        str(RUNNER),
+        "--internal-run",
+        run_id,
+        "--packet-file",
+        str(prompt_path),
+    ]
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode:
+        prompt_path.unlink(missing_ok=True)
+        metadata["status"] = "failed"
+        metadata["returnCode"] = result.returncode
+        metadata["completedAt"] = utc_now()
+        metadata["launchError"] = (result.stderr.strip() or result.stdout.strip())[:1000]
+        atomic_metadata(run_root / "metadata.json", metadata)
+        raise RequestError(f"failed to start worker service: {metadata['launchError']}")
+    append_event(
+        {
+            "event": "queued",
+            "runId": run_id,
+            "at": metadata["createdAt"],
+            "agent": metadata["agent"],
+            "repo": metadata["repo"],
+            "access": metadata["access"],
+            "mode": metadata["mode"],
+            "model": metadata["model"],
+            "effort": metadata["effort"],
+            "sessionId": metadata.get("sessionId"),
+            "unit": unit,
+        }
+    )
+    return {
+        "runId": run_id,
+        "status": "queued",
+        "agent": metadata["agent"],
+        "repo": metadata["repo"],
+        "access": access,
+        "permissionProfile": metadata["permissionProfile"],
+        "mode": metadata["mode"],
+        "model": metadata["model"],
+        "effort": metadata["effort"],
+        "sessionId": metadata.get("sessionId"),
+        "unit": unit,
+    }
+
+
+def path_auth_ok(path: Path) -> bool:
+    try:
+        state = path.stat()
+    except OSError:
+        return False
+    worker = pwd.getpwnam(WORKER_NAME)
+    return (
+        path.is_file()
+        and state.st_uid == worker.pw_uid
+        and state.st_mode & 0o077 == 0
+        and state.st_size > 0
+    )
+
+
+def probe() -> dict[str, object]:
+    worker = pwd.getpwnam(WORKER_NAME)
+    probe_unit = f"agent-worker-boundary-probe-{uuid.uuid4().hex}.service"
+    memory_probe = subprocess.run(
+        [
+            "systemd-run",
+            "--unit",
+            probe_unit,
+            "--collect",
+            "--wait",
+            "--quiet",
+            "--pipe",
+            "--uid",
+            WORKER_NAME,
+            "--gid",
+            WORKER_NAME,
+            "--property",
+            "NoNewPrivileges=yes",
+            "--property",
+            "ProtectHome=yes",
+            "--property",
+            "CapabilityBoundingSet=",
+            "--property",
+            "AmbientCapabilities=",
+            "/bin/sh",
+            "-c",
+            "awk '/^(CapEff|CapBnd|NoNewPrivs):/ { print }' /proc/self/status; "
+            "test ! -x /home/hermes",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    boundary_status = {
+        key: value
+        for line in memory_probe.stdout.splitlines()
+        for key, separator, value in [line.partition(":")]
+        if separator
+    }
+    binaries = {
+        name: shutil.which(name, path="/var/lib/agent-worker/.local/bin:/usr/local/bin:/usr/bin:/bin")
+        is not None
+        for name in ("codex", "claude", "kimi")
+    }
+    binaries["hermes"] = HERMES_ADAPTER.is_file()
+    checks = {
+        "dedicatedIdentity": worker.pw_uid not in {0, pwd.getpwnam(CALLER_NAME).pw_uid},
+        "memoryBoundary": memory_probe.returncode == 0,
+        "effectiveCapabilities": boundary_status.get("CapEff", "").strip() == "0000000000000000",
+        "capabilityBoundingSet": boundary_status.get("CapBnd", "").strip() == "0000000000000000",
+        "noNewPrivileges": boundary_status.get("NoNewPrivs", "").strip() == "1",
+        "systemServiceManager": Path("/run/systemd/system").is_dir(),
+        "privateRuntime": RUNS_DIR.is_dir() and STATE_ROOT.stat().st_mode & 0o007 == 0,
+        "canonicalPolicy": (POLICY_ROOT / "AGENTS.md").is_file(),
+        "codex": binaries["codex"],
+        "claude": binaries["claude"],
+        "kimi": binaries["kimi"],
+        "hermes": binaries["hermes"],
+        "codexAuth": path_auth_ok(WORKER_HOME / ".codex/auth.json"),
+        "claudeAuth": path_auth_ok(WORKER_HOME / ".claude/.credentials.json"),
+        "kimiAuth": path_auth_ok(WORKER_HOME / ".kimi/config.toml"),
+        "providerDefaults": bool(load_provider_defaults()),
+    }
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "workerUid": worker.pw_uid,
+        "runtimeRoot": str(STATE_ROOT),
+    }
+
+
+def handle_request(request: object) -> dict[str, object]:
+    if not isinstance(request, dict):
+        raise RequestError("request must be an object")
+    action = request.get("action")
+    if action == "probe":
+        return probe()
+    if action == "launch":
+        with LAUNCH_LOCK:
+            return launch(request)
+    raise RequestError("unsupported action")
+
+
+def read_request(connection: socket.socket) -> object:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = connection.recv(min(65536, MAX_REQUEST_BYTES + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > MAX_REQUEST_BYTES:
+            raise RequestError("request exceeds size limit")
+        if b"\n" in chunk:
+            break
+    raw = b"".join(chunks)
+    line, _, remainder = raw.partition(b"\n")
+    if remainder.strip():
+        raise RequestError("only one request is allowed per connection")
+    try:
+        return json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RequestError("request is not valid JSON") from exc
+
+
+def serve_connection(connection: socket.socket) -> None:
+    with connection:
+        try:
+            _pid, uid, _gid = struct.unpack(
+                "3i",
+                connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+            )
+            allowed = {0, pwd.getpwnam(CALLER_NAME).pw_uid}
+            if uid not in allowed:
+                raise RequestError("caller is not authorized")
+            response = {"ok": True, "result": handle_request(read_request(connection))}
+        except RequestError as exc:
+            response = {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            traceback.print_exc()
+            response = {
+                "ok": False,
+                "error": f"broker internal error: {type(exc).__name__}: {exc}",
+            }
+        connection.sendall((json.dumps(response, sort_keys=True) + "\n").encode())
+
+
+def main() -> int:
+    if int(os.environ.get("LISTEN_FDS", "0")) < 1:
+        raise SystemExit("agent-worker-broker requires systemd socket activation")
+    ensure_runtime_directories()
+    listener = socket.socket(fileno=3)
+    while True:
+        connection, _ = listener.accept()
+        thread = threading.Thread(target=serve_connection, args=(connection,), daemon=True)
+        thread.start()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Keep every holder of the shared ChatGPT sign-in on its newest token pair.
+
+ChatGPT refresh tokens are single-use: the first holder to refresh invalidates
+every other copy. The default Hermes profile, its Codex CLI, and the repository
+worker's Hermes and Codex stores share one grant, so each run copies the newest
+pair (by access-token issue time) into every holder that lags. Before any
+holder reaches its own refresh point, the default profile refreshes the pair
+once under its auth lock, so holders never race to spend the same token.
+"""
+
+import base64
+import datetime as dt
+import fcntl
+import json
+import os
+import subprocess
+import time
+import uuid
+from contextlib import ExitStack
+from pathlib import Path
+
+PROVIDER = "openai-codex"
+HERMES_USER = "hermes"
+HERMES_CLI = Path("/home/hermes/.local/bin/hermes")
+# The default profile defines the account; holders signed in elsewhere are left alone.
+PRIMARY = Path("/home/hermes/.hermes/auth.json")
+HERMES_STORES = (PRIMARY, Path("/var/lib/agent-worker/.hermes/auth.json"))
+CODEX_STORES = (
+    Path("/home/hermes/.codex/auth.json"),
+    Path("/var/lib/agent-worker/.codex/auth.json"),
+)
+# Hermes refreshes two minutes before the ten-day expiry; refreshing centrally at
+# five days means no holder reaches its own refresh point on a shared token.
+REFRESH_AFTER_SECONDS = 5 * 86400
+LOCK_TIMEOUT_SECONDS = 30
+STATUS_FIELDS = (
+    "last_status",
+    "last_status_at",
+    "last_error_code",
+    "last_error_reason",
+    "last_error_message",
+    "last_error_reset_at",
+)
+
+
+def jwt_claims(token: object) -> dict:
+    if not isinstance(token, str):
+        return {}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        value = json.loads(base64.urlsafe_b64decode(payload))
+    except (IndexError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def account_of(access_token: object) -> str | None:
+    auth = jwt_claims(access_token).get("https://api.openai.com/auth")
+    account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
+    return account if isinstance(account, str) and account else None
+
+
+def issued_at(access_token: object) -> float:
+    value = jwt_claims(access_token).get("iat")
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def refresh_due(pair: dict, now: float) -> bool:
+    return now - issued_at(pair["access_token"]) >= REFRESH_AFTER_SECONDS
+
+
+def pool_entries(store: dict) -> list[dict]:
+    pool = store.get("credential_pool")
+    entries = pool.get(PROVIDER) if isinstance(pool, dict) else None
+    return [entry for entry in entries or [] if isinstance(entry, dict)]
+
+
+def singleton(store: dict) -> dict | None:
+    providers = store.get("providers")
+    state = providers.get(PROVIDER) if isinstance(providers, dict) else None
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+    return tokens if isinstance(tokens, dict) else None
+
+
+def token_pairs(path: Path, store: dict) -> list[dict]:
+    if path in CODEX_STORES:
+        tokens = store.get("tokens")
+        return [tokens] if isinstance(tokens, dict) else []
+    tokens = singleton(store)
+    return ([tokens] if tokens else []) + pool_entries(store)
+
+
+def usable(pair: dict, account: str) -> bool:
+    return (
+        isinstance(pair.get("access_token"), str)
+        and isinstance(pair.get("refresh_token"), str)
+        and bool(pair["refresh_token"])
+        and account_of(pair["access_token"]) == account
+    )
+
+
+def holds_other_account(pair: dict | None, account: str) -> bool:
+    other = account_of(pair.get("access_token")) if pair else None
+    return other is not None and other != account
+
+
+def refreshed_iso(pair: dict) -> str:
+    moment = dt.datetime.fromtimestamp(issued_at(pair["access_token"]), dt.UTC)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def adopt(tokens: dict, pair: dict, id_token: str | None, account: str) -> dict:
+    updated = {
+        **tokens,
+        "access_token": pair["access_token"],
+        "refresh_token": pair["refresh_token"],
+        "account_id": account,
+    }
+    if id_token:
+        updated["id_token"] = id_token
+    return updated
+
+
+def apply(path: Path, store: dict, pair: dict, id_token: str | None, account: str) -> bool:
+    changed = False
+    if path in CODEX_STORES:
+        tokens = store.get("tokens") if isinstance(store.get("tokens"), dict) else {}
+        if holds_other_account(tokens, account):
+            return False
+        if tokens.get("refresh_token") != pair["refresh_token"]:
+            store["tokens"] = adopt(tokens, pair, id_token, account)
+            store["last_refresh"] = refreshed_iso(pair)
+            changed = True
+        return changed
+
+    tokens = singleton(store) or {}
+    if not holds_other_account(tokens, account) and tokens.get("refresh_token") != pair["refresh_token"]:
+        providers = store.setdefault("providers", {})
+        state = providers.setdefault(PROVIDER, {})
+        state["tokens"] = adopt(tokens, pair, id_token, account)
+        state["last_refresh"] = refreshed_iso(pair)
+        state.setdefault("auth_mode", "chatgpt")
+        changed = True
+    for entry in pool_entries(store):
+        if holds_other_account(entry, account) or entry.get("refresh_token") == pair["refresh_token"]:
+            continue
+        entry["access_token"] = pair["access_token"]
+        entry["refresh_token"] = pair["refresh_token"]
+        entry["last_refresh"] = refreshed_iso(pair)
+        # The recorded status described the spent pair; a successful refresh clears it too.
+        for field in STATUS_FIELDS:
+            if field in entry:
+                entry[field] = None
+        changed = True
+    return changed
+
+
+def lock_store(stack: ExitStack, path: Path) -> None:
+    lock_path = path.with_suffix(".lock")
+    if not lock_path.exists():
+        # Hermes opens its lock for append, so a root-owned lock would lock it out.
+        info = path.stat()
+        lock_path.touch(mode=0o644)
+        os.chown(lock_path, info.st_uid, info.st_gid)
+    descriptor = os.open(lock_path, os.O_RDONLY)
+    stack.callback(os.close, descriptor)
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise SystemExit(f"codex-auth-sync: timed out waiting for {lock_path}")
+            time.sleep(0.2)
+
+
+def write_json(path: Path, value: dict) -> None:
+    info = path.stat()
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchown(handle.fileno(), info.st_uid, info.st_gid)
+            handle.write(json.dumps(value, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def sync() -> tuple[dict, list[Path], str | None]:
+    """Propagate the newest pair; return it, the rewritten stores, and its primary pool id."""
+    with ExitStack() as stack:
+        for path in HERMES_STORES:
+            if path.exists():
+                lock_store(stack, path)
+        stores = {}
+        for path in (*HERMES_STORES, *CODEX_STORES):
+            if path.exists():
+                value = json.loads(path.read_text(encoding="utf-8-sig"))
+                if not isinstance(value, dict):
+                    raise SystemExit(f"codex-auth-sync: {path} is not a JSON object")
+                stores[path] = value
+        if PRIMARY not in stores:
+            raise SystemExit(f"codex-auth-sync: {PRIMARY} is missing")
+        account = account_of((singleton(stores[PRIMARY]) or {}).get("access_token"))
+        if account is None:
+            raise SystemExit("codex-auth-sync: the default profile has no ChatGPT sign-in")
+        candidates = [
+            pair
+            for path, store in stores.items()
+            for pair in token_pairs(path, store)
+            if usable(pair, account)
+        ]
+        newest = max(candidates, key=lambda pair: issued_at(pair["access_token"]))
+        id_token = next(
+            (
+                pair["id_token"]
+                for pair in candidates
+                if pair["refresh_token"] == newest["refresh_token"]
+                and isinstance(pair.get("id_token"), str)
+                and pair["id_token"]
+            ),
+            None,
+        )
+        changed = []
+        for path, store in stores.items():
+            if apply(path, store, newest, id_token, account):
+                write_json(path, store)
+                changed.append(path)
+        entry_id = next(
+            (
+                entry.get("id")
+                for entry in pool_entries(stores[PRIMARY])
+                if entry.get("refresh_token") == newest["refresh_token"]
+                and isinstance(entry.get("id"), str)
+            ),
+            None,
+        )
+        return dict(newest), changed, entry_id
+
+
+def refresh(entry_id: str) -> None:
+    result = subprocess.run(
+        [str(HERMES_CLI), "auth", "refresh", PROVIDER, entry_id],
+        user=HERMES_USER,
+        group=HERMES_USER,
+        extra_groups=[],
+        env={
+            "HOME": f"/home/{HERMES_USER}",
+            "HERMES_HOME": str(PRIMARY.parent),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+        },
+        cwd=f"/home/{HERMES_USER}",
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    outcome = [line for line in result.stdout.splitlines() if line.startswith("Refresh")]
+    if result.returncode != 0 or not outcome:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["no output"]
+        raise SystemExit(f"codex-auth-sync: central refresh failed: {detail[0]}")
+    print(f"codex-auth-sync: {outcome[-1]}")
+
+
+def report(changed: list[Path]) -> None:
+    for path in changed:
+        print(f"codex-auth-sync: updated {path}")
+
+
+def main() -> int:
+    pair, changed, entry_id = sync()
+    report(changed)
+    if refresh_due(pair, time.time()):
+        if entry_id is None:
+            raise SystemExit("codex-auth-sync: no default-profile pool entry holds the newest pair")
+        refresh(entry_id)
+        _, changed, _ = sync()
+        report(changed)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

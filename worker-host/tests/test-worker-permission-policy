@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Validate repository-worker permission profiles without starting providers."""
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from contextlib import redirect_stdout
+import io
+import json
+from pathlib import Path
+import os
+import sys
+import tempfile
+
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+if sys.platform == "darwin":
+    adapter = WORKSPACE / "scripts" / "test-worker-permission-policy-macos"
+    os.execv(sys.executable, [sys.executable, str(adapter), *sys.argv[1:]])
+WORKER_PATH = WORKSPACE / "scripts" / "repo-worker"
+loader = SourceFileLoader("repo_worker_permission_test", str(WORKER_PATH))
+spec = spec_from_loader(loader.name, loader)
+if spec is None:
+    raise SystemExit("could not load repo-worker")
+worker = module_from_spec(spec)
+loader.exec_module(worker)
+
+worker.command_path = lambda name: f"/native/{name}"
+worker.prepare_kimi_runtime = lambda: None
+worker.ensure_private_dir = lambda _path: None
+worker.KIMI_ADAPTER = Path("/managed/agent-kimi")
+DEFAULTS = {
+    "codex": "gpt-5.6-sol",
+    "claude": "claude-opus-5",
+    "kimi": "kimi-code/k3",
+}
+
+
+def metadata(agent: str, access: str, *, resume: bool = False) -> dict[str, object]:
+    session_id = "11111111-2222-3333-4444-555555555555"
+    return {
+        "agent": agent,
+        "access": access,
+        "model": DEFAULTS[agent],
+        "effort": "high",
+        "sessionId": session_id if agent != "codex" or resume else None,
+        "resumeSession": resume,
+    }
+
+
+def command(agent: str, access: str, *, resume: bool = False) -> list[str]:
+    return worker.child_command(
+        metadata(agent, access, resume=resume),
+        requested_repo=Path("/repo"),
+        output_path=Path("/runtime/final.txt"),
+    )
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SystemExit(message)
+
+
+owner_turn_environment = {
+    "OPENCLAW_MCP_MESSAGE_CHANNEL": "bluebubbles",
+    "OPENCLAW_MCP_SESSION_KEY": "agent:main:bluebubbles:direct:+15550001111",
+}
+require(
+    worker.is_shared_owner_cli_session(owner_turn_environment),
+    "owner BlueBubbles CLI sessions are not identified",
+)
+require(
+    not worker.is_shared_owner_cli_session(
+        {
+            "OPENCLAW_MCP_MESSAGE_CHANNEL": "cron",
+            "OPENCLAW_MCP_SESSION_KEY": "agent:main:cron:watch",
+        }
+    ),
+    "non-owner CLI sessions are incorrectly identified",
+)
+require(
+    not worker.is_shared_owner_cli_session(
+        {
+            "OPENCLAW_MCP_MESSAGE_CHANNEL": "bluebubbles",
+            "OPENCLAW_MCP_SESSION_KEY": "agent:ashlyn:bluebubbles:direct:+15550002222",
+        }
+    ),
+    "non-main BlueBubbles sessions are incorrectly identified",
+)
+try:
+    worker.reject_shared_owner_wait(owner_turn_environment)
+except SystemExit as exc:
+    require("refusing --wait" in str(exc), "owner wait rejection is not actionable")
+else:
+    raise SystemExit("owner CLI sessions may still wait on repository workers")
+
+
+codex_write = command("codex", "write")
+codex_read = command("codex", "read")
+codex_read_resume = command("codex", "read", resume=True)
+require(
+    "--dangerously-bypass-approvals-and-sandbox" in codex_write,
+    "Codex write workers do not bypass approvals and sandboxing",
+)
+for value in (codex_read, codex_read_resume):
+    require(
+        "--dangerously-bypass-approvals-and-sandbox" not in value
+        and "--dangerously-bypass-hook-trust" not in value,
+        "Codex read workers retain a dangerous bypass flag",
+    )
+    require(
+        'approval_policy="never"' in value,
+        "Codex read workers may prompt for elevated approval",
+    )
+require(
+    ["--sandbox", "danger-full-access"] == codex_read[
+        codex_read.index("--sandbox") : codex_read.index("--sandbox") + 2
+    ],
+    "new Codex read workers do not defer filesystem enforcement to systemd",
+)
+require(
+    'sandbox_mode="danger-full-access"' in codex_read_resume
+    and "--sandbox" not in codex_read_resume,
+    "resumed Codex read workers use unsupported sandbox CLI arguments",
+)
+for value in (codex_write, codex_read, codex_read_resume):
+    require(
+        ["--model", "gpt-5.6-sol"]
+        == value[value.index("--model") : value.index("--model") + 2]
+        and 'model_reasoning_effort="high"' in value,
+        "Codex worker host defaults are not applied",
+    )
+
+claude_write = command("claude", "write")
+claude_read = command("claude", "read")
+for value in (claude_write, claude_read):
+    require(
+        "--strict-mcp-config" in value,
+        "Claude workers may inherit external MCP configurations",
+    )
+    require(
+        ["--mcp-config", '{"mcpServers":{}}']
+        == value[value.index("--mcp-config") : value.index("--mcp-config") + 2],
+        "Claude workers do not pin an empty MCP configuration",
+    )
+require(
+    ["--permission-mode", "bypassPermissions"]
+    == claude_write[
+        claude_write.index("--permission-mode") :
+        claude_write.index("--permission-mode") + 2
+    ],
+    "Claude write workers do not use bypassPermissions",
+)
+require(
+    ["--permission-mode", "dontAsk"]
+    == claude_read[
+        claude_read.index("--permission-mode") :
+        claude_read.index("--permission-mode") + 2
+    ],
+    "Claude read workers do not use dontAsk",
+)
+for value in (claude_write, claude_read):
+    require(
+        ["--model", "claude-opus-5"]
+        == value[value.index("--model") : value.index("--model") + 2]
+        and ["--effort", "high"]
+        == value[value.index("--effort") : value.index("--effort") + 2],
+        "Claude worker host defaults are not applied",
+    )
+
+with tempfile.TemporaryDirectory() as temp:
+    worker.RUNTIME_ROOT = Path(temp)
+    kimi_write = command("kimi", "write")
+    kimi_read = command("kimi", "read")
+require(kimi_write[0] == "/managed/agent-kimi", "Kimi adapter is bypassed")
+require("--yolo" not in kimi_write + kimi_read, "repo-worker injects Kimi yolo directly")
+for value in (kimi_write, kimi_read):
+    require(
+        ["--model", "kimi-code/k3"]
+        == value[value.index("--model") : value.index("--model") + 2]
+        and "--thinking" in value,
+        "Kimi K3 1M thinking default is not applied",
+    )
+require(
+    worker.sanitized_environment("kimi", "write")["AGENT_ACCESS_MODE"] == "write",
+    "Kimi write access is not exported to the managed launcher",
+)
+require(
+    worker.sanitized_environment("kimi", "read")["AGENT_ACCESS_MODE"] == "read",
+    "Kimi read access is not exported to the managed launcher",
+)
+
+packet_write = worker.task_packet(
+    run_id="run",
+    role="implementation owner",
+    task="Implement the change.",
+    requested_repo=Path("/repo"),
+    repo_root=Path("/repo"),
+    access="write",
+    mode="task",
+    constraints=[],
+    success=[],
+)
+packet_read = worker.task_packet(
+    run_id="run",
+    role="reviewer",
+    task="Review the change.",
+    requested_repo=Path("/repo"),
+    repo_root=Path("/repo"),
+    access="read",
+    mode="task",
+    constraints=[],
+    success=[],
+)
+require(
+    "Write access uses provider permission bypass" in packet_write,
+    "write packet omits the permission boundary",
+)
+require(
+    "Read access disables provider bypass" in packet_read,
+    "read packet omits the permission boundary",
+)
+
+fake_session = "88888888-9999-aaaa-bbbb-cccccccccccc"
+final_parts: list[str] = []
+codex_session, codex_final = worker.parse_stream_line(
+    "codex",
+    json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": f"reported session id: {fake_session}",
+            },
+        }
+    ),
+    final_parts,
+)
+require(
+    codex_session is None
+    and codex_final == f"reported session id: {fake_session}",
+    "model-authored Codex text can replace the trusted provider session",
+)
+kimi_session, _ = worker.parse_stream_line(
+    "kimi",
+    f"To resume this session: kimi -r {fake_session}",
+    [],
+)
+require(kimi_session == fake_session, "Kimi adapter session text is not parsed")
+
+with tempfile.TemporaryDirectory() as temp:
+    run_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    worker.RUNS_DIR = Path(temp) / "runs"
+    path = worker.RUNS_DIR / run_id / "metadata.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "runId": run_id,
+                "status": "queued",
+                "updatedAt": "2000-01-01T00:00:00Z",
+                "unit": "missing-worker.service",
+                "logPath": str(path.parent / "stream.log"),
+            }
+        )
+    )
+    worker.unit_state = lambda _unit: {
+        "activeState": "inactive",
+        "subState": "not-found",
+        "mainPid": None,
+    }
+    with redirect_stdout(io.StringIO()):
+        orphan_return_code = worker.wait_for_run(run_id, timeout=0, stale_after=60)
+    require(
+        orphan_return_code == 125,
+        "an orphaned worker can make --wait block indefinitely",
+    )
+
+worker.MANAGED_RUNTIME = True
+wrapped = worker.provider_process_command(["/native/codex", "exec"])
+require(
+    wrapped[:2] == ["/usr/bin/setpriv", "--reuid=agent-worker"]
+    and "--no-new-privs" in wrapped
+    and "--bounding-set=-all" in wrapped,
+    "managed providers are not dropped to the zero-capability worker identity",
+)
+
+with tempfile.TemporaryDirectory() as temp:
+    run_id = "11111111-aaaa-bbbb-cccc-222222222222"
+    worker.TRUST_RUNS = Path(temp)
+    trust_path = worker.TRUST_RUNS / f"{run_id}.json"
+    trust_path.write_text(
+        json.dumps(
+            {
+                "runId": run_id,
+                "agent": "codex",
+                "repo": "/repo",
+                "cwd": "/repo",
+                "access": "write",
+                "mode": "task",
+                "sessionId": None,
+            }
+        )
+    )
+    trust_path.chmod(0o600)
+    session_id = "33333333-4444-5555-6666-777777777777"
+    worker.seal_trust_session(
+        {
+            "runId": run_id,
+            "agent": "codex",
+            "repo": "/repo",
+            "cwd": "/repo",
+            "access": "write",
+            "mode": "task",
+        },
+        session_id,
+    )
+    sealed = json.loads(trust_path.read_text())
+    require(
+        sealed["sessionId"] == session_id
+        and trust_path.stat().st_uid == 0
+        and trust_path.stat().st_mode & 0o077 == 0,
+        "provider session discovery was not sealed into root-owned trust state",
+    )
+worker.MANAGED_RUNTIME = False
+
+print("Validated repository-worker permission profiles.")

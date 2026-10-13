@@ -1,0 +1,14 @@
+[Unit]
+Description=Repository worker launch broker socket
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/agent-worker/broker.sock
+SocketUser=root
+SocketGroup=hermes
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Validate durable auth, launcher routing, and Remote Control supervision."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import pwd
+import stat
+import subprocess
+import sys
+
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+if sys.platform == "darwin":
+    adapter = WORKSPACE / "scripts" / "test-agent-runtime-policy-macos"
+    os.execv(sys.executable, [sys.executable, str(adapter), *sys.argv[1:]])
+CONFIG = WORKSPACE.parent / "openclaw.json"
+CLAUDE_LAUNCHER = Path("/root/.agents/bin/agent-claude")
+CODEX_AUTH = Path("/root/.codex/auth.json")
+CLAUDE_AUTH = Path("/root/.claude/.credentials.json")
+CLAUDE_SUDOERS = Path("/etc/sudoers.d/claude-agent-host-admin")
+REMOTE_CONTROL_SUPERVISOR = Path(
+    "/usr/local/libexec/openclaw-codex-remote-control-supervisor"
+)
+REMOTE_CONTROL_SETTINGS = Path("/root/.codex/app-server-daemon/settings.json")
+REMOTE_CONTROL_UNIT = Path(
+    "/root/.config/systemd/user/codex-remote-control-supervisor.service"
+)
+ROOT_RUNTIME_ENV = {
+    "HOME": "/root",
+    "XDG_RUNTIME_DIR": "/run/user/0",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/0/bus",
+    "OPENCLAW_STATE_DIR": "/root/.openclaw",
+}
+EXPECTED_CLI_WATCHDOG = {
+    "fresh": {"noOutputTimeoutMs": 90_000},
+    "resume": {"noOutputTimeoutMs": 90_000},
+}
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+def ensure_host_access() -> None:
+    if os.geteuid() != 0:
+        os.execvp(
+            "sudo",
+            [
+                "sudo",
+                "-n",
+                "env",
+                *(f"{key}={value}" for key, value in ROOT_RUNTIME_ENV.items()),
+                sys.executable,
+                str(Path(__file__).resolve()),
+                *sys.argv[1:],
+            ],
+        )
+    os.environ.update(ROOT_RUNTIME_ENV)
+
+
+def command_ok(command: list[str], *, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(
+        command,
+        cwd="/",
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        fail(f"command failed ({' '.join(command)}), exit={result.returncode}")
+    return result.stdout.strip() or result.stderr.strip()
+
+
+def require_mode(path: Path, expected_mode: int, expected_uid: int) -> None:
+    if not path.is_file():
+        fail(f"required runtime file is missing: {path}")
+    state = path.stat()
+    mode = stat.S_IMODE(state.st_mode)
+    if mode != expected_mode or state.st_uid != expected_uid:
+        fail(
+            f"unsafe runtime file metadata: {path} "
+            f"uid={state.st_uid} mode={mode:o}"
+        )
+
+
+def require_sequence(values: object, expected: tuple[str, ...], label: str) -> list[str]:
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        fail(f"{label} must be a string array")
+    for item in expected:
+        if item not in values:
+            fail(f"{label} is missing {item}")
+    return values
+
+
+def main() -> int:
+    ensure_host_access()
+    config = json.loads(CONFIG.read_text(encoding="utf-8"))
+    backends = config["agents"]["defaults"]["cliBackends"]
+
+    if "codex-cli" in backends:
+        fail("retired codex-cli backend remains configured")
+
+    claude = backends.get("claude-cli")
+    if not isinstance(claude, dict):
+        fail("claude-cli backend is missing")
+    if claude.get("command") != str(CLAUDE_LAUNCHER):
+        fail("claude-cli backend does not use the global launcher")
+    if claude.get("env") != {
+        "AGENT_CLAUDE_RUN_AS": "claude-agent",
+        "AGENT_CLAUDE_CONFIG_DIR": "/root/.claude",
+        "AGENT_CLAUDE_HOST_ADMIN": "1",
+        "OPENCLAW_STATE_DIR": "/root/.openclaw",
+        "AGENT_REMOTE_CONTROL": "0",
+    }:
+        fail("claude-cli backend runtime identity changed")
+    require_sequence(
+        claude.get("args"),
+        ("--permission-mode", "bypassPermissions", "--effort", "high"),
+        "claude-cli args",
+    )
+    require_sequence(
+        claude.get("resumeArgs"),
+        (
+            "--permission-mode",
+            "bypassPermissions",
+            "--effort",
+            "high",
+            "--resume",
+            "{sessionId}",
+        ),
+        "claude-cli resumeArgs",
+    )
+    if claude.get("reliability", {}).get("watchdog") != EXPECTED_CLI_WATCHDOG:
+        fail("claude-cli no-output failover watchdog changed")
+
+    claude_uid = pwd.getpwnam("claude-agent").pw_uid
+    require_mode(CODEX_AUTH, 0o600, 0)
+    require_mode(CLAUDE_AUTH, 0o600, claude_uid)
+    require_mode(CLAUDE_SUDOERS, 0o440, 0)
+    require_mode(REMOTE_CONTROL_SUPERVISOR, 0o755, 0)
+    require_mode(REMOTE_CONTROL_UNIT, 0o644, 0)
+    supervisor = REMOTE_CONTROL_SUPERVISOR.read_text(encoding="utf-8")
+    if "app-server daemon version" not in supervisor or "app-server.pid" in supervisor:
+        fail("Codex Remote Control supervisor uses obsolete PID-file detection")
+
+    if "Logged in" not in command_ok(["codex", "login", "status"]):
+        fail("Codex OAuth status is not logged in")
+    claude_env = {
+        **os.environ,
+        "AGENT_CLAUDE_RUN_AS": "claude-agent",
+        "AGENT_CLAUDE_CONFIG_DIR": "/root/.claude",
+        "AGENT_CLAUDE_HOST_ADMIN": "1",
+        "OPENCLAW_STATE_DIR": "/root/.openclaw",
+        "AGENT_REMOTE_CONTROL": "0",
+    }
+    claude_status = json.loads(
+        command_ok([str(CLAUDE_LAUNCHER), "auth", "status"], env=claude_env)
+    )
+    if claude_status.get("loggedIn") is not True:
+        fail("Claude OAuth status is not logged in")
+    if command_ok(
+        ["sudo", "-u", "claude-agent", "--", "sudo", "-n", "id", "-u"]
+    ) != "0":
+        fail("Cal host-admin sudo profile is not effective")
+
+    if command_ok(
+        ["systemctl", "--user", "is-active", "codex-remote-control-supervisor.service"]
+    ) != "active":
+        fail("Codex Remote Control supervisor is not active")
+    if command_ok(
+        ["systemctl", "--user", "is-enabled", "codex-remote-control-supervisor.service"]
+    ) != "enabled":
+        fail("Codex Remote Control supervisor is not enabled")
+    if command_ok(["loginctl", "show-user", "root", "-p", "Linger", "--value"]) != "yes":
+        fail("root user linger is not enabled")
+
+    daemon_state = json.loads(
+        command_ok(["codex", "app-server", "daemon", "version"])
+    )
+    if daemon_state.get("status") != "running":
+        fail("Codex Remote Control managed app server is not running")
+    if not daemon_state.get("socketPath"):
+        fail("Codex Remote Control daemon omitted its control socket")
+    settings = json.loads(REMOTE_CONTROL_SETTINGS.read_text(encoding="utf-8"))
+    if settings.get("remoteControlEnabled") is not True:
+        fail("Codex Remote Control is disabled in daemon settings")
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "codexOAuth": "logged-in",
+                "claudeOAuth": "logged-in",
+                "remoteControl": "active",
+                "remoteControlSocket": daemon_state["socketPath"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

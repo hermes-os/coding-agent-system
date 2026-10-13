@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync the shared ChatGPT sign-in to repository workers
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+Persistent=yes
+
+[Install]
+WantedBy=timers.target

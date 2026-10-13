@@ -1,0 +1,24 @@
+# Shared, immutable worker defaults for read (review) runs.
+# Per-work-order state lives in HERMES_HOME.
+model: ""
+providers: {}
+# Owner rule 2026-10-07: never swap a worker's model silently. A provider
+# failure stops the run; Cal resumes it on the same model with --resume-run.
+fallback_providers: []
+toolsets:
+  - file
+  - search
+  - terminal
+  - skills
+agent:
+  reasoning_effort: medium
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  write_approval: true
+skills:
+  external_dirs: []
+plugins:
+  enabled: []
+security:
+  allow_data_training_tiers_noninteractive: true

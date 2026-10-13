@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Exercise one disposable lease against the actual coordination remote."""
+import json
+from pathlib import Path
+import subprocess
+
+LEASE = '/var/lib/agent-worker/coding-agent-system/skills/portfolio/scripts/agent-lease.py'
+SCOPE = 'repo:hermes/coordination-readiness:write'
+CONFIG = Path('/var/lib/agent-worker/.agents/config.json')
+LEASE_TTL = 420
+
+
+def command(*args):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=40)
+    if result.returncode:
+        # Lease diagnostics are sanitized by the canonical command.
+        raise RuntimeError(result.stderr.strip() or 'lease operation failed')
+    return result.stdout.strip()
+
+
+def lease(*args):
+    return json.loads(command('/usr/bin/python3', LEASE, *args))
+
+
+repo = json.loads(CONFIG.read_text())['coordinationRepo']
+head = command('git', '-C', repo, 'rev-parse', 'HEAD')
+prior = lease('status', SCOPE)
+if prior.get('locked') and prior.get('expired'):
+    lease('reap', SCOPE)
+    prior = lease('status', SCOPE)
+assert not prior['locked']
+acquired = lease('acquire', SCOPE, '--ttl', str(LEASE_TTL), '--head', head,
+                 '--owner', 'cal-authorized-coordination-readiness')
+try:
+    token = acquired['lease_id']
+    assert lease('status', SCOPE)['lease_id'] == token
+    assert lease('verify', token, '--repo', repo, '--head', head)['head'] == head
+    assert lease('renew', token, '--ttl', str(LEASE_TTL), '--head', head)['head'] == head
+    assert lease('verify', token, '--repo', repo, '--head', head)['head'] == head
+    print('PASS acquire, remote readback, exact-head verify, renew, reverify')
+finally:
+    lease('release', acquired['lease_id'])
+assert lease('status', SCOPE)['locked'] is False
+print('PASS release and remote absence readback')

@@ -1,0 +1,1274 @@
+#!/usr/bin/python3 -I
+"""Run one Hermes Agent task inside the existing managed worker boundary."""
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import json
+import os
+import re
+import selectors
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import quote
+
+
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+TOOLSETS = "file,search,terminal,skills"
+TRUSTED_HERMES_SOURCE = Path(
+    "/opt/agent-worker-hermes/releases/9caa21336d278b614e99a58e302f48894ff0dbd7/source"
+)
+TRUSTED_HERMES_LAUNCHER = TRUSTED_HERMES_SOURCE / ".venv/bin/hermes"
+TRUSTED_HERMES_PYTHON = TRUSTED_HERMES_SOURCE / ".venv/bin/python"
+TRUSTED_HERMES_INTERPRETER = Path(
+    "/opt/agent-worker-hermes/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11"
+)
+TRUSTED_PYTHON_ALIAS = Path("/opt/agent-worker-hermes/python/cpython-3.11-linux-x86_64-gnu")
+WORKER_CODEX_HOME = Path("/var/lib/agent-worker/.codex")
+WORKER_HERMES_HOME = Path("/var/lib/agent-worker/.hermes")
+TRUSTED_DIRECT_PROVIDERS = frozenset(
+    """
+    aci actual actual-computer actualcomputer ai-gateway ai_gateway aigateway
+    alibaba alibaba-cloud alibaba-cloud-cn alibaba-cn alibaba-coding alibaba-coding-cn
+    alibaba-coding-plan alibaba-coding-plan-cn alibaba-token-plan alibaba-token-plan-cn
+    alibaba_coding alibaba_coding_plan amazon amazon-bedrock anthropic arcee arcee-ai arceeai
+    aws aws-bedrock azure azure-ai azure-ai-foundry azure-foundry bedrock claude claude-code
+    claude-oauth codex commandcode commandcode-anthropic commandcode-chat commandcode-claude
+    copilot custom dashscope dashscope-cn dashscope-coding dashscope-coding-cn
+    dashscope-token-plan dashscope-token-plan-cn deep-infra deepinfra deepinfra-ai deepseek
+    deepseek-chat fireworks fireworks-ai free fw gcp-vertex gemini github github-copilot
+    github-model github-models glm gmi gmi-cloud gmicloud go google google-ai-studio
+    google-gemini google-vertex grok grok-oauth hf hugging-face huggingface huggingface-hub
+    kilo kilo-code kilo-gateway kilocode kimi kimi-cn kimi-coding kimi-coding-cn kimi-for-coding
+    llama-cpp llama.cpp llamacpp lm-studio lm_studio lmstudio local meta meta-ai mimo mini-max
+    minimax minimax-china minimax-cn minimax-global minimax-oauth minimax-oauth-io minimax-portal
+    minimax_cn minimax_oauth model-api moonshot moonshot-cn msl muse muse-spark nebius nebius-tf
+    nebius-token-factory nebius-tokenfactory nous nous-portal nousresearch novita novita-ai
+    novitaai nvidia nvidia-nim ollama ollama-cloud ollama_cloud openai-api openai-codex
+    openai_codex opencode opencode-free opencode-go opencode-go-sub opencode-zen opencode_free
+    opencode_go opencode_zen openrouter or qwen qwen-cli qwen-dashscope qwen-oauth qwen-portal
+    ramp ramp-router router router.com solar step stepfun stepfun-coding-plan tencent
+    tencent-cloud tencent-lkeap tencent-tokenhub tencent-tokenplan tencentmaas token-factory
+    tokenfactory tokenhub tokenplan upstage vercel vercel-ai-gateway vertex vertex-ai vllm x-ai
+    x-ai-oauth x.ai xai xai-grok-oauth xai-oauth xiaomi xiaomi-mimo z-ai z.ai zai zen zhipu
+    """.split()
+)
+EXTERNAL_PROCESS_PROVIDERS = frozenset(
+    {"copilot-acp", "github-copilot-acp", "copilot-acp-agent"}
+)
+MAX_TASK_BYTES = 4 * 1024 * 1024
+MAX_RESULT_BYTES = 8 * 1024 * 1024
+MAX_DIAGNOSTIC_LINE_BYTES = 256 * 1024
+PIPE_DRAIN_SECONDS = 2.0
+SESSION_LINE = re.compile(r"^\s*session_id:\s*(\S+)\s*$")
+TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "hermes-worker"
+ACCESS_TEMPLATE_PATHS = {
+    "read": TEMPLATE_DIR / "config.read.yaml",
+    "write": TEMPLATE_DIR / "config.write.yaml",
+}
+# Credentials the fallback chains may need, seeded beside the primary route's.
+FALLBACK_AUTH_PROVIDERS = ("openai-codex", "openrouter")
+BRIDGE_STATE_NAME = "bridge-state.json"
+BRIDGE_STATE_VERSION = 1
+NATIVE_STATE_NAME = "state.db"
+NATIVE_REQUIRED_SESSION_COLUMNS = {
+    "id",
+    "parent_session_id",
+    "cwd",
+    "model_config",
+    "source",
+    "started_at",
+    "ended_at",
+    "end_reason",
+    "last_activity_at",
+    "session_key",
+}
+NATIVE_REQUIRED_MESSAGE_COLUMNS = {"session_id", "timestamp"}
+RESET_END_REASONS = {"session_reset", "session_switch", "idle", "daily", "suspended", "resume_pending_expired"}
+CHILD_RUNTIME_ENV_NAMES = frozenset({
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TERM",
+    "COLORTERM",
+    "TERM_PROGRAM",
+    "NO_COLOR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "VIRTUAL_ENV",
+})
+# These names are the staged runtime's provider registry plus the documented direct tool-provider
+# credentials. No general HERMES_* or *_TOKEN inheritance is allowed; new runtime behavior must be
+# added here deliberately after checking the pinned source.
+CHILD_PROVIDER_ENV_NAMES = frozenset({
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL",
+    "NOUS_API_KEY", "NOUS_BASE_URL", "NOUS_INFERENCE_BASE_URL",
+    "CUSTOM_API_KEY", "CUSTOM_BASE_URL", "LM_API_KEY", "LM_BASE_URL",
+    "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_API_BASE_URL",
+    "COPILOT_GH_HOST", "GOOGLE_API_KEY", "GEMINI_API_KEY", "GEMINI_BASE_URL",
+    "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "GLM_BASE_URL", "KIMI_API_KEY",
+    "KIMI_CODING_API_KEY", "KIMI_CN_API_KEY", "KIMI_BASE_URL", "STEPFUN_API_KEY", "STEPFUN_BASE_URL",
+    "ARCEEAI_API_KEY", "ARCEE_BASE_URL", "GMI_API_KEY", "GMI_BASE_URL", "ACTUAL_API_KEY", "ACTUAL_BASE_URL",
+    "MINIMAX_API_KEY", "MINIMAX_BASE_URL", "MINIMAX_CN_API_KEY", "MINIMAX_CN_BASE_URL",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL", "ALIBABA_CODING_PLAN_API_KEY",
+    "ALIBABA_CODING_PLAN_BASE_URL", "ALIBABA_CODING_PLAN_CN_API_KEY", "ALIBABA_CODING_PLAN_CN_BASE_URL",
+    "DASHSCOPE_CN_BASE_URL", "ALIBABA_TOKEN_PLAN_API_KEY", "ALIBABA_TOKEN_PLAN_BASE_URL",
+    "ALIBABA_TOKEN_PLAN_CN_API_KEY", "ALIBABA_TOKEN_PLAN_CN_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
+    "DEEPINFRA_API_KEY", "DEEPINFRA_BASE_URL", "QWEN_API_KEY", "XAI_API_KEY", "XAI_BASE_URL",
+    "HERMES_XAI_BASE_URL", "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "AI_GATEWAY_API_KEY", "AI_GATEWAY_BASE_URL",
+    "OPENCODE_ZEN_API_KEY", "OPENCODE_ZEN_BASE_URL", "COMMANDCODE_API_KEY", "COMMANDCODE_BASE_URL",
+    "COMMANDCODE_ANTHROPIC_BASE_URL", "OPENCODE_GO_API_KEY",
+    "OPENCODE_GO_BASE_URL", "KILOCODE_API_KEY", "KILOCODE_BASE_URL", "HF_TOKEN", "HF_BASE_URL",
+    "XIAOMI_API_KEY", "XIAOMI_BASE_URL", "TOKENHUB_API_KEY", "TOKENHUB_BASE_URL", "TOKENPLAN_API_KEY",
+    "TOKENPLAN_BASE_URL", "OLLAMA_API_KEY", "OLLAMA_BASE_URL", "OLLAMA_HOST", "BEDROCK_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_WEB_IDENTITY_TOKEN_FILE", "VERTEX_CREDENTIALS_PATH",
+    "GOOGLE_APPLICATION_CREDENTIALS", "VERTEX_PROJECT_ID", "VERTEX_REGION", "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_QUOTA_PROJECT", "AZURE_FOUNDRY_API_KEY", "AZURE_FOUNDRY_BASE_URL", "HERMES_CODEX_BASE_URL",
+    "HERMES_QWEN_BASE_URL", "HERMES_PORTAL_BASE_URL", "NOUS_PORTAL_BASE_URL",
+    "FIREWORKS_API_KEY", "UPSTAGE_API_KEY", "UPSTAGE_BASE_URL", "NEBIUS_API_KEY",
+    "NEBIUS_TOKEN_FACTORY_API_KEY", "NEBIUS_BASE_URL", "NOVITA_API_KEY", "NOVITA_BASE_URL", "FAL_KEY",
+    "EXA_API_KEY", "PARALLEL_API_KEY", "TAVILY_API_KEY", "PERPLEXITY_API_KEY", "KEENABLE_API_KEY",
+    "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "FIRECRAWL_GATEWAY_URL", "TOOL_GATEWAY_DOMAIN",
+    "TOOL_GATEWAY_SCHEME", "TOOL_GATEWAY_USER_TOKEN", "SEARXNG_URL", "BRAVE_SEARCH_API_KEY",
+    "BROWSER_USE_API_KEY", "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "CAMOFOX_URL",
+    "GROQ_API_KEY", "MISTRAL_API_KEY", "ELEVENLABS_API_KEY", "VOICE_TOOLS_OPENAI_KEY",
+    "RAMP_ROUTER_API_KEY", "ROUTER_API_KEY", "RAMP_ROUTER_BASE_URL",
+    "MODEL_API_KEY", "META_API_KEY", "META_MODEL_API_KEY", "META_BASE_URL",
+})
+
+
+class BridgeError(Exception):
+    def __init__(self, code, message, returncode=2):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.returncode = returncode
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise BridgeError("invalid_arguments", message)
+
+
+def build_parser():
+    parser = ArgumentParser(
+        prog="agent-hermes-worker",
+        description="Run one bounded Hermes Agent worker task; read task text from stdin.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--provider", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--effort", required=True, choices=EFFORTS)
+    parser.add_argument("--access", required=True, choices=("read", "write"))
+    parser.add_argument("--runtime-home", required=True)
+    parser.add_argument("--broker-session-id", required=True)
+    session = parser.add_mutually_exclusive_group(required=True)
+    session.add_argument("--fresh-session", action="store_true")
+    session.add_argument("--resume-session")
+    return parser
+
+
+def emit(event, **fields):
+    record = {"event": event, **fields}
+    sys.stdout.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def emit_error(code, message, *, returncode=2, **fields):
+    emit("error", code=code, message=message, **fields)
+    return returncode
+
+
+def validate_token(value, field):
+    if not value or len(value) > 256 or value.startswith("-"):
+        raise BridgeError("invalid_config", f"invalid {field}")
+    if any(ord(char) < 32 or ord(char) == 127 or char.isspace() for char in value):
+        raise BridgeError("invalid_config", f"invalid {field}")
+    return value
+
+
+def validate_args(args):
+    validate_token(args.provider, "provider")
+    if args.provider.lower() not in TRUSTED_DIRECT_PROVIDERS:
+        raise BridgeError(
+            "provider_transport_denied",
+            "provider is not an admitted direct transport",
+        )
+    validate_token(args.model, "model")
+    broker_session_id = validate_token(args.broker_session_id, "broker session id")
+    try:
+        broker_session_id = str(uuid.UUID(broker_session_id))
+    except ValueError as exc:
+        raise BridgeError("invalid_config", "broker session id must be a UUID") from exc
+
+    resume_session = None
+    if args.resume_session is not None:
+        resume_session = validate_token(args.resume_session, "resume session")
+        if resume_session.lower() in {"latest", "current", "last"}:
+            raise BridgeError("invalid_session", "resume requires an explicit native session id")
+
+    runtime_home = Path(args.runtime_home)
+    if not runtime_home.is_absolute() or "\x00" in args.runtime_home:
+        raise BridgeError("unsafe_runtime_home", "runtime home must be an absolute path")
+
+    return broker_session_id, resume_session, runtime_home
+
+
+def require_managed_boundary(access):
+    if os.environ.get("AGENT_WORKER_MANAGED") != "1":
+        raise BridgeError("boundary_required", "existing managed worker boundary is required")
+    if os.environ.get("AGENT_ACCESS_MODE") != access:
+        raise BridgeError("boundary_required", "worker access mode does not match the boundary")
+
+
+def _read_template_file(path):
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError
+        return path.read_bytes()
+    except OSError as exc:
+        raise BridgeError("invalid_template", "worker template is unavailable") from exc
+
+
+def read_template(access):
+    return _read_template_file(ACCESS_TEMPLATE_PATHS[access])
+
+
+def _known_templates():
+    """Every root-owned worker template, so runs started on an older one can resume."""
+    known = set()
+    try:
+        candidates = sorted(TEMPLATE_DIR.glob("config*.yaml"))
+    except OSError:
+        return known
+    for candidate in candidates:
+        try:
+            info = candidate.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o222:
+            known.add(candidate.read_bytes())
+    return known
+
+
+def _replace_readonly_file(path, content):
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+        try:
+            if os.write(descriptor, content) != len(content):
+                raise OSError
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def check_directory(path, *, fresh):
+    try:
+        if path.is_symlink():
+            raise BridgeError("unsafe_runtime_home", "runtime home cannot be a symlink")
+        if fresh:
+            if path.exists():
+                raise BridgeError("unsafe_runtime_home", "fresh runtime home already exists")
+            if not path.parent.is_dir() or path.parent.is_symlink():
+                raise BridgeError("unsafe_runtime_home", "runtime home parent is unavailable")
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+        else:
+            if not path.is_dir():
+                raise BridgeError("unsafe_runtime_home", "resume runtime home is unavailable")
+        info = path.lstat()
+    except BridgeError:
+        raise
+    except OSError as exc:
+        raise BridgeError("unsafe_runtime_home", "runtime home cannot be prepared") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o077
+        or (info.st_mode & 0o700) != 0o700
+    ):
+        raise BridgeError("unsafe_runtime_home", "runtime home ownership or mode is unsafe")
+
+
+def prepare_runtime_home(path, *, fresh, access):
+    template = read_template(access)
+    check_directory(path, fresh=fresh)
+    config = path / "config.yaml"
+    no_bundled_skills = path / ".no-bundled-skills"
+    try:
+        if os.path.lexists(path / "plugins"):
+            raise BridgeError(
+                "unsafe_runtime_home",
+                "runtime provider plugins are not allowed",
+            )
+        if config.is_symlink():
+            raise BridgeError("unsafe_runtime_home", "runtime configuration cannot be a symlink")
+        if fresh:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            descriptor = os.open(config, flags, 0o400)
+            try:
+                if os.write(descriptor, template) != len(template):
+                    raise OSError
+                os.fchmod(descriptor, 0o400)
+            finally:
+                os.close(descriptor)
+            descriptor = os.open(no_bundled_skills, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+            os.close(descriptor)
+        else:
+            if not config.is_file():
+                raise BridgeError("unsafe_runtime_home", "resume runtime template does not match")
+            current = config.read_bytes()
+            if current != template:
+                if current not in _known_templates():
+                    raise BridgeError("unsafe_runtime_home", "resume runtime template does not match")
+                _replace_readonly_file(config, template)
+            info = config.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o222:
+                raise BridgeError("unsafe_runtime_home", "runtime configuration is mutable")
+            if no_bundled_skills.is_symlink() or not no_bundled_skills.is_file():
+                raise BridgeError("unsafe_runtime_home", "resume skill seed marker is unavailable")
+            info = no_bundled_skills.lstat()
+            if info.st_uid != os.geteuid() or info.st_mode & 0o222:
+                raise BridgeError("unsafe_runtime_home", "resume skill seed marker is mutable")
+    except BridgeError:
+        raise
+    except OSError as exc:
+        raise BridgeError("unsafe_runtime_home", "runtime configuration cannot be prepared") from exc
+
+
+def _worker_codex_auth_payload():
+    source = WORKER_HERMES_HOME / "auth.json"
+    try:
+        if source.is_symlink() or not source.is_file():
+            return None
+        stored = json.loads(source.read_text(encoding="utf-8-sig"))
+        providers = stored.get("providers")
+        state = providers.get("openai-codex") if isinstance(providers, dict) else None
+        tokens = state.get("tokens") if isinstance(state, dict) else None
+        if not isinstance(tokens, dict) or not tokens.get("access_token") or not tokens.get("refresh_token"):
+            return None
+        return {
+            "version": stored.get("version", 1),
+            "providers": {"openai-codex": dict(state)},
+            "active_provider": "openai-codex",
+        }
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _write_private_json(path, value, *, exclusive=False):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = json.dumps(value, indent=2) + "\n"
+    if exclusive:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = None
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _worker_pool_auth_payload(provider):
+    """Credential-pool seed for API-key providers (e.g. openrouter) from the shared worker store."""
+    source = WORKER_HERMES_HOME / "auth.json"
+    try:
+        if source.is_symlink() or not source.is_file():
+            return None
+        stored = json.loads(source.read_text(encoding="utf-8-sig"))
+        pool = stored.get("credential_pool")
+        entries = pool.get(provider) if isinstance(pool, dict) else None
+        if not isinstance(entries, list) or not entries:
+            return None
+        usable = [e for e in entries if isinstance(e, dict) and e.get("access_token")]
+        if not usable:
+            return None
+        return {
+            "version": stored.get("version", 1),
+            "providers": {},
+            "credential_pool": {provider: [dict(e) for e in usable]},
+        }
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+# anthropic seeds only the manual API-key rows; Hermes appends the Claude OAuth
+# (claude_code) row after them at load, so the key is spent first.
+SEEDED_POOL_PROVIDERS = frozenset({"openrouter", "anthropic"})
+
+
+def _merge_auth_payloads(payloads):
+    merged = {"version": 1, "providers": {}, "credential_pool": {}}
+    for payload in payloads:
+        merged["version"] = payload.get("version", merged["version"])
+        merged["providers"].update(payload.get("providers") or {})
+        merged["credential_pool"].update(payload.get("credential_pool") or {})
+        if payload.get("active_provider"):
+            merged.setdefault("active_provider", payload["active_provider"])
+    return merged
+
+
+def _auth_payload_for(provider):
+    if provider == "openai-codex":
+        return _worker_codex_auth_payload()
+    if provider in SEEDED_POOL_PROVIDERS:
+        return _worker_pool_auth_payload(provider)
+    return None
+
+
+def seed_worker_auth(runtime_home, provider):
+    """Seed the primary route's credentials plus every fallback route's.
+
+    A run whose auth store predates its fallback chain gains only the missing
+    providers; state it already holds (possibly freshly refreshed) is kept."""
+    target = runtime_home / "auth.json"
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise BridgeError("unsafe_runtime_home", "runtime auth store is unsafe")
+    wanted = dict.fromkeys((provider, *FALLBACK_AUTH_PROVIDERS))
+    fresh = {name: _auth_payload_for(name) for name in wanted}
+    fresh = {name: payload for name, payload in fresh.items() if payload is not None}
+    if not fresh:
+        return
+    if not target.exists():
+        merged = _merge_auth_payloads(fresh.values())
+        if provider != "openai-codex":
+            # Fallback credentials must not redirect a run whose primary is elsewhere.
+            merged.pop("active_provider", None)
+        try:
+            _write_private_json(target, merged, exclusive=True)
+        except FileExistsError:
+            pass
+        return
+    try:
+        current = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BridgeError("unsafe_runtime_home", "runtime auth store is unreadable") from exc
+    if not isinstance(current, dict):
+        raise BridgeError("unsafe_runtime_home", "runtime auth store is unreadable")
+    held = set((current.get("providers") or {}).keys()) | set((current.get("credential_pool") or {}).keys())
+    missing = [payload for name, payload in fresh.items() if name not in held]
+    changed = bool(missing)
+    shared_codex = fresh.get("openai-codex")
+    if shared_codex is not None and "openai-codex" in held:
+        # A refresh elsewhere spent this copy's single-use refresh token.
+        held_state = (current.get("providers") or {}).get("openai-codex")
+        if _codex_issued_at(shared_codex["providers"]["openai-codex"]) > _codex_issued_at(held_state):
+            current.setdefault("providers", {})["openai-codex"] = shared_codex["providers"]["openai-codex"]
+            changed = True
+    if changed:
+        merged = _merge_auth_payloads([*missing, current])
+        if provider != "openai-codex" and current.get("active_provider") != "openai-codex":
+            merged.pop("active_provider", None)
+        _write_private_json(target, merged)
+
+
+def _codex_issued_at(state):
+    """Access-token issue time; ChatGPT refresh tokens are single-use, so newest pair wins."""
+    try:
+        token = state["tokens"]["access_token"]
+        body = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        return float(claims.get("iat") or 0)
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        return 0.0
+
+
+def sync_worker_auth(runtime_home, provider):
+    source = runtime_home / "auth.json"
+    if source.is_symlink() or not source.is_file():
+        return
+    lock_path = WORKER_HERMES_HOME / "auth.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            # Merge the refreshed provider state into the shared store instead of
+            # replacing the whole file: the runtime home only carries this
+            # provider, and a whole-file write drops every other provider's
+            # credentials (observed: an openai-codex sync erased the seeded
+            # openrouter pool entry). Any run may have refreshed ChatGPT through
+            # its fallback chain, so the check is by token age, not primary route.
+            # Only providers.openai-codex is written; credential_pool rows (the
+            # anthropic API key) are never copied back, so run-side rotation
+            # state cannot rewrite them.
+            refreshed = json.loads(source.read_text(encoding="utf-8"))
+            store_path = WORKER_HERMES_HOME / "auth.json"
+            try:
+                stored = json.loads(store_path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                stored = {}
+            if not isinstance(stored, dict):
+                stored = {}
+            state = (refreshed.get("providers") or {}).get("openai-codex")
+            current = (stored.get("providers") or {}).get("openai-codex")
+            if isinstance(state, dict) and _codex_issued_at(state) > _codex_issued_at(current):
+                stored.setdefault("version", refreshed.get("version", 1))
+                stored.setdefault("providers", {})["openai-codex"] = state
+                stored["active_provider"] = "openai-codex"
+                _write_private_json(store_path, stored)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _parse_native_model_config(value):
+    if value in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError) as exc:
+        raise BridgeError("resume_state_invalid", "native session metadata is malformed") from exc
+    if not isinstance(parsed, dict):
+        raise BridgeError("resume_state_invalid", "native session metadata is malformed")
+    return parsed
+
+
+def _native_state_connection(runtime_home):
+    state = runtime_home / NATIVE_STATE_NAME
+    try:
+        info = state.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise BridgeError("resume_state_invalid", "native session state is unsafe")
+        connection = sqlite3.connect(
+            f"file:{quote(str(state), safe='/')}?mode=ro", uri=True, timeout=0.5, check_same_thread=False
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        session_columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+        message_columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+        if not NATIVE_REQUIRED_SESSION_COLUMNS <= session_columns or not NATIVE_REQUIRED_MESSAGE_COLUMNS <= message_columns:
+            connection.close()
+            raise BridgeError("resume_state_invalid", "native session schema is unsupported")
+        return connection
+    except BridgeError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise BridgeError("resume_state_missing", "native session state is unavailable") from exc
+
+
+def _native_session_row(connection, session_id):
+    return connection.execute(
+        "SELECT id, parent_session_id, cwd, model_config, source, started_at, ended_at, "
+        "end_reason, last_activity_at, session_key FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+
+
+def _native_model_config(row):
+    return _parse_native_model_config(row["model_config"])
+
+
+def _native_has_messages(connection, session_id):
+    return connection.execute(
+        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1", (session_id,)
+    ).fetchone() is not None
+
+
+def _native_last_active(connection, row):
+    values = []
+    for value in (
+        row["last_activity_at"],
+        row["started_at"],
+        connection.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE session_id = ?", (row["id"],)
+        ).fetchone()[0],
+    ):
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    return max(values, default=0.0)
+
+
+def _native_child_is_continuation(row, *, compression):
+    config = _native_model_config(row)
+    if config.get("_branched_from") is not None or config.get("_delegate_from") is not None:
+        return False
+    if not compression and config.get("_reset_from") is not None:
+        return False
+    return (row["source"] or "") != "tool"
+
+
+def _native_children(connection, parent_id, *, compression):
+    parent = _native_session_row(connection, parent_id)
+    rows = connection.execute(
+        "SELECT id, parent_session_id, cwd, model_config, source, started_at, ended_at, "
+        "end_reason, last_activity_at, session_key FROM sessions WHERE parent_session_id = ?",
+        (parent_id,),
+    ).fetchall()
+    rows = [row for row in rows if _native_child_is_continuation(row, compression=compression)]
+    if not compression and parent and parent["end_reason"] in RESET_END_REASONS and parent["session_key"]:
+        rows = [row for row in rows if not row["session_key"] or row["session_key"] != parent["session_key"]]
+    if compression:
+        rows = [row for row in rows if row["source"] != "tool"]
+    return sorted(
+        rows,
+        key=lambda row: (
+            -(0 if compression and row["end_reason"] == "compression" else 1 if compression and row["ended_at"] is None else 2),
+            _native_last_active(connection, row) if compression else float(row["started_at"] or 0),
+            float(row["started_at"] or 0),
+            str(row["id"]),
+        ),
+        reverse=True,
+    )
+
+
+def _resolve_native_session(connection, requested_id):
+    original = _native_session_row(connection, requested_id)
+    if original is None:
+        raise BridgeError("resume_session_missing", "native resume session was not found")
+
+    visited = [requested_id]
+    seen = {requested_id}
+    current = requested_id
+    for _ in range(100):
+        parent = _native_session_row(connection, current)
+        if parent is None or parent["end_reason"] != "compression":
+            break
+        children = _native_children(connection, current, compression=True)
+        if not children:
+            break
+        child_id = str(children[0]["id"])
+        if child_id in seen:
+            raise BridgeError("resume_state_invalid", "native compression lineage is cyclic")
+        seen.add(child_id)
+        visited.append(child_id)
+        current = child_id
+
+    best = None
+    current = visited[-1]
+    seen = {current}
+    for _ in range(32):
+        if _native_has_messages(connection, current):
+            best = current
+        children = _native_children(connection, current, compression=False)
+        if not children:
+            break
+        child_id = str(children[0]["id"])
+        if child_id in seen:
+            raise BridgeError("resume_state_invalid", "native resume lineage is cyclic")
+        seen.add(child_id)
+        visited.append(child_id)
+        current = child_id
+
+    effective = best or visited[-1]
+    effective_row = _native_session_row(connection, effective)
+    if effective_row is None:
+        raise BridgeError("resume_state_invalid", "native resume target disappeared")
+    if not _native_has_messages(connection, effective):
+        raise BridgeError("resume_session_empty", "native resume session has no transcript")
+    return effective, set(visited), effective_row
+
+
+def _load_bridge_state(runtime_home):
+    state = runtime_home / BRIDGE_STATE_NAME
+    if not state.exists():
+        raise BridgeError("resume_binding_missing", "native resume ownership is not recorded")
+    try:
+        info = state.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > 1024 * 1024:
+            raise BridgeError("resume_binding_invalid", "native resume ownership state is unsafe")
+        parsed = json.loads(state.read_text(encoding="utf-8"))
+    except BridgeError:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise BridgeError("resume_binding_invalid", "native resume ownership state is malformed") from exc
+    if not isinstance(parsed, dict) or parsed.get("version") != BRIDGE_STATE_VERSION or not isinstance(parsed.get("sessions"), dict):
+        raise BridgeError("resume_binding_invalid", "native resume ownership state is malformed")
+    return parsed["sessions"]
+
+
+def _record_bridge_bindings(runtime_home, native_ids, broker_session_id, access):
+    native_ids = [native_id for native_id in native_ids if native_id]
+    if not native_ids:
+        return
+    state = runtime_home / BRIDGE_STATE_NAME
+    sessions = {}
+    if state.exists():
+        sessions = _load_bridge_state(runtime_home)
+    cwd = os.path.realpath(os.getcwd())
+    for native_id in native_ids:
+        validate_token(native_id, "native session id")
+        existing = sessions.get(native_id)
+        binding = {"broker_session_id": broker_session_id, "access": access, "cwd": cwd}
+        if existing is not None and existing != binding:
+            raise BridgeError("resume_binding_conflict", "native resume ownership changed")
+        sessions[native_id] = binding
+    payload = {"version": BRIDGE_STATE_VERSION, "sessions": sessions}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    if len(encoded.encode("utf-8")) > 1024 * 1024:
+        raise BridgeError("resume_binding_invalid", "native resume ownership state is too large")
+    temporary = state.with_name(f".{state.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, state)
+        state.chmod(0o600)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise BridgeError("resume_binding_invalid", "native resume ownership state cannot be saved") from exc
+
+
+def preflight_resume(runtime_home, resume_session, access, broker_session_id):
+    sessions = _load_bridge_state(runtime_home)
+    binding = sessions.get(resume_session)
+    if not isinstance(binding, dict):
+        raise BridgeError("resume_binding_missing", "native resume ownership is not recorded")
+    if binding.get("access") != access or binding.get("broker_session_id") != broker_session_id:
+        raise BridgeError("resume_binding_mismatch", "native resume ownership does not match this work order")
+    assigned_cwd = os.path.realpath(os.getcwd())
+    if binding.get("cwd") != assigned_cwd:
+        raise BridgeError("resume_cwd_mismatch", "native resume ownership has a different working directory")
+
+    connection = _native_state_connection(runtime_home)
+    try:
+        effective, accepted_ids, row = _resolve_native_session(connection, resume_session)
+        saved_cwd = row["cwd"]
+        if not saved_cwd or not os.path.isdir(saved_cwd) or os.path.realpath(saved_cwd) != assigned_cwd:
+            raise BridgeError("resume_cwd_mismatch", "native resume metadata has a different working directory")
+        yolo = bool(_native_model_config(row).get("yolo_mode"))
+        if access == "read" and yolo:
+            raise BridgeError("resume_persisted_yolo", "read resume would restore native write bypass")
+        return {"effective_session_id": effective, "accepted_session_ids": accepted_ids, "yolo": yolo}
+    finally:
+        connection.close()
+
+
+def verify_resumed_native_id(runtime_home, resume_session, observed_id):
+    connection = _native_state_connection(runtime_home)
+    try:
+        _, accepted_ids, _ = _resolve_native_session(connection, resume_session)
+        if observed_id not in accepted_ids:
+            raise BridgeError("native_session_mismatch", "Hermes returned an unrelated native session")
+    finally:
+        connection.close()
+
+
+def _worker_can_write(info):
+    if os.geteuid() == 0:
+        return False
+    if info.st_uid == os.geteuid():
+        return bool(info.st_mode & stat.S_IWUSR)
+    if info.st_gid == os.getegid() or info.st_gid in os.getgroups():
+        return bool(info.st_mode & stat.S_IWGRP)
+    return bool(info.st_mode & stat.S_IWOTH)
+
+
+def _verify_deployment_path(path, *, kind, executable=False):
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise BridgeError("runtime_unavailable", "trusted Hermes runtime is unavailable", 3) from exc
+    expected = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    if (
+        not expected(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_mode & stat.S_IWOTH
+        or _worker_can_write(info)
+        or executable and not info.st_mode & stat.S_IXUSR
+    ):
+        raise BridgeError("runtime_untrusted", "trusted Hermes runtime ownership is invalid", 3)
+
+
+def _verify_deployment_tree(root, *, allowed_symlink_roots, ignored_paths=frozenset()):
+    try:
+        for directory, names, files in os.walk(root, followlinks=False):
+            for name in (*names, *files):
+                path = Path(directory) / name
+                if path in ignored_paths:
+                    continue
+                info = path.lstat()
+                if info.st_uid != 0 or info.st_gid != 0:
+                    raise BridgeError(
+                        "runtime_untrusted",
+                        "trusted Hermes runtime ownership is invalid",
+                        3,
+                    )
+                if stat.S_ISLNK(info.st_mode):
+                    target = path.resolve(strict=True)
+                    if not any(
+                        target == allowed or allowed in target.parents
+                        for allowed in allowed_symlink_roots
+                    ):
+                        raise BridgeError(
+                            "runtime_untrusted",
+                            "trusted Hermes runtime linkage is invalid",
+                            3,
+                        )
+                elif (
+                    not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                    or info.st_mode & stat.S_IWOTH
+                    or _worker_can_write(info)
+                ):
+                    raise BridgeError(
+                        "runtime_untrusted",
+                        "trusted Hermes runtime ownership is invalid",
+                        3,
+                    )
+    except BridgeError:
+        raise
+    except OSError as exc:
+        raise BridgeError("runtime_unavailable", "trusted Hermes runtime is unavailable", 3) from exc
+
+
+def resolve_hermes_runtime():
+    deployment_directories = (
+        Path("/opt"),
+        Path("/opt/agent-worker-hermes"),
+        Path("/opt/agent-worker-hermes/releases"),
+        TRUSTED_HERMES_SOURCE.parent,
+        TRUSTED_HERMES_SOURCE,
+        TRUSTED_HERMES_SOURCE / ".venv",
+        TRUSTED_HERMES_SOURCE / ".venv/bin",
+        TRUSTED_HERMES_SOURCE / ".venv/lib/python3.11/site-packages",
+        TRUSTED_HERMES_SOURCE / "agent",
+        TRUSTED_HERMES_SOURCE / "hermes_cli",
+        TRUSTED_HERMES_SOURCE / "plugins/model-providers",
+        TRUSTED_HERMES_SOURCE / "providers",
+        Path("/opt/agent-worker-hermes/python"),
+        TRUSTED_HERMES_INTERPRETER.parents[1],
+        TRUSTED_HERMES_INTERPRETER.parent,
+    )
+    for path in deployment_directories:
+        _verify_deployment_path(path, kind="directory")
+    for path in (
+        TRUSTED_HERMES_LAUNCHER,
+        TRUSTED_HERMES_INTERPRETER,
+        TRUSTED_HERMES_SOURCE / ".venv/pyvenv.cfg",
+        TRUSTED_HERMES_SOURCE / ".venv/lib/python3.11/site-packages/_virtualenv.pth",
+        TRUSTED_HERMES_SOURCE / ".venv/lib/python3.11/site-packages/__editable__.hermes_agent-0.21.0.pth",
+        TRUSTED_HERMES_SOURCE
+        / ".venv/lib/python3.11/site-packages/__editable___hermes_agent_0_21_0_finder.py",
+    ):
+        _verify_deployment_path(
+            path,
+            kind="file",
+            executable=path in {TRUSTED_HERMES_LAUNCHER, TRUSTED_HERMES_INTERPRETER},
+        )
+    try:
+        python_info = TRUSTED_HERMES_PYTHON.lstat()
+        alias_info = TRUSTED_PYTHON_ALIAS.lstat()
+        python_target = TRUSTED_HERMES_PYTHON.resolve(strict=True)
+        alias_target = TRUSTED_PYTHON_ALIAS.resolve(strict=True)
+    except OSError as exc:
+        raise BridgeError("runtime_unavailable", "trusted Hermes runtime is unavailable", 3) from exc
+    if (
+        not stat.S_ISLNK(python_info.st_mode)
+        or python_info.st_uid != 0
+        or python_info.st_gid != 0
+        or not stat.S_ISLNK(alias_info.st_mode)
+        or alias_info.st_uid != 0
+        or alias_info.st_gid != 0
+        or python_target != TRUSTED_HERMES_INTERPRETER
+        or alias_target != TRUSTED_HERMES_INTERPRETER.parents[1]
+    ):
+        raise BridgeError("runtime_untrusted", "trusted Hermes runtime linkage is invalid", 3)
+    trusted_trees = (TRUSTED_HERMES_SOURCE, TRUSTED_HERMES_INTERPRETER.parents[1])
+    _verify_deployment_tree(
+        TRUSTED_HERMES_SOURCE,
+        allowed_symlink_roots=trusted_trees,
+        ignored_paths=frozenset({TRUSTED_HERMES_SOURCE / ".venv/.lock"}),
+    )
+    _verify_deployment_tree(
+        TRUSTED_HERMES_INTERPRETER.parents[1],
+        allowed_symlink_roots=trusted_trees,
+    )
+    return (str(TRUSTED_HERMES_PYTHON), "-I", str(TRUSTED_HERMES_LAUNCHER))
+
+
+def build_environment(runtime_home, access):
+    source = os.environ
+    environment = {
+        key: source[key]
+        for key in CHILD_RUNTIME_ENV_NAMES | CHILD_PROVIDER_ENV_NAMES
+        if key in source
+    }
+    for key, value in source.items():
+        if key.startswith("TERMINAL_") and key != "TERMINAL_CWD":
+            environment[key] = value
+    assigned_cwd = os.path.realpath(os.getcwd())
+    environment["PWD"] = assigned_cwd
+    environment["TERMINAL_CWD"] = assigned_cwd
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GCM_INTERACTIVE"] = "Never"
+    environment["HERMES_HOME"] = str(runtime_home)
+    environment["HERMES_SUPERVISED_CHILD"] = "1"
+    environment["AGENT_WORKER_MANAGED"] = "1"
+    environment["AGENT_ACCESS_MODE"] = access
+    environment["CODEX_HOME"] = str(WORKER_CODEX_HOME)
+    if access == "write":
+        environment["HERMES_YOLO_MODE"] = "1"
+    return environment
+
+
+def build_command(runtime, args, resume_session):
+    command = [
+        *runtime,
+        "chat",
+        "--oneshot",
+        "--query-file",
+        "-",
+        "--quiet",
+        "--provider",
+        args.provider,
+        "--model",
+        args.model,
+        "--reasoning",
+        args.effort,
+        "--toolsets",
+        TOOLSETS,
+    ]
+    if resume_session is not None:
+        command.extend(("--resume", resume_session, "--no-restore-cwd"))
+    if args.access == "write":
+        command.append("--yolo")
+    return command
+
+
+def run_child(command, task, environment, args, broker_session_id, resume_session):
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            close_fds=True,
+            start_new_session=True,
+            env=environment,
+        )
+    except OSError as exc:
+        raise BridgeError("runtime_unavailable", "Hermes could not be started", 3) from exc
+
+    selector = selectors.DefaultSelector()
+    open_streams = {}
+    interrupted = []
+    shutdown_started = False
+    shutdown_deadline = None
+    force_sent = False
+    stdout_bytes = bytearray()
+    stderr_pending = bytearray()
+    result_too_large = False
+    diagnostic_too_large = False
+    session_ids = []
+    task_bytes = task.encode("utf-8")
+    task_offset = 0
+
+    def signal_group(signum):
+        try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            pass
+
+    def begin_shutdown():
+        nonlocal shutdown_started, shutdown_deadline
+        if not shutdown_started:
+            shutdown_started = True
+            shutdown_deadline = time.monotonic() + PIPE_DRAIN_SECONDS
+            signal_group(signal.SIGTERM)
+
+    def handle_signal(signum, _frame):
+        if not interrupted:
+            interrupted.append(signum)
+        begin_shutdown()
+
+    def close_stream(fileobj):
+        if fileobj is None:
+            return
+        descriptor = None
+        with contextlib.suppress(Exception):
+            descriptor = fileobj.fileno()
+        with contextlib.suppress(Exception):
+            selector.unregister(fileobj)
+        with contextlib.suppress(Exception):
+            fileobj.close()
+        if descriptor is not None:
+            open_streams.pop(descriptor, None)
+
+    def record_session(raw):
+        try:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        except AttributeError:
+            line = str(raw).rstrip("\r\n")
+        match = SESSION_LINE.match(line)
+        if not match:
+            return
+        native_id = match.group(1)
+        try:
+            validate_token(native_id, "native session id")
+        except BridgeError:
+            return
+        if native_id in session_ids:
+            return
+        session_ids.append(native_id)
+        fields = {"native_session_id": native_id, "broker_session_id": broker_session_id}
+        if resume_session is not None:
+            fields["resumed_from_native_session_id"] = resume_session
+        emit("session", **fields)
+
+    def consume_stderr(chunk, *, eof=False):
+        nonlocal diagnostic_too_large
+        stderr_pending.extend(chunk)
+        while True:
+            try:
+                newline = stderr_pending.index(b"\n")
+            except ValueError:
+                break
+            line = bytes(stderr_pending[: newline + 1])
+            del stderr_pending[: newline + 1]
+            if len(line) <= MAX_DIAGNOSTIC_LINE_BYTES:
+                record_session(line)
+            else:
+                diagnostic_too_large = True
+        if len(stderr_pending) > MAX_DIAGNOSTIC_LINE_BYTES:
+            diagnostic_too_large = True
+            stderr_pending.clear()
+        if eof and stderr_pending:
+            if len(stderr_pending) <= MAX_DIAGNOSTIC_LINE_BYTES:
+                record_session(bytes(stderr_pending))
+            else:
+                diagnostic_too_large = True
+            stderr_pending.clear()
+
+    old_handlers = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, handle_signal)
+
+    try:
+        for stream, events, name in (
+            (child.stdin, selectors.EVENT_WRITE, "stdin"),
+            (child.stdout, selectors.EVENT_READ, "stdout"),
+            (child.stderr, selectors.EVENT_READ, "stderr"),
+        ):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, events, name)
+            open_streams[stream.fileno()] = stream
+
+        while True:
+            returncode = child.poll()
+            if returncode is not None and not shutdown_started:
+                begin_shutdown()
+            if result_too_large or diagnostic_too_large:
+                begin_shutdown()
+            if shutdown_started and not force_sent and time.monotonic() >= shutdown_deadline:
+                signal_group(signal.SIGKILL)
+                force_sent = True
+                for stream in tuple(open_streams.values()):
+                    close_stream(stream)
+            if returncode is not None and not open_streams:
+                break
+            timeout = 0.05
+            if shutdown_started and not force_sent:
+                timeout = max(0.0, min(timeout, shutdown_deadline - time.monotonic()))
+            events = selector.select(timeout)
+            for key, _mask in events:
+                stream = key.fileobj
+                name = key.data
+                if name == "stdin":
+                    if task_offset >= len(task_bytes):
+                        close_stream(stream)
+                        continue
+                    try:
+                        written = os.write(stream.fileno(), task_bytes[task_offset:task_offset + 65536])
+                    except (BrokenPipeError, OSError):
+                        close_stream(stream)
+                    else:
+                        task_offset += written
+                        if task_offset >= len(task_bytes):
+                            close_stream(stream)
+                    continue
+                try:
+                    chunk = os.read(stream.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    if name == "stderr":
+                        consume_stderr(b"", eof=True)
+                    close_stream(stream)
+                    continue
+                if name == "stdout":
+                    remaining = MAX_RESULT_BYTES - len(stdout_bytes)
+                    if len(chunk) > remaining:
+                        if remaining > 0:
+                            stdout_bytes.extend(chunk[:remaining])
+                        result_too_large = True
+                    else:
+                        stdout_bytes.extend(chunk)
+                else:
+                    consume_stderr(chunk)
+    finally:
+        if child.poll() is None:
+            signal_group(signal.SIGTERM)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=PIPE_DRAIN_SECONDS)
+        if child.poll() is None:
+            signal_group(signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=0.25)
+        for stream in tuple(open_streams.values()):
+            close_stream(stream)
+        with contextlib.suppress(Exception):
+            selector.close()
+        for signum, handler in old_handlers.items():
+            signal.signal(signum, handler)
+        with contextlib.suppress(Exception):
+            child.stdin.close()
+        with contextlib.suppress(Exception):
+            child.stdout.close()
+        with contextlib.suppress(Exception):
+            child.stderr.close()
+
+    returncode = child.returncode if child.returncode is not None else (child.poll() or 1)
+    if interrupted:
+        return 128 + interrupted[0], None, session_ids, True
+    if result_too_large:
+        return 1, "result_too_large", session_ids, False
+    if diagnostic_too_large:
+        return 1, "diagnostic_too_large", session_ids, False
+    if returncode != 0:
+        return returncode, None, session_ids, False
+    result = bytes(stdout_bytes).decode("utf-8", errors="replace").strip()
+    if not result:
+        return 1, "empty_result", session_ids, False
+    if not session_ids:
+        return 1, "missing_native_session", session_ids, False
+    return 0, result, session_ids, False
+
+
+def main(argv=None):
+    try:
+        args = build_parser().parse_args(argv)
+        broker_session_id, resume_session, runtime_home = validate_args(args)
+        require_managed_boundary(args.access)
+        task_bytes = sys.stdin.buffer.read(MAX_TASK_BYTES + 1)
+        if len(task_bytes) > MAX_TASK_BYTES:
+            raise BridgeError("invalid_task", "task input is too large")
+        try:
+            task = task_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise BridgeError("invalid_task", "task input must be UTF-8") from exc
+        if not task.strip() or "\x00" in task:
+            raise BridgeError("invalid_task", "task input must be non-empty text")
+
+        runtime = resolve_hermes_runtime()
+        prepare_runtime_home(runtime_home, fresh=args.fresh_session, access=args.access)
+        seed_worker_auth(runtime_home, args.provider)
+        resume_info = None
+        if resume_session is not None:
+            resume_info = preflight_resume(runtime_home, resume_session, args.access, broker_session_id)
+        environment = build_environment(runtime_home, args.access)
+        command = build_command(runtime, args, resume_session)
+        started_fields = {
+            "broker_session_id": broker_session_id,
+            "session_mode": "resume" if resume_session is not None else "fresh",
+            "provider": args.provider,
+            "model": args.model,
+            "effort": args.effort,
+            "access": args.access,
+        }
+        if resume_session is not None:
+            started_fields["resumed_from_native_session_id"] = resume_session
+            started_fields["effective_resume_native_session_id"] = resume_info["effective_session_id"]
+        emit("started", **started_fields)
+        returncode, result, session_ids, was_interrupted = run_child(
+            command, task, environment, args, broker_session_id, resume_session
+        )
+        sync_worker_auth(runtime_home, args.provider)
+        if args.fresh_session and session_ids:
+            _record_bridge_bindings(runtime_home, session_ids, broker_session_id, args.access)
+        if returncode != 0:
+            if was_interrupted:
+                return emit_error(
+                    "interrupted",
+                    "Hermes worker was interrupted",
+                    returncode=returncode,
+                    broker_session_id=broker_session_id,
+                )
+            if result in {"empty_result", "missing_native_session", "result_too_large", "diagnostic_too_large"}:
+                return emit_error(
+                    result,
+                    "Hermes returned an unusable result",
+                    returncode=1,
+                    broker_session_id=broker_session_id,
+                )
+            return emit_error(
+                "provider_failed",
+                "Hermes provider exited with a failure status",
+                returncode=1,
+                broker_session_id=broker_session_id,
+            )
+        if resume_session is not None:
+            verify_resumed_native_id(runtime_home, resume_session, session_ids[-1])
+            _record_bridge_bindings(runtime_home, session_ids, broker_session_id, args.access)
+        native_session_id = session_ids[-1]
+        final_fields = {
+            "broker_session_id": broker_session_id,
+            "native_session_id": native_session_id,
+            "provider": args.provider,
+            "model": args.model,
+            "effort": args.effort,
+            "result": result,
+        }
+        if resume_session is not None:
+            final_fields["resumed_from_native_session_id"] = resume_session
+        emit("final", **final_fields)
+        return 0
+    except BridgeError as exc:
+        return emit_error(exc.code, exc.message, returncode=exc.returncode)
+    except (OSError, UnicodeError):
+        return emit_error("runtime_error", "Hermes worker could not complete", returncode=1)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

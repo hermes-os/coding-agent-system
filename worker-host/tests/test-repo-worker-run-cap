@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""A launch is refused once MAX_ACTIVE_RUNS runs are active, across all repositories."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+LAUNCHER = WORKSPACE / "scripts" / "repo-worker"
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"FAIL: {message}")
+
+
+def load_launcher():
+    spec = importlib.util.spec_from_loader(
+        "repo_worker_under_test",
+        importlib.machinery.SourceFileLoader("repo_worker_under_test", str(LAUNCHER)),
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["repo_worker_under_test"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def run(run_id: str, repo: str, status: str) -> dict[str, object]:
+    return {"runId": run_id, "repo": repo, "status": status}
+
+
+def main() -> int:
+    launcher = load_launcher()
+    if launcher.MAX_ACTIVE_RUNS != 2:
+        fail(f"limit is {launcher.MAX_ACTIVE_RUNS}, owner ordered 2")
+    live = {"a1", "b2", "c3"}
+    launcher.run_is_active = lambda metadata: metadata["runId"] in live
+
+    launcher.all_runs = lambda: [run("a1", "/r/one", "running"), run("z9", "/r/two", "completed")]
+    launcher.assert_capacity()
+
+    launcher.all_runs = lambda: [
+        run("a1", "/r/one", "running"),
+        run("b2", "/r/two", "running"),
+        run("z9", "/r/three", "completed"),
+    ]
+    try:
+        launcher.assert_capacity()
+    except SystemExit as exc:
+        message = str(exc)
+        if "limit 2" not in message or "a1" not in message or "b2" not in message:
+            fail(f"refusal does not name the limit and the active runs: {message}")
+    else:
+        fail("third launch was admitted while two runs were active")
+
+    launcher.all_runs = lambda: [
+        run("a1", "/r/one", "running"),
+        run("b2", "/r/two", "running"),
+        run("c3", "/r/three", "running"),
+    ]
+    try:
+        launcher.assert_capacity()
+    except SystemExit:
+        pass
+    else:
+        fail("launch was admitted while three runs were active")
+
+    print("PASS: launcher refuses a launch at the active-run limit and counts only live runs")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

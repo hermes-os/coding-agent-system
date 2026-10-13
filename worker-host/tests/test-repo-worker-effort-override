@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Owner-chosen effort must reach the worker for every alias.
+
+An alias may carry a default effort, but an explicit --effort is the owner's
+decision and must win. A hardcoded per-model floor silently overrode that and
+made a legitimate reasoning change impossible, so the launcher must not
+special-case any single alias.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+LAUNCHER = WORKSPACE / "scripts" / "repo-worker"
+# Aliases whose catalog default differs from the effort requested below, so a
+# surviving floor or a silently-dropped override is visible in the readback.
+CASES = (("luna", "xhigh"), ("opus-5", "xhigh"), ("sol", "medium"))
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"FAIL: {message}")
+
+
+def load_launcher():
+    spec = importlib.util.spec_from_loader(
+        "repo_worker_under_test",
+        importlib.machinery.SourceFileLoader("repo_worker_under_test", str(LAUNCHER)),
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["repo_worker_under_test"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def source_has_no_alias_floor() -> None:
+    source = LAUNCHER.read_text(encoding="utf-8")
+    floor = re.search(
+        r'alias == "(?P<alias>[\w.-]+)".{0,80}?resolved_effort',
+        source,
+        re.S,
+    )
+    if floor:
+        fail(f"launcher still hardcodes an effort floor for alias {floor.group('alias')!r}")
+
+
+def main() -> int:
+    source_has_no_alias_floor()
+    launcher = load_launcher()
+    for alias, effort in CASES:
+        _, _, resolved = launcher.resolve_worker_selection(
+            model=alias, agent=None, effort=effort
+        )
+        if resolved != effort:
+            fail(
+                f"{alias} requested --effort {effort} but the launcher resolved "
+                f"{resolved!r}"
+            )
+    # An omitted --effort must still fall back to the alias default.
+    _, _, default_effort = launcher.resolve_worker_selection(
+        model="luna", agent=None, effort=None
+    )
+    if default_effort != "max":
+        fail(f"luna default effort regressed to {default_effort!r}, expected 'max'")
+    print(
+        "PASS: explicit --effort survives to the worker for "
+        + ", ".join(f"{alias}={effort}" for alias, effort in CASES)
+        + "; omitted --effort still defaults luna=max"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

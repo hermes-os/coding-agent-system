@@ -1,0 +1,24 @@
+[Unit]
+Description=Repository worker launch broker
+Requires=agent-worker-broker.socket
+After=agent-worker-broker.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/agent-worker-broker
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+UMask=0077
+ReadWritePaths=/var/lib/agent-worker /var/lib/agent-worker-scratch /run/agent-worker /home/hermes
+
+[Install]
+WantedBy=multi-user.target

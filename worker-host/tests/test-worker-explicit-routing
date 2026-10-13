@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Keep explicit worker assignments intact when a provider is unavailable."""
+
+import argparse
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+
+loader = SourceFileLoader("worker_routing_test", str(Path(__file__).with_name("repo-worker")))
+spec = spec_from_loader(loader.name, loader)
+core = module_from_spec(spec)
+loader.exec_module(core)
+
+
+class ExplicitRoutingTests(unittest.TestCase):
+    def test_availability_failure_preserves_assigned_model_or_session(self):
+        for assignment in ("model", "resume_run", "project"):
+            for detail in ("quota exceeded", "OAuth session expired", "429 Too Many Requests"):
+                with self.subTest(assignment=assignment, detail=detail):
+                    args = argparse.Namespace(
+                        agent="claude", model="claude-fable-5-1" if assignment == "model" else None,
+                        effort="high", resume_run="prior-run" if assignment == "resume_run" else None,
+                        mode="project" if assignment == "project" else "task", access="write",
+                    )
+                    summary = {"runId": "assigned-run", "agent": "claude", "resumeSession": assignment == "project"}
+                    failure = {**summary, "status": "failed", "failureDetail": detail, "model": "claude-fable-5-1", "effort": "high"}
+                    with patch.object(core, "LAUNCH_GRACE_SECONDS", 1), patch.object(core, "LAUNCH_POLL_SECONDS", 0), patch.object(core, "time") as clock:
+                        clock.monotonic.return_value = 0
+                        def submit(_):
+                            self.fail("Explicit assignment launched an unauthorized replacement")
+                        result = core.apply_launch_fallback(args, summary, submit=submit, read_status=lambda _: dict(failure))
+                    self.assertEqual(result, failure)
+                    self.assertNotIn("fallbackFrom", result)
+
+    def test_unassigned_task_keeps_existing_fallback_behavior(self):
+        args = argparse.Namespace(agent="claude", model=None, effort=None, resume_run=None, mode="task", access="read")
+        submitted = []
+        def submit(next_args):
+            submitted.append(next_args.agent)
+            return {"runId": "replacement-run", "agent": next_args.agent}
+        def status(run_id):
+            return {"runId": run_id, "status": "failed", "failureDetail": "quota exceeded"} if run_id == "initial-run" else {"runId": run_id, "status": "completed"}
+        with patch.object(core, "LAUNCH_GRACE_SECONDS", 1), patch.object(core, "LAUNCH_POLL_SECONDS", 0), patch.object(core, "time") as clock:
+            clock.monotonic.return_value = 0
+            result = core.apply_launch_fallback(args, {"runId": "initial-run", "agent": "claude"}, submit=submit, read_status=status)
+        self.assertEqual(submitted, ["codex"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["fallbackFrom"][0]["runId"], "initial-run")
+
+
+if __name__ == "__main__":
+    unittest.main()
