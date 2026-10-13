@@ -71,3 +71,13 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `/usr/local/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` (`build_command`) and `repo-worker` (`--foreground` is unavailable with the worker broker).
 - What happens: each worker runs `hermes chat --oneshot` with no terminal attached. A herdr pane can only show the run through `watch-worker.py`, so herdr does not list the worker as an agent and Hermes cannot type to it.
 - Found: Hermes asked for interactive workers in herdr, 2026-10-12.
+
+## Forgejo push mirrors stalled silently for two weeks
+- Where: Forgejo on `vps` (`/etc/forgejo/app.ini`, mirror cron).
+- What happens: from 2026-10-01 the mirror cron logged `PushMirrorsIterate: context canceled` every 10 minutes and pushed nothing; GitHub stayed at 2026-09-28 for every repo while each mirror showed no `last_error`. A Forgejo restart cleared it. Nothing alerts when GitHub falls behind Forgejo.
+- Found: imessage-sidecar remote setup, 2026-10-12.
+
+## Worker system and Foreman tools are not in git
+- Where: `~/.hermes/profiles/cal/workspace/scripts/` (repo-worker, agent-worker-broker, agent-hermes-worker and configs, wait-for-workers; 153 files, many one-off dated launch scripts and `.bak-*` copies), the installed copy at `/usr/local/libexec/agent-worker-hermes/`, and `~/.hermes/profiles/foreman/{SOUL.md,skills,scripts}`.
+- What happens: the software every worker run depends on has no history, no review and no backup; changes to it cannot be traced or rolled back.
+- Found: git coverage check, 2026-10-12.
