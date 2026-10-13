@@ -135,13 +135,16 @@ run_systemctl() {
   fi
 }
 
+# Prints nothing for an unreadable file; under pipefail a failed read would
+# otherwise end the script before it reports the file.
 sha_of() {
-  as_reader sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  { as_reader sha256sum "$1" 2>/dev/null || true; } | cut -d' ' -f1
 }
 
 drift=0
 changed_system=()
 changed_links=()
+unreadable=()
 
 check_system() {
   local entry rel target want have
@@ -158,6 +161,7 @@ check_system() {
     if [[ -z "$have" ]]; then
       echo "DRIFT unreadable $target (sudo -n unavailable)"
       drift=1
+      unreadable+=("$target")
       continue
     fi
     if [[ "$have" != "$want" ]]; then
@@ -260,6 +264,12 @@ fi
 if [[ -n $uncommitted ]]; then
   echo "refusing: $REPO has uncommitted changes; --apply installs committed content only:" >&2
   printf '%s\n' "$uncommitted" >&2
+  exit 1
+fi
+
+# A target that cannot be read cannot be compared or backed up.
+if [[ ${#unreadable[@]} -gt 0 ]]; then
+  echo "refusing: cannot read ${unreadable[*]}" >&2
   exit 1
 fi
 

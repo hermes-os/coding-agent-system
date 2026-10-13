@@ -64,6 +64,9 @@ This file records user-visible changes to the portable coding-agent system.
 - `worker-host/install.sh` resolves its repository with `pwd -P`, so
   starting it through a symlinked path no longer reports every client link as
   drift.
+- `worker-host/install.sh --apply` refuses when an installed target cannot be
+  read, instead of skipping it; `--check` now reports such a target as
+  `DRIFT unreadable` instead of stopping silently at it.
 
 ### Changed
 
