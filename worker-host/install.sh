@@ -6,8 +6,9 @@
 #                          symlink into the repository; print DRIFT lines and
 #                          exit 1 on any drift.
 #   install.sh --apply     make the live copies come from the repository.
-#                          Refuses while any worker run is active or while
-#                          ~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT exists.
+#                          Refuses while any worker run is active, while
+#                          ~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT exists,
+#                          or while worker-host/ has uncommitted changes.
 #                          Each replaced file is copied first to
 #                          /var/backups/agent-worker/<timestamp>/<original path>.
 #
@@ -221,6 +222,18 @@ require_idle() {
   fi
 }
 require_idle
+
+# Only committed content is installed: a local edit or an untracked file under
+# worker-host/ would reach the live host without review.
+if ! uncommitted=$(git -c core.fsmonitor=false -C "$REPO" status --porcelain -- . 2>&1); then
+  echo "refusing: cannot read git status of $REPO: $uncommitted" >&2
+  exit 1
+fi
+if [[ -n $uncommitted ]]; then
+  echo "refusing: $REPO has uncommitted changes; --apply installs committed content only:" >&2
+  printf '%s\n' "$uncommitted" >&2
+  exit 1
+fi
 
 for entry in "${SYSTEM_FILES[@]}"; do
   IFS='|' read -r rel _ <<<"$entry"

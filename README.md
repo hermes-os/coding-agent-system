@@ -166,7 +166,8 @@ worker-host/install.sh --apply   # installs from the repo; refuses while a run i
 owner and mode, replaces the client paths with symlinks into `worker-host/`,
 runs `systemctl daemon-reload` only when a unit changed, and restarts only the
 broker service (never its socket). It also refuses while
-`~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT` exists.
+`~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT` exists, and while `worker-host/`
+has uncommitted changes or untracked files: it installs committed content only.
 
 ## Validation
 

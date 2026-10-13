@@ -51,6 +51,9 @@ This file records user-visible changes to the portable coding-agent system.
 - `worker-host/install.sh --apply` no longer resets the mode of an existing
   parent directory to 0755 when it installs a new file; it only creates a
   missing parent (root, 0755).
+- `worker-host/install.sh --apply` installs committed content only: it
+  refuses, before writing anything, while `git status --porcelain` lists any
+  change or untracked file under `worker-host/`.
 
 ### Changed
 

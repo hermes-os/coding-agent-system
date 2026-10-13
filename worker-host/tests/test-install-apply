@@ -121,6 +121,21 @@ def main() -> int:
         # The missing unit's directory exists with its own mode.
         system[SOCKET_UNIT].parent.chmod(0o750)
 
+        # Uncommitted content is refused before anything is written.
+        broker_before = system[BROKER].read_text()
+        stray = host.repo / "libexec" / "stray"
+        stray.write_text("untracked\n")
+        edited = host.repo / "bin" / "worker-pane.sh"
+        edited.write_text(edited.read_text() + "# local edit\n")
+        for label in ("an untracked file and a local edit", "a local edit"):
+            dirty = host.run("--apply")
+            if dirty.returncode != 1 or "uncommitted changes" not in dirty.stderr:
+                fail(f"apply with {label} was not refused: {dirty.stdout}{dirty.stderr}")
+            if system[BROKER].read_text() != broker_before or (host.prefix / "var/backups").exists():
+                fail(f"a refused apply with {label} changed the tree")
+            stray.unlink(missing_ok=True)
+        git(host.repo.parent, "checkout", "-q", "--", "worker-host/bin/worker-pane.sh")
+
         applied = host.run("--apply")
         output = applied.stdout + applied.stderr
         if applied.returncode != 0:
@@ -140,7 +155,7 @@ def main() -> int:
         clean = host.run("--check")
         if clean.returncode != 0 or "DRIFT" in clean.stdout:
             fail(f"tree still drifts after apply: {clean.stdout}{clean.stderr}")
-    print("PASS: install.sh --apply on a prefix installs, backs up, keeps parent modes and only echoes systemctl")
+    print("PASS: install.sh --apply refuses uncommitted content; on a prefix it installs, backs up, keeps parent modes and only echoes systemctl")
     return 0
 
 
