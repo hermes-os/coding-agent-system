@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# Compare or install the live worker-host system from this repository.
+#
+#   install.sh [--check]   read-only: sha256-compare every repository file with
+#                          its installed target and every client path with its
+#                          symlink into the repository; print DRIFT lines and
+#                          exit 1 on any drift.
+#   install.sh --apply     make the live copies come from the repository.
+#                          Refuses while any worker run is active or while
+#                          ~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT exists.
+#                          Each replaced file is copied first to
+#                          /var/backups/agent-worker/<timestamp>/<original path>.
+#
+# WORKER_HOST_PREFIX (system targets) and WORKER_HOST_HOME (client paths) exist
+# so tests can run against a scratch tree; leave them unset on the live host.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREFIX=${WORKER_HOST_PREFIX:-}
+HOME_DIR=${WORKER_HOST_HOME:-/home/hermes}
+CAL=$HOME_DIR/.hermes/profiles/cal
+W=$CAL/workspace/scripts
+C=$CAL/scripts
+F=$HOME_DIR/.hermes/profiles/foreman/scripts
+SKILL=$HOME_DIR/.hermes/profiles/foreman/skills/foreman-method/scripts
+LAUNCHER=$W/repo-worker
+HOLD=$CAL/state/HOLD-FOR-REBOOT
+BACKUP_ROOT=$PREFIX/var/backups/agent-worker
+LIBEXEC=$PREFIX/usr/local/libexec
+UNITS=$PREFIX/etc/systemd/system
+MOUNT_UNIT='var-lib-agent\x2dworker-coding\x2dagent\x2dsystem.mount'
+
+# <repository file>|<installed target>|<owner:group:mode for a new target>
+SYSTEM_FILES=(
+  "libexec/agent-worker-runner|$LIBEXEC/agent-worker-runner|root:root:755"
+  "libexec/agent-worker-broker|$LIBEXEC/agent-worker-broker|root:root:755"
+  "libexec/agent-worker-codex-auth-sync|$LIBEXEC/agent-worker-codex-auth-sync|root:root:755"
+  "libexec/agent-worker-coordination-probe|$LIBEXEC/agent-worker-coordination-probe|root:root:755"
+  "libexec/agent-worker-hermes/host/bin/agent-hermes-worker|$LIBEXEC/agent-worker-hermes/host/bin/agent-hermes-worker|root:root:755"
+  "libexec/agent-worker-hermes/host/hermes-worker/config.read.yaml|$LIBEXEC/agent-worker-hermes/host/hermes-worker/config.read.yaml|root:root:444"
+  "libexec/agent-worker-hermes/host/hermes-worker/config.write.yaml|$LIBEXEC/agent-worker-hermes/host/hermes-worker/config.write.yaml|root:root:444"
+  "etc/agent-worker/defaults.json|$PREFIX/etc/agent-worker/defaults.json|root:root:644"
+  "etc/sudoers.d/portfolio-worker-coordination|$PREFIX/etc/sudoers.d/portfolio-worker-coordination|root:root:440"
+  "systemd/agent-worker-broker.service|$UNITS/agent-worker-broker.service|root:root:644"
+  "systemd/agent-worker-broker.socket|$UNITS/agent-worker-broker.socket|root:root:644"
+  "systemd/agent-worker-codex-auth-sync.service|$UNITS/agent-worker-codex-auth-sync.service|root:root:644"
+  "systemd/agent-worker-codex-auth-sync.timer|$UNITS/agent-worker-codex-auth-sync.timer|root:root:644"
+  "systemd/$MOUNT_UNIT|$UNITS/$MOUNT_UNIT|root:root:644"
+)
+
+# <repository file>|<client path that becomes a symlink to it>
+CLIENT_LINKS=(
+  "libexec/agent-worker-runner|$W/repo-worker"
+  "libexec/agent-worker-broker|$W/agent-worker-broker"
+  "libexec/agent-worker-hermes/host/bin/agent-hermes-worker|$W/agent-hermes-worker"
+  "libexec/agent-worker-hermes/host/hermes-worker/config.read.yaml|$W/agent-hermes-worker.config.read.yaml"
+  "libexec/agent-worker-hermes/host/hermes-worker/config.write.yaml|$W/agent-hermes-worker.config.write.yaml"
+  "libexec/agent-worker-codex-auth-sync|$W/agent-worker-codex-auth-sync"
+  "libexec/agent-worker-coordination-probe|$W/agent-worker-coordination-probe"
+  "etc/agent-worker/defaults.json|$CAL/workspace/config/agent-worker-defaults.json"
+  "bin/wait-for-workers.sh|$C/wait-for-workers.sh"
+  "bin/worker-watchdog.sh|$C/worker-watchdog.sh"
+  "bin/model-usage-watch-v20260930.py|$C/model-usage-watch-v20260930.py"
+  "bin/worker-pane.sh|$F/worker-pane.sh"
+  "bin/watch-worker.py|$F/watch-worker.py"
+  "bin/chain-workers.sh|$SKILL/chain-workers.sh"
+)
+for test in "$REPO"/tests/test-*; do
+  name=$(basename "$test")
+  # Only tests that lived in the cal workspace go back there as symlinks.
+  case "$name" in
+    test-repo-worker-symlink-client|test-install-check) continue ;;
+  esac
+  CLIENT_LINKS+=("tests/$name|$W/$name")
+done
+
+usage() {
+  echo "usage: install.sh [--check | --apply]" >&2
+  exit 2
+}
+
+mode=check
+case "${1:-}" in
+  "" | --check) mode=check ;;
+  --apply) mode=apply ;;
+  *) usage ;;
+esac
+[[ $# -le 1 ]] || usage
+
+# Root-only paths (/etc/agent-worker, /etc/sudoers.d) are read through sudo -n.
+as_reader() {
+  if [[ -r "${*: -1}" ]]; then "$@"; else sudo -n "$@"; fi
+}
+
+target_exists() {
+  [[ -e "$1" ]] || sudo -n test -e "$1" 2>/dev/null
+}
+
+sha_of() {
+  as_reader sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+drift=0
+changed_system=()
+changed_links=()
+
+check_system() {
+  local entry rel target want have
+  for entry in "${SYSTEM_FILES[@]}"; do
+    IFS='|' read -r rel target _ <<<"$entry"
+    want=$(sha_of "$REPO/$rel")
+    if ! target_exists "$target"; then
+      echo "DRIFT missing   $target (repo $rel)"
+      drift=1
+      changed_system+=("$entry")
+      continue
+    fi
+    have=$(sha_of "$target")
+    if [[ -z "$have" ]]; then
+      echo "DRIFT unreadable $target (sudo -n unavailable)"
+      drift=1
+      continue
+    fi
+    if [[ "$have" != "$want" ]]; then
+      echo "DRIFT content   $target differs from $rel"
+      drift=1
+      changed_system+=("$entry")
+    fi
+  done
+}
+
+check_links() {
+  local entry rel path
+  for entry in "${CLIENT_LINKS[@]}"; do
+    IFS='|' read -r rel path <<<"$entry"
+    if [[ -L "$path" && "$(readlink -f "$path")" == "$REPO/$rel" ]]; then
+      continue
+    fi
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+      echo "DRIFT missing   $path (link to $rel)"
+    elif [[ -L "$path" ]]; then
+      echo "DRIFT link      $path points at $(readlink "$path"), not $rel"
+    elif [[ "$(sha_of "$path")" == "$(sha_of "$REPO/$rel")" ]]; then
+      echo "DRIFT copy      $path is a copy of $rel (same content), not a symlink"
+    else
+      echo "DRIFT copy      $path differs from $rel and is not a symlink"
+    fi
+    drift=1
+    changed_links+=("$entry")
+  done
+}
+
+check_system
+check_links
+echo "checked ${#SYSTEM_FILES[@]} installed files and ${#CLIENT_LINKS[@]} client paths: ${#changed_system[@]} installed and ${#changed_links[@]} client paths drift"
+
+if [[ $mode == check ]]; then
+  exit "$drift"
+fi
+
+# --apply from here on.
+if [[ $drift -eq 0 ]]; then
+  echo "nothing to apply"
+  exit 0
+fi
+if [[ -e "$HOLD" ]]; then
+  echo "refusing: $HOLD exists (owner's reboot hold)" >&2
+  exit 1
+fi
+
+active_runs() {
+  # Fails closed: no launcher, an error, or unparsable output counts as active.
+  local listing
+  [[ -x "$LAUNCHER" ]] || { echo "unknown"; return; }
+  if ! listing=$("$LAUNCHER" --list --active 2>/dev/null); then
+    echo "unknown"
+    return
+  fi
+  python3 -c '
+import json, sys
+try:
+    runs = json.load(sys.stdin)
+except ValueError:
+    print("unknown"); raise SystemExit
+print(len(runs) if isinstance(runs, list) else "unknown")' <<<"$listing"
+}
+
+require_idle() {
+  local count
+  count=$(active_runs)
+  if [[ "$count" != 0 ]]; then
+    echo "refusing: worker runs active ($count per $LAUNCHER --list --active)" >&2
+    exit 1
+  fi
+}
+require_idle
+
+for entry in "${SYSTEM_FILES[@]}"; do
+  IFS='|' read -r rel _ <<<"$entry"
+  if [[ $rel == etc/sudoers.d/* ]]; then
+    sudo -n visudo -cf "$REPO/$rel" >/dev/null || {
+      echo "refusing: visudo rejects $rel" >&2
+      exit 1
+    }
+  fi
+done
+
+stamp=$(date +%Y%m%d-%H%M%S)
+backup=$BACKUP_ROOT/$stamp
+sudo -n install -d -o root -g root -m 0700 "$backup"
+
+back_up() {
+  if [[ -e "$1" || -L "$1" ]] || sudo -n test -e "$1"; then
+    sudo -n mkdir -p "$backup$(dirname "$1")"
+    sudo -n cp -a "$1" "$backup$1"
+  fi
+}
+
+unit_changed=0
+broker_changed=0
+for entry in "${changed_system[@]}"; do
+  IFS='|' read -r rel target default <<<"$entry"
+  if target_exists "$target"; then
+    read -r owner group perm < <(sudo -n stat -c '%U %G %a' "$target")
+  else
+    IFS=':' read -r owner group perm <<<"$default"
+    sudo -n install -d -o root -g root -m 0755 "$(dirname "$target")"
+  fi
+  back_up "$target"
+  sudo -n install -o "$owner" -g "$group" -m "$perm" "$REPO/$rel" "$target"
+  echo "installed $target ($owner:$group $perm)"
+  case "$rel" in
+    systemd/*) unit_changed=1 ;;
+  esac
+  case "$rel" in
+    libexec/agent-worker-broker | systemd/agent-worker-broker.service) broker_changed=1 ;;
+    systemd/agent-worker-broker.socket)
+      echo "NOTE: agent-worker-broker.socket changed; restart it by hand when no run is active" ;;
+    systemd/agent-worker-codex-auth-sync.timer)
+      echo "NOTE: restart agent-worker-codex-auth-sync.timer to load the new schedule" ;;
+    systemd/var-lib-*)
+      echo "NOTE: the coding-agent-system mount unit changed; it is not remounted here" ;;
+  esac
+done
+
+for entry in "${changed_links[@]}"; do
+  IFS='|' read -r rel path <<<"$entry"
+  back_up "$path"
+  mkdir -p "$(dirname "$path")"
+  # A same-directory rename swaps the path in one step for running callers.
+  ln -sfn "$REPO/$rel" "$path.worker-host-new"
+  mv -Tf "$path.worker-host-new" "$path"
+  echo "linked $path -> $REPO/$rel"
+done
+
+if [[ $unit_changed -eq 1 ]]; then
+  sudo -n systemctl daemon-reload
+  echo "systemd daemon-reload done"
+fi
+if [[ $broker_changed -eq 1 ]]; then
+  # The socket stays up; only the service process reloads the new broker.
+  require_idle
+  sudo -n systemctl try-restart agent-worker-broker.service
+  echo "agent-worker-broker.service restarted (socket untouched)"
+fi
+echo "backups in $backup"

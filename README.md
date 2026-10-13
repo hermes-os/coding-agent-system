@@ -2,8 +2,8 @@
 
 A portable, model-neutral engineering system for Codex, Claude Code, Kimi CLI, Cursor,
 and other coding-agent hosts. The coordinator skills (`worker-first`, `review`,
-`land`) assume workers run on the Hermes harness through `repo-worker`, which
-this repository does not ship. It keeps policy terse, loads workflows as skills,
+`land`) assume workers run on the Hermes harness through `repo-worker`, whose
+host copy lives in `worker-host/`. It keeps policy terse, loads workflows as skills,
 dispatches skill-owned hooks, reconstructs work from repository evidence, and
 uses deterministic checks for the parts that should not depend on judgment.
 
@@ -146,6 +146,27 @@ This creates only the `CLAUDE.md` pointer when missing and a managed GitHub
 Actions workflow pinned to the full global-system commit SHA. It refuses to
 overwrite an unrelated workflow or repository guide. Re-run with `--check` to
 detect a stale pin without changing files.
+
+## Worker host
+
+`worker-host/` is the source of the live worker system on Hermes's Linux host,
+laid out by install target: `libexec/` (runner, broker, Hermes adapter and
+configs, Codex auth sync, coordination probe) for `/usr/local/libexec`, `etc/`
+for `/etc` (model policy, sudoers rule), `systemd/` for `/etc/systemd/system`,
+`bin/` for the client tools in the Cal and Foreman profiles, and `tests/`,
+which `validate.sh` runs.
+
+```bash
+worker-host/install.sh --check   # read-only; prints DRIFT lines, exits 1 on drift
+worker-host/install.sh --apply   # installs from the repo; refuses while a run is active
+```
+
+`--apply` backs up each replaced file under
+`/var/backups/agent-worker/<timestamp>/`, installs with the target's current
+owner and mode, replaces the client paths with symlinks into `worker-host/`,
+runs `systemctl daemon-reload` only when a unit changed, and restarts only the
+broker service (never its socket). It also refuses while
+`~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT` exists.
 
 ## Validation
 

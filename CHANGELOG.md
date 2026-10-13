@@ -39,6 +39,12 @@ This file records user-visible changes to the portable coding-agent system.
   return at once (no model swap), matching the code since 2026-10-07.
   `test-agent-runtime-policy` moved too but is not run (it probes the retired
   OpenClaw runtime).
+- `worker-host/install.sh` compares the repository with the live host
+  (`--check`, read-only, the default) and installs from it (`--apply`):
+  backups under `/var/backups/agent-worker/<timestamp>/`, the target's current
+  owner and mode, client paths replaced by symlinks into `worker-host/`,
+  `daemon-reload` only when a unit changed, and a refusal while a run is
+  active or the reboot hold is set.
 
 ### Changed
 

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""install.sh --check finds every drift; --apply refuses before touching anything."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+WORKER_HOST = Path(__file__).resolve().parents[1]
+INSTALL = WORKER_HOST / "install.sh"
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"FAIL: {message}")
+
+
+def manifest(prefix: Path, home: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Read the install map by asking install.sh itself on an empty tree."""
+    result = run(prefix, home, "--check")
+    system, links = [], []
+    for line in result.stdout.splitlines():
+        match = re.match(r"DRIFT missing\s+(\S+) \(repo (.+)\)$", line)
+        if match:
+            system.append((match.group(2), match.group(1)))
+            continue
+        match = re.match(r"DRIFT missing\s+(\S+) \(link to (.+)\)$", line)
+        if match:
+            links.append((match.group(2), match.group(1)))
+    return system, links
+
+
+def run(prefix: Path, home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "WORKER_HOST_PREFIX": str(prefix),
+        "WORKER_HOST_HOME": str(home),
+    }
+    return subprocess.run(
+        ["bash", str(INSTALL), *args],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary).resolve()
+        prefix, home = base / "root", base / "home"
+        # An empty tree: every target is reported missing.
+        system, links = manifest(prefix, home)
+        repo_files = {str(path.relative_to(WORKER_HOST)) for path in WORKER_HOST.rglob("*") if path.is_file()}
+        if len(system) != 14 or not all(rel in repo_files for rel, _ in system):
+            fail(f"installed-file map is wrong: {system}")
+        if len(links) < 14 or not all(rel in repo_files for rel, _ in links):
+            fail(f"client-link map is wrong: {links}")
+        if not any(path.endswith("/workspace/scripts/repo-worker") for _, path in links):
+            fail("the client launcher is not in the link map")
+
+        # A tree that matches the repository: no drift.
+        for rel, target in system:
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(WORKER_HOST / rel, path)
+        for rel, target in links:
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(WORKER_HOST / rel)
+        clean = run(prefix, home, "--check")
+        if clean.returncode != 0 or "DRIFT" in clean.stdout:
+            fail(f"matching tree reported drift: {clean.stdout}{clean.stderr}")
+        if "0 installed and 0 client paths drift" not in clean.stdout:
+            fail(f"summary is wrong: {clean.stdout}")
+
+        # Content drift, a missing file, a copy instead of a link, a stray link.
+        runner_target = Path(next(t for r, t in system if r == "libexec/agent-worker-runner"))
+        runner_target.write_text("#!/bin/sh\n")
+        sudoers_target = Path(next(t for r, t in system if r.startswith("etc/sudoers.d/")))
+        sudoers_target.unlink()
+        pane = Path(next(t for r, t in links if r == "bin/worker-pane.sh"))
+        pane.unlink()
+        shutil.copyfile(WORKER_HOST / "bin" / "worker-pane.sh", pane)
+        watch = Path(next(t for r, t in links if r == "bin/watch-worker.py"))
+        watch.unlink()
+        watch.symlink_to(WORKER_HOST / "bin" / "worker-pane.sh")
+        drifted = run(prefix, home, "--check")
+        expected = (
+            f"DRIFT content   {runner_target} differs",
+            f"DRIFT missing   {sudoers_target}",
+            f"DRIFT copy      {pane} is a copy of bin/worker-pane.sh (same content)",
+            f"DRIFT link      {watch} points at",
+        )
+        if drifted.returncode != 1 or not all(line in drifted.stdout for line in expected):
+            fail(f"drift was not reported: {drifted.stdout}{drifted.stderr}")
+        if drifted.stdout.count("DRIFT") != 4:
+            fail(f"unexpected drift lines: {drifted.stdout}")
+
+        # --apply refuses under the reboot hold, then while runs are active or
+        # unknown, and changes nothing.
+        before = runner_target.read_text()
+        hold = home / ".hermes/profiles/cal/state/HOLD-FOR-REBOOT"
+        hold.parent.mkdir(parents=True)
+        hold.write_text("hold\n")
+        held = run(prefix, home, "--apply")
+        if held.returncode != 1 or "HOLD-FOR-REBOOT" not in held.stderr:
+            fail(f"apply ignored the reboot hold: {held.stdout}{held.stderr}")
+        hold.unlink()
+
+        launcher = Path(next(t for r, t in links if r == "libexec/agent-worker-runner"))
+        launcher.unlink()
+        launcher.write_text('#!/bin/sh\necho \'[{"runId": "a1"}]\'\n')
+        launcher.chmod(0o755)
+        busy = run(prefix, home, "--apply")
+        if busy.returncode != 1 or "worker runs active (1 " not in busy.stderr:
+            fail(f"apply ignored an active run: {busy.stdout}{busy.stderr}")
+        launcher.unlink()
+        unknown = run(prefix, home, "--apply")
+        if unknown.returncode != 1 or "worker runs active (unknown" not in unknown.stderr:
+            fail(f"apply did not fail closed without a launcher: {unknown.stdout}{unknown.stderr}")
+        if runner_target.read_text() != before or (prefix / "var/backups").exists():
+            fail("a refused apply changed the tree")
+    print("PASS: install.sh --check reports every drift and --apply refuses on hold or active runs")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -25,6 +25,7 @@ user_tests=(
   test-worker-provider-fallback
   test-worker-explicit-routing
   test-worker-codex-auth-sync
+  test-install-check
 )
 root_tests=(
   test-worker-broker-policy

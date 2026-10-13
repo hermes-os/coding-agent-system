@@ -11,6 +11,7 @@ bash -n \
   "$ROOT/host/local/bin/agent-codex" \
   "$ROOT/host/local/bin/agent-kimi" \
   "$ROOT/host/local/shell/default-invocations.sh" \
+  "$ROOT/worker-host/install.sh" \
   "$ROOT/worker-host/tests/run-tests" \
   "$ROOT/worker-host/bin/chain-workers.sh" \
   "$ROOT/worker-host/bin/wait-for-workers.sh" \
