@@ -22,11 +22,6 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - What happens: host git fails with "insufficient permission for adding an object" on fetch, merge or push until the ACLs are reset by hand.
 - Found: ashwren merge 2026-10-11; `find .git ! -user hermes ! -writable` found 130 paths in hermes-mobile-lane-toolcore-r2 and 9 in hermes-mobile.
 
-## Live runner copies differ until worker-host is installed
-- Where: `~/.hermes/profiles/cal/workspace/scripts/repo-worker` (client launcher) and `/usr/local/libexec/agent-worker-runner` (installed); likewise the broker in the cal workspace and `/usr/local/libexec/agent-worker-broker`.
-- What happens: `worker-host/libexec/` holds the reconciled runner and broker (two-run cap, forge hosts `github.com` and `git.imhermes.dev`), but the installed runner still lacks the run cap and the installed runner and broker still accept `git.ashwren.com`, until `worker-host/install.sh --apply` runs.
-- Found: skill audit, 2026-10-12; diff of the live copies against `worker-host/`, 2026-10-12.
-
 ## Runner still offers project mode
 - Where: `repo-worker --mode project`.
 - What happens: it adds a "single execution owner for this project queue" note to the packet, a long-lived-session model the workflow no longer uses.
@@ -79,8 +74,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 
 ## Live worker system is not installed from git yet
 - Where: `/usr/local/libexec/agent-worker-*`, `/etc/agent-worker/defaults.json`, `/etc/sudoers.d/portfolio-worker-coordination`, the `agent-worker-*` units in `/etc/systemd/system`, and the client copies in `~/.hermes/profiles/cal/{workspace/scripts,scripts}`, `~/.hermes/profiles/foreman/scripts` and the `foreman-method` skill.
-- What happens: `worker-host/` holds their source, but the live files are still separate copies until `worker-host/install.sh --apply` runs; `install.sh --check` lists 2 installed files and 24 client paths that drift. The other entries in `~/.hermes/profiles/cal/workspace/scripts/` (153 entries in all, many one-off dated launch scripts and `.bak-*` copies) and `~/.hermes/profiles/foreman/{SOUL.md,skills}` are still outside git.
-- Found: git coverage check, 2026-10-12; `worker-host/install.sh --check`.
+- What happens: `worker-host/` holds their source, but the live files are still separate copies until `worker-host/install.sh --apply` runs; `install.sh --check` lists 2 installed files and 24 client paths that drift. The installed runner (`/usr/local/libexec/agent-worker-runner`) and the client launcher (`~/.hermes/profiles/cal/workspace/scripts/repo-worker`) differ from the reconciled `worker-host/libexec/agent-worker-runner`: the installed runner lacks the two-run cap, and the installed runner and broker still accept `git.ashwren.com`. The other entries in `~/.hermes/profiles/cal/workspace/scripts/` (153 entries in all, many one-off dated launch scripts and `.bak-*` copies) and `~/.hermes/profiles/foreman/{SOUL.md,skills}` are still outside git.
+- Found: git coverage check, skill audit and a diff of the live copies against `worker-host/`, 2026-10-12; `worker-host/install.sh --check`.
 
 ## Runtime-policy test probes the retired OpenClaw runtime
 - Where: `worker-host/tests/test-agent-runtime-policy` (moved from the cal workspace).
