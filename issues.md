@@ -116,3 +116,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `agent-repo-check` skill audit, run by a worker in ashwren-legacy.
 - What happens: the skill audit step stops with `No module named 'lib'`, so the repo check fails for a reason unrelated to the repo.
 - Found: ashwren-legacy worker defbf092, 2026-10-13.
+
+## Workers cannot build crates with sibling path dependencies
+- Where: worker sandbox; `imessage-sidecar` depends on `../../rustpush-upstream`, which lives under `/home/hermes/Projects` and is not in the worker workspace.
+- What happens: workers clone RustPush master into /tmp and patch it to build, so their gate runs against a different RustPush revision (70ec162) than the host checkout (a7fab47).
+- Found: imessage-sidecar workers 3e244c95 and cf94a341, 2026-10-13; Foreman re-ran the gate against the host checkout.
