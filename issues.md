@@ -11,6 +11,7 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `~/.hermes/profiles/cal/scripts/model-usage-watch-v20260930.py` (every 5 minutes); its ledger is `~/.hermes/profiles/cal/workspace/state/model-usage-watch/ledger.json`.
 - What happens: it calls `repo-worker --resume-run` on any run it reads as limit-killed unless the runId is in the ledger's `not_limit` list. A run whose task a fresh worker already finished was restarted on a moved main.
 - Found: ashwren run 6b3f57c9 resumed itself after its task was done, 2026-10-11.
+- It also reads a provider 429 stream fault as limit-killed and resumes the run as a new run with no herdr pane, while the coordinator relaunches fresh (chain-workers or by hand). The duplicate takes a broker slot, so the next launch fails with "2 runs already active". Found: marquee reviewers 85a7fa69 and 22073d1c resumed as 05c6d415 and e53fea56 after their task was already approved and pushed, 2026-10-13.
 
 ## Write runs leave worker-owned paths in .git
 - Where: canonical checkouts and lane clones after a write run (`.git/objects/xx`, refs).
