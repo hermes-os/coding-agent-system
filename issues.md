@@ -91,3 +91,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: worker sandbox (`repo-worker --access write`), `~/.local/share/Trash` of the worker user.
 - What happens: the trash directory sits on a read-only mount, so `agent-trash` fails; a worker had to set `XDG_DATA_HOME=/var/lib/agent-worker/.cache/xdg-data` to remove files.
 - Found: tape-machine worker f579fb5c, 2026-10-12.
+
+## File-mutation verifier warns about a file that a later edit changed
+- Where: Hermes harness file-mutation verifier, at the end of a worker's report.
+- What happens: one failed `patch` call on a wrong path makes the report end with "issues.md was NOT modified this turn", even though a later edit changed and committed that file.
+- Found: ashwren worker 77c8c020 (commit 77916f5 changed issues.md), 2026-10-13.
