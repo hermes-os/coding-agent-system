@@ -91,3 +91,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/install.sh`, `--apply` path after the `git status` check.
 - What happens: an edit made to `worker-host/` during an apply could still be installed as root.
 - Found: round 2 review of ff5da1e.
+
+## agent-trash fails inside the worker sandbox
+- Where: worker sandbox (`repo-worker --access write`), `~/.local/share/Trash` of the worker user.
+- What happens: the trash directory sits on a read-only mount, so `agent-trash` fails; a worker had to set `XDG_DATA_HOME=/var/lib/agent-worker/.cache/xdg-data` to remove files.
+- Found: tape-machine worker f579fb5c, 2026-10-12.
