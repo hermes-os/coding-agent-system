@@ -111,3 +111,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `agent-repo-check` (`PLAN_SECTIONS` check on `docs/plan/*.md`).
 - What happens: the check still requires plan-file sections, while the working agreement retires plan files; it keeps nudging agents toward writing plans.
 - Found: marvin-legal-management worker ade14070, 2026-10-13.
+
+## agent-repo-check skill audit fails with No module named 'lib'
+- Where: `agent-repo-check` skill audit, run by a worker in ashwren-legacy.
+- What happens: the skill audit step stops with `No module named 'lib'`, so the repo check fails for a reason unrelated to the repo.
+- Found: ashwren-legacy worker defbf092, 2026-10-13.
