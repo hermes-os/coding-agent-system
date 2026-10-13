@@ -96,3 +96,13 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: Hermes harness file-mutation verifier, at the end of a worker's report.
 - What happens: one failed `patch` call on a wrong path makes the report end with "issues.md was NOT modified this turn", even though a later edit changed and committed that file.
 - Found: ashwren worker 77c8c020 (commit 77916f5 changed issues.md), 2026-10-13.
+
+## Run status says blocked when the report does not start with OUTCOME
+- Where: worker run status in `repo-worker --output` / `wait-for-workers.sh`.
+- What happens: a reviewer that put `VERDICT: APPROVE` before `OUTCOME: COMPLETED` finished with status `blocked`; a worker whose only problem was a refused chmod also reported `blocked`. The status does not tell a finished run from a stuck one.
+- Found: kestrel runs c36f5db8 and 13223cfb, 2026-10-13.
+
+## repo-worker launch sometimes prints no runId
+- Where: `repo-worker --agent hermes ... --task-file`.
+- What happens: one launch for ashwren-legacy returned no runId and started no run; the same command a minute later worked.
+- Found: Foreman launch of the ashwren-legacy align task, 2026-10-13.
