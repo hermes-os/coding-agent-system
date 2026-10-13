@@ -26,6 +26,11 @@ This file records user-visible changes to the portable coding-agent system.
   `repo-worker`. The runner and broker no longer accept `git.ashwren.com`
   origins: the name no longer resolves and no checkout uses it; the forge is
   `git.imhermes.dev`.
+- The runner finds its Cal workspace (model policy, Cal-profile guard) from
+  the path it was started by, not the symlink-resolved file, so
+  `~/.hermes/profiles/cal/workspace/scripts/repo-worker` can become a symlink
+  into `worker-host/`. `worker-pane.sh` and `chain-workers.sh` find their
+  sibling tools next to their resolved location in `worker-host/bin/`.
 
 ### Changed
 

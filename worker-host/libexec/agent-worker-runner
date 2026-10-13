@@ -27,7 +27,11 @@ from urllib.parse import urlsplit
 import uuid
 
 
-WORKSPACE = Path(__file__).resolve().parents[1]
+# The client launcher path (~/.hermes/profiles/cal/workspace/scripts/repo-worker)
+# may be a symlink into the coding-agent-system repository; resolving it would
+# point WORKSPACE at the repository and lose the Cal-profile guard and policy.
+WORKSPACE = Path(os.path.abspath(__file__)).parents[1]
+CLIENT_MODEL_POLICY = WORKSPACE / "config/agent-worker-defaults.json"
 RUNTIME_HOME = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
 PRIVATE_PROFILE_ROOT = Path(
     os.environ.get("AGENT_WORKER_PRIVATE_PROFILE_ROOT", str(WORKSPACE.parent))
@@ -960,7 +964,7 @@ def model_policy() -> dict[str, object]:
             else "/etc/agent-worker/defaults.json"
         )
     else:
-        path = WORKSPACE / "config/agent-worker-defaults.json"
+        path = CLIENT_MODEL_POLICY
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:

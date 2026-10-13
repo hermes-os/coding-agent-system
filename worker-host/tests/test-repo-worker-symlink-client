@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""The client launcher keeps its Cal workspace when it is a symlink into the repo."""
+
+from __future__ import annotations
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
+RUNNER = WORKER_HOST / "libexec" / "agent-worker-runner"
+POLICY = WORKER_HOST / "etc" / "agent-worker" / "defaults.json"
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"FAIL: {message}")
+
+
+def load(path: Path):
+    # SourceFileLoader sets __file__ to the path as given, the way the
+    # interpreter does for `python3 <symlink>` and `./<symlink>`.
+    loader = SourceFileLoader("repo_worker_symlink_test", str(path))
+    spec = spec_from_loader(loader.name, loader)
+    if spec is None:
+        fail("could not load the runner")
+    module = module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main() -> int:
+    os.environ.pop("AGENT_WORKER_PRIVATE_PROFILE_ROOT", None)
+    os.environ.pop("AGENT_WORKER_MANAGED", None)
+    with tempfile.TemporaryDirectory() as temporary:
+        profile = Path(temporary).resolve() / "profiles" / "cal"
+        workspace = profile / "workspace"
+        (workspace / "scripts").mkdir(parents=True)
+        (workspace / "config").mkdir()
+        shutil.copyfile(POLICY, workspace / "config" / "agent-worker-defaults.json")
+        client = workspace / "scripts" / "repo-worker"
+        client.symlink_to(RUNNER)
+
+        runner = load(client)
+        if runner.WORKSPACE != workspace:
+            fail(f"WORKSPACE followed the symlink to {runner.WORKSPACE}")
+        if runner.PRIVATE_PROFILE_ROOT != profile:
+            fail(f"Cal-profile guard points at {runner.PRIVATE_PROFILE_ROOT}")
+        if runner.model_policy().get("schemaVersion") != 2:
+            fail("client policy was not read from the workspace config")
+
+        private_repo = profile / "private-repo"
+        private_repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(private_repo)], check=True)
+        try:
+            runner.resolve_repo(private_repo)
+        except SystemExit as exc:
+            if "Cal's private profile" not in str(exc):
+                fail(f"unexpected refusal: {exc}")
+        else:
+            fail("runner accepted a repository inside the Cal profile")
+
+        installed = load(RUNNER)
+        if installed.WORKSPACE != WORKER_HOST:
+            fail(f"direct path computed WORKSPACE {installed.WORKSPACE}")
+    print("PASS: a symlinked client launcher keeps its workspace, policy and Cal-profile guard")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

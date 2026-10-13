@@ -15,7 +15,9 @@
 #   packet-file is relative to $PACKETS (default /home/hermes/Projects/cal-task-packets)
 # Env: REPO_WORKER_MAX_ACTIVE (passed through; set only when Hermes raised it).
 W=/home/hermes/.hermes/profiles/cal/workspace
-WAIT=/home/hermes/.hermes/profiles/cal/scripts/wait-for-workers.sh
+# readlink -f: the client path is a symlink into worker-host/bin, where its siblings sit.
+BIN=$(dirname "$(readlink -f "$0")")
+WAIT=$BIN/wait-for-workers.sh
 PACKETS=${PACKETS:-/home/hermes/Projects/cal-task-packets}
 cd "$W" || exit 1
 prev=$1; shift
@@ -33,7 +35,7 @@ for spec in "$@"; do
     echo "LAUNCHED $packet (attempt $attempt) -> ${id:-FAILED: $(echo "$out" | tail -1)}"
     [ -z "$id" ] && exit 1
     # Every run gets a watch pane, chained ones too (Hermes watches all runs).
-    /home/hermes/.hermes/profiles/foreman/scripts/worker-pane.sh "$id" "${packet%.md}" || echo "PANE FAILED for $id"
+    "$BIN/worker-pane.sh" "$id" "${packet%.md}" || echo "PANE FAILED for $id"
     res=$("$WAIT" "$id"); echo "$res"
     echo "$res" | grep -q "status=failed" || break
     sleep $((attempt * 90))

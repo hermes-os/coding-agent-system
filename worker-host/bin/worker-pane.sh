@@ -8,7 +8,8 @@
 set -euo pipefail
 run=$1
 label=${2:-${run:0:8}}
-viewer=/home/hermes/.hermes/profiles/foreman/scripts/watch-worker.py
+# readlink -f: the client path is a symlink into worker-host/bin, where the viewer sits.
+viewer=$(dirname "$(readlink -f "$0")")/watch-worker.py
 root=/home/hermes/Projects/hermes-os
 # ashwren-legacy comes before ashwren so the longer name wins.
 repos="ashwren-legacy ashwren coding-agent-system coding-agent-vm-setup hearth hermes-apple-bridge imessage-sidecar inkwell kestrel linq-sidecar marquee marvin-legal-management nomad rpo-wellness tape-machine"
