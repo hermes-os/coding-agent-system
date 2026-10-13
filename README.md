@@ -169,6 +169,16 @@ broker service (never its socket). It also refuses while
 `~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT` exists, and while `worker-host/`
 has uncommitted changes or untracked files: it installs committed content only.
 
+Before it installs a unit or the broker, `--apply` records the systemd steps it
+still owes (`daemon-reload`, `try-restart agent-worker-broker.service`) in
+`/var/backups/agent-worker/pending`. If a run starts during the apply, the broker
+is installed but not restarted: it prints the exact `sudo systemctl ...` command
+to run when idle and exits 3. If it stops between a unit install and
+`daemon-reload`, it prints that command too. `--check` lists recorded steps as
+`PENDING` lines (exit 1), and the next `--apply` runs them instead of reporting
+nothing to apply. Exit status: 0 done or no drift, 1 drift or refused, 2 usage,
+3 installed with a systemd step still pending.
+
 ## Validation
 
 ```bash

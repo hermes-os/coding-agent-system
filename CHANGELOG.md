@@ -54,6 +54,13 @@ This file records user-visible changes to the portable coding-agent system.
 - `worker-host/install.sh --apply` installs committed content only: it
   refuses, before writing anything, while `git status --porcelain` lists any
   change or untracked file under `worker-host/`.
+- `worker-host/install.sh --apply` records the daemon-reload and broker
+  restart it owes in `/var/backups/agent-worker/pending` before installing.
+  When a run starts during the apply it leaves the broker unrestarted, prints
+  the `sudo systemctl try-restart agent-worker-broker.service` command and
+  exits 3; an apply stopped before `daemon-reload` prints that command.
+  `--check` reports recorded steps as `PENDING`, and the next `--apply` runs
+  them instead of reporting nothing to apply.
 
 ### Changed
 

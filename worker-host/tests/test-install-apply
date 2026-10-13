@@ -153,9 +153,65 @@ def main() -> int:
         if len(backups) != 1 or backups[0].read_text() != "#!/bin/sh\necho old broker\n":
             fail(f"the old broker was not backed up: {backups}")
         clean = host.run("--check")
-        if clean.returncode != 0 or "DRIFT" in clean.stdout:
+        if clean.returncode != 0 or "DRIFT" in clean.stdout or "PENDING" in clean.stdout:
             fail(f"tree still drifts after apply: {clean.stdout}{clean.stderr}")
-    print("PASS: install.sh --apply refuses uncommitted content; on a prefix it installs, backs up, keeps parent modes and only echoes systemctl")
+
+        # A run starts after the broker is installed: no restart, exit 3, and
+        # the restart stays pending until an idle re-run does it.
+        pending = host.prefix / "var/backups/agent-worker/pending"
+        system[BROKER].write_text("#!/bin/sh\necho old broker\n")
+        host.set_runs("[]", later='[{"runId": "r1"}]')
+        mid = host.run("--apply")
+        if mid.returncode != 3 or RESTART in mid.stdout:
+            fail(f"a run that started mid-apply did not stop the restart: {mid.returncode} {mid.stdout}{mid.stderr}")
+        told = "broker installed but NOT restarted; run `sudo systemctl try-restart agent-worker-broker.service` when idle"
+        if told not in mid.stderr:
+            fail(f"the operator was not told the restart command: {mid.stderr}")
+        if system[BROKER].read_bytes() != (host.repo / BROKER).read_bytes():
+            fail("the broker was not installed before the restart check")
+        if pending.read_text() != "try-restart agent-worker-broker.service\n":
+            fail(f"the pending restart was not recorded: {pending.read_text()!r}")
+        check = host.run("--check")
+        if check.returncode != 1 or "DRIFT" in check.stdout or "PENDING         sudo systemctl try-restart" not in check.stdout:
+            fail(f"--check did not report the pending restart: {check.stdout}{check.stderr}")
+        busy = host.run("--apply")
+        if busy.returncode != 1 or "worker runs active (1 " not in busy.stderr:
+            fail(f"a pending restart ran while a run was active: {busy.stdout}{busy.stderr}")
+        host.set_runs("[]")
+        rerun = host.run("--apply")
+        if rerun.returncode != 0 or RESTART not in rerun.stdout or "nothing to apply" in rerun.stdout:
+            fail(f"the re-run did not finish the pending restart: {rerun.stdout}{rerun.stderr}")
+        if RELOAD in rerun.stdout or pending.read_text() != "":
+            fail(f"the re-run did more than the pending restart: {rerun.stdout}{pending.read_text()!r}")
+        if "nothing to apply" not in host.run("--apply").stdout:
+            fail("a finished restart was run again")
+
+        # Stopped between a unit install and daemon-reload (a client path that
+        # cannot be replaced): the reload is recorded, the command is printed,
+        # and the next apply runs it.
+        if os.geteuid() != 0:
+            timer = next(t for r, t in system.items() if r.endswith(".timer"))
+            timer.write_text("[Timer]\n")
+            pane = next(Path(p) for p, s in links.items() if s.name == "worker-pane.sh")
+            pane.unlink()
+            pane.parent.chmod(0o555)
+            try:
+                stopped = host.run("--apply")
+            finally:
+                pane.parent.chmod(0o755)
+            if stopped.returncode in (0, 3) or "run `sudo systemctl daemon-reload`" not in stopped.stderr:
+                fail(f"an interrupted apply did not name the reload: {stopped.returncode} {stopped.stdout}{stopped.stderr}")
+            if pending.read_text() != "daemon-reload\n":
+                fail(f"the pending reload was not recorded: {pending.read_text()!r}")
+            if "PENDING         sudo systemctl daemon-reload" not in host.run("--check").stdout:
+                fail("--check did not report the pending reload")
+            finished = host.run("--apply")
+            if finished.returncode != 0 or RELOAD not in finished.stdout or RESTART in finished.stdout:
+                fail(f"the re-run did not finish the reload: {finished.stdout}{finished.stderr}")
+            final = host.run("--check")
+            if final.returncode != 0 or "DRIFT" in final.stdout or "PENDING" in final.stdout:
+                fail(f"tree drifts after the reload re-run: {final.stdout}{final.stderr}")
+    print("PASS: install.sh --apply refuses uncommitted content, installs on a prefix with systemctl echoed, keeps parent modes, and records and finishes a pending restart or reload")
     return 0
 
 
