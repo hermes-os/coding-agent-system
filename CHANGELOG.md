@@ -48,6 +48,9 @@ This file records user-visible changes to the portable coding-agent system.
 - `worker-host/install.sh` with `WORKER_HOST_PREFIX` set (a scratch test
   tree) never calls sudo or systemctl: files keep the caller as owner and
   each systemctl command is printed as `would run: ...` instead.
+- `worker-host/install.sh --apply` no longer resets the mode of an existing
+  parent directory to 0755 when it installs a new file; it only creates a
+  missing parent (root, 0755).
 
 ### Changed
 

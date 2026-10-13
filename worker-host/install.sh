@@ -251,7 +251,9 @@ for entry in "${changed_system[@]}"; do
     read -r owner group perm < <(as_root stat -c '%U %G %a' "$target")
   else
     IFS=':' read -r owner group perm <<<"$default"
-    install_as root root 0755 -d "$(dirname "$target")"
+    # An existing parent keeps its mode; only a missing one is made.
+    d=$(dirname "$target")
+    as_root test -d "$d" || install_as root root 0755 -d "$d"
   fi
   back_up "$target"
   install_as "$owner" "$group" "$perm" "$REPO/$rel" "$target"

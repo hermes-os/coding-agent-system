@@ -118,6 +118,8 @@ def main() -> int:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(host.repo / rel, target)
         system[BROKER].write_text("#!/bin/sh\necho old broker\n")
+        # The missing unit's directory exists with its own mode.
+        system[SOCKET_UNIT].parent.chmod(0o750)
 
         applied = host.run("--apply")
         output = applied.stdout + applied.stderr
@@ -130,13 +132,15 @@ def main() -> int:
         for rel in (BROKER, SOCKET_UNIT):
             if system[rel].read_bytes() != (host.repo / rel).read_bytes():
                 fail(f"{rel} was not installed")
+        if system[SOCKET_UNIT].parent.stat().st_mode & 0o777 != 0o750:
+            fail("apply re-moded an existing parent directory")
         backups = list((host.prefix / "var/backups/agent-worker").glob(f"*/**/{Path(BROKER).name}"))
         if len(backups) != 1 or backups[0].read_text() != "#!/bin/sh\necho old broker\n":
             fail(f"the old broker was not backed up: {backups}")
         clean = host.run("--check")
         if clean.returncode != 0 or "DRIFT" in clean.stdout:
             fail(f"tree still drifts after apply: {clean.stdout}{clean.stderr}")
-    print("PASS: install.sh --apply on a prefix installs, backs up and only echoes systemctl")
+    print("PASS: install.sh --apply on a prefix installs, backs up, keeps parent modes and only echoes systemctl")
     return 0
 
 
