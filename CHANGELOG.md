@@ -20,6 +20,12 @@ This file records user-visible changes to the portable coding-agent system.
   the Codex auth sync, the coordination probe and its sudoers rule, the model
   policy (`/etc/agent-worker/defaults.json`), the systemd units, the client
   tools (wait, watchdog, usage watch, pane, viewer, chain) and their tests.
+- The repository runner (`worker-host/libexec/agent-worker-runner`) now
+  carries the client launcher's two-run cap (`REPO_WORKER_MAX_ACTIVE`,
+  default 2), so one file serves both the installed runner and
+  `repo-worker`. The runner and broker no longer accept `git.ashwren.com`
+  origins: the name no longer resolves and no checkout uses it; the forge is
+  `git.imhermes.dev`.
 
 ### Changed
 

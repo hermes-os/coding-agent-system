@@ -133,6 +133,9 @@ WORKER_WORKSPACES = Path(
 MANAGED_RUNTIME = os.environ.get("AGENT_WORKER_MANAGED") == "1"
 MAX_PACKET_FIELD_CHARS = 20_000
 ACTIVE_STATES = {"starting", "queued", "running"}
+# Owner order 2026-10-08: two runs at once keeps the weekly Anthropic meter on pace.
+# REPO_WORKER_MAX_ACTIVE lets the owner raise it for one night without editing this file.
+MAX_ACTIVE_RUNS = int(os.environ.get("REPO_WORKER_MAX_ACTIVE", "2"))
 TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted"}
 FINAL_OUTCOME_RE = re.compile(r"^OUTCOME: (COMPLETED|BLOCKED)$")
 BOUNDARY_FIXTURE_RE = re.compile(r"^\.agent-worker-boundary-[0-9a-f]{32}$")
@@ -569,7 +572,7 @@ def github_repository(root: Path) -> str | None:
         return None
     value = result.stdout.strip()
     scp = re.fullmatch(
-        r"(?:[^@/:]+@)?(?:github\.com|git\.imhermes\.dev|git\.ashwren\.com):([^/?#]+)/([^/?#]+)",
+        r"(?:[^@/:]+@)?(?:github\.com|git\.imhermes\.dev):([^/?#]+)/([^/?#]+)",
         value,
         flags=re.IGNORECASE,
     )
@@ -579,7 +582,7 @@ def github_repository(root: Path) -> str | None:
         parsed = urlsplit(value)
         if (
             parsed.hostname is None
-            or parsed.hostname.casefold() not in {"github.com", "git.imhermes.dev", "git.ashwren.com"}
+            or parsed.hostname.casefold() not in {"github.com", "git.imhermes.dev"}
             or parsed.scheme.casefold() not in {"https", "ssh", "git"}
             or parsed.query
             or parsed.fragment
@@ -895,6 +898,16 @@ def assert_available(repo_root: Path, _access: str) -> None:
         raise SystemExit(
             "repo-worker: repository already has an active run: "
             f"{repo_root} ({existing.get('runId')})"
+        )
+
+
+def assert_capacity() -> None:
+    active = [run for run in all_runs() if run_is_active(run)]
+    if len(active) >= MAX_ACTIVE_RUNS:
+        ids = ", ".join(str(run.get("runId"))[:8] for run in active)
+        raise SystemExit(
+            f"repo-worker: {len(active)} runs already active "
+            f"(limit {MAX_ACTIVE_RUNS}): {ids}"
         )
 
 
@@ -2145,6 +2158,7 @@ def launch(args: argparse.Namespace) -> int:
         )
         return 0
 
+    assert_capacity()
     summary = launch_service(metadata, packet)
 
     def submit(next_args: argparse.Namespace) -> dict[str, object]:

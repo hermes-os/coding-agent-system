@@ -12,9 +12,9 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - What happens: it calls `repo-worker --resume-run` on any run it reads as limit-killed unless the runId is in the ledger's `not_limit` list. A run whose task a fresh worker already finished was restarted on a moved main.
 - Found: ashwren run 6b3f57c9 resumed itself after its task was done, 2026-10-11.
 
-## Launcher origin check accepts only one form of the Forgejo URL
-- Where: origin check in the cal copy `~/.hermes/profiles/cal/workspace/scripts/repo-worker` (the libexec copy accepts all forms).
-- What happens: `git.ashwren.com` is accepted only as `git@host:owner/repo`, not as an https or ssh:// URL, and the refusal message still says "GitHub URL".
+## Runner refusal still names only GitHub
+- Where: `github_repository` caller in `worker-host/libexec/agent-worker-runner` (`resolve_repo`).
+- What happens: an origin that is not on `github.com` or `git.imhermes.dev` is refused with "repository origin must be a canonical GitHub URL", although Forgejo origins are accepted too.
 - Found: skill audit against the launcher code, 2026-10-12.
 
 ## Write runs leave worker-owned paths in .git
@@ -22,10 +22,10 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - What happens: host git fails with "insufficient permission for adding an object" on fetch, merge or push until the ACLs are reset by hand.
 - Found: ashwren merge 2026-10-11; `find .git ! -user hermes ! -writable` found 130 paths in hermes-mobile-lane-toolcore-r2 and 9 in hermes-mobile.
 
-## Two copies of the runner differ
-- Where: `~/.hermes/profiles/cal/workspace/scripts/repo-worker` and `/usr/local/libexec/agent-worker-runner`.
-- What happens: at least the run-cap constant differs; it is not clear which copy is live for which setting.
-- Found: skill audit, 2026-10-12.
+## Live runner copies differ until worker-host is installed
+- Where: `~/.hermes/profiles/cal/workspace/scripts/repo-worker` (client launcher) and `/usr/local/libexec/agent-worker-runner` (installed); likewise the broker in the cal workspace and `/usr/local/libexec/agent-worker-broker`.
+- What happens: `worker-host/libexec/` holds the reconciled runner and broker (two-run cap, forge hosts `github.com` and `git.imhermes.dev`), but the installed runner still lacks the run cap and the installed runner and broker still accept `git.ashwren.com`, until `worker-host/install.sh --apply` runs.
+- Found: skill audit, 2026-10-12; diff of the live copies against `worker-host/`, 2026-10-12.
 
 ## Runner still offers project mode
 - Where: `repo-worker --mode project`.

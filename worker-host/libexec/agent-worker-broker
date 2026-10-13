@@ -59,7 +59,7 @@ OPEN_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 # The portfolio migrated from GitHub to a self-hosted Forgejo. Both origins
 # resolve to the same owner/repository slug, so DIRECT_REPOSITORIES still
 # fences the control plane regardless of which host a checkout points at.
-FORGE_HOSTS = frozenset({"github.com", "git.imhermes.dev", "git.ashwren.com"})
+FORGE_HOSTS = frozenset({"github.com", "git.imhermes.dev"})
 DIRECT_REPOSITORIES = {
     "hermes-os/openclaw-workspace",
     "hermes-os/coding-agent-system",
