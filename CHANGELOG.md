@@ -77,6 +77,17 @@ This file records user-visible changes to the portable coding-agent system.
 - The runner refuses an origin outside the accepted forges with "repository
   origin must be a forge URL" instead of naming only GitHub; Forgejo
   (`git.imhermes.dev`) origins were already accepted.
+- `worker-host/install.sh --apply` puts real file copies, not symlinks, in
+  the Cal and Foreman profile `scripts/` directories (`wait-for-workers.sh`,
+  `worker-watchdog.sh`, `model-usage-watch-v20260930.py`, `worker-pane.sh`,
+  `watch-worker.py`). The Hermes cron scheduler blocks a script whose symlink
+  resolves outside the profile scripts directory, and the 2026-10-12 apply
+  left the watchdog and usage-watch cron jobs failing every 5 minutes until
+  a manual repair. `--check` compares copies by content and reports a
+  symlink there as `DRIFT symlink` even when the target has the same
+  content; `--apply` backs the symlink up and replaces it. The launcher, its
+  helpers, the tests and `chain-workers.sh` stay symlinks. Backups no longer
+  write through a backup symlink saved in the same second.
 
 ### Changed
 

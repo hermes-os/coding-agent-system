@@ -88,9 +88,9 @@ class Host:
             env=env, text=True, capture_output=True, check=False, timeout=60,
         )
 
-    def manifest(self) -> tuple[dict[str, Path], dict[str, Path]]:
+    def manifest(self) -> tuple[dict[str, Path], dict[str, Path], dict[str, Path]]:
         result = self.run("--check")
-        system, links = {}, {}
+        system, links, copies = {}, {}, {}
         for line in result.stdout.splitlines():
             match = re.match(r"DRIFT missing\s+(\S+) \(repo (.+)\)$", line)
             if match:
@@ -98,18 +98,26 @@ class Host:
             match = re.match(r"DRIFT missing\s+(\S+) \(link to (.+)\)$", line)
             if match:
                 links[match.group(1)] = self.repo / match.group(2)
-        if len(system) != 14:
+            match = re.match(r"DRIFT missing\s+(\S+) \(copy of (.+)\)$", line)
+            if match:
+                copies[match.group(1)] = self.repo / match.group(2)
+        if len(system) != 14 or len(copies) != 5:
             fail(f"installed-file map is wrong: {result.stdout}")
-        return system, links
+        return system, links, copies
 
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as temporary:
         host = Host(Path(temporary).resolve())
-        system, links = host.manifest()
+        system, links, copies = host.manifest()
         if any(Path(path).name == "test-install-apply" for path in links):
             fail("test-install-apply is linked into the cal workspace")
         for path, source in links.items():
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).symlink_to(source)
+        # The shape the 2026-10-12 apply left in the profile scripts
+        # directories: symlinks into the repository, which the cron guard blocks.
+        for path, source in copies.items():
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             Path(path).symlink_to(source)
         for rel, target in system.items():
@@ -168,6 +176,31 @@ def main() -> int:
         clean = host.run("--check")
         if clean.returncode != 0 or "DRIFT" in clean.stdout or "PENDING" in clean.stdout:
             fail(f"tree still drifts after apply: {clean.stdout}{clean.stderr}")
+        # The profile scripts directories hold regular files with the
+        # repository's content and mode, and the symlinks were backed up.
+        for path, source in copies.items():
+            copy = Path(path)
+            if copy.is_symlink() or not copy.is_file():
+                fail(f"{copy} is not a regular file after apply")
+            if copy.read_bytes() != source.read_bytes() or copy.stat().st_mode & 0o777 != source.stat().st_mode & 0o777:
+                fail(f"{copy} differs from {source} after apply")
+            saved = list((host.prefix / "var/backups/agent-worker").glob(f"*{copy.parent}/{copy.name}"))
+            if len(saved) != 1 or not saved[0].is_symlink():
+                fail(f"the symlink at {copy} was not backed up: {saved}")
+        if not all(Path(path).is_symlink() for path in links):
+            fail("apply turned a client link into a file")
+        # Edited content in a copy is drift, restored by apply, and the edit is kept.
+        watchdog = next(Path(p) for p, s in copies.items() if s.name == "worker-watchdog.sh")
+        watchdog.write_text("#!/bin/sh\n# edited\n")
+        edited_check = host.run("--check")
+        if edited_check.returncode != 1 or f"DRIFT content   {watchdog} differs" not in edited_check.stdout:
+            fail(f"an edited copy was not reported: {edited_check.stdout}{edited_check.stderr}")
+        restored = host.run("--apply")
+        if restored.returncode != 0 or watchdog.is_symlink() or watchdog.read_bytes() != copies[str(watchdog)].read_bytes():
+            fail(f"apply did not restore the edited copy: {restored.stdout}{restored.stderr}")
+        kept = [f for f in (host.prefix / "var/backups/agent-worker").glob(f"*{watchdog.parent}/{watchdog.name}") if f.read_text() == "#!/bin/sh\n# edited\n"]
+        if len(kept) != 1:
+            fail("the edited copy was not backed up before apply replaced it")
 
         # A run starts after the broker is installed: no restart, exit 3, and
         # the restart stays pending until an idle re-run does it.
@@ -205,7 +238,7 @@ def main() -> int:
         if os.geteuid() != 0:
             timer = next(t for r, t in system.items() if r.endswith(".timer"))
             timer.write_text("[Timer]\n")
-            pane = next(Path(p) for p, s in links.items() if s.name == "worker-pane.sh")
+            pane = next(Path(p) for p, s in copies.items() if s.name == "worker-pane.sh")
             pane.unlink()
             pane.parent.chmod(0o555)
             try:
@@ -224,7 +257,7 @@ def main() -> int:
             final = host.run("--check")
             if final.returncode != 0 or "DRIFT" in final.stdout or "PENDING" in final.stdout:
                 fail(f"tree drifts after the reload re-run: {final.stdout}{final.stderr}")
-    print("PASS: install.sh --apply refuses uncommitted content and unreadable targets, installs on a prefix with systemctl echoed, keeps parent modes, and records and finishes a pending restart or reload")
+    print("PASS: install.sh --apply refuses uncommitted content and unreadable targets, replaces profile-scripts symlinks with regular copies, installs on a prefix with systemctl echoed, keeps parent modes, and records and finishes a pending restart or reload")
     return 0
 
 

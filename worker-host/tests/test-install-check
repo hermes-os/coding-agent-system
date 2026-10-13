@@ -19,10 +19,12 @@ def fail(message: str) -> None:
     raise SystemExit(f"FAIL: {message}")
 
 
-def manifest(prefix: Path, home: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+def manifest(
+    prefix: Path, home: Path
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
     """Read the install map by asking install.sh itself on an empty tree."""
     result = run(prefix, home, "--check")
-    system, links = [], []
+    system, links, copies = [], [], []
     for line in result.stdout.splitlines():
         match = re.match(r"DRIFT missing\s+(\S+) \(repo (.+)\)$", line)
         if match:
@@ -31,7 +33,11 @@ def manifest(prefix: Path, home: Path) -> tuple[list[tuple[str, str]], list[tupl
         match = re.match(r"DRIFT missing\s+(\S+) \(link to (.+)\)$", line)
         if match:
             links.append((match.group(2), match.group(1)))
-    return system, links
+            continue
+        match = re.match(r"DRIFT missing\s+(\S+) \(copy of (.+)\)$", line)
+        if match:
+            copies.append((match.group(2), match.group(1)))
+    return system, links, copies
 
 
 def run(prefix: Path, home: Path, *args: str, install: Path = INSTALL) -> subprocess.CompletedProcess[str]:
@@ -55,7 +61,7 @@ def main() -> int:
         base = Path(temporary).resolve()
         prefix, home = base / "root", base / "home"
         # An empty tree: every target is reported missing.
-        system, links = manifest(prefix, home)
+        system, links, copies = manifest(prefix, home)
         repo_files = {str(path.relative_to(WORKER_HOST)) for path in WORKER_HOST.rglob("*") if path.is_file()}
         if len(system) != 14 or not all(rel in repo_files for rel, _ in system):
             fail(f"installed-file map is wrong: {system}")
@@ -63,6 +69,14 @@ def main() -> int:
             fail(f"client-link map is wrong: {links}")
         if not any(path.endswith("/workspace/scripts/repo-worker") for _, path in links):
             fail("the client launcher is not in the link map")
+        if len(copies) != 5 or not all(rel.startswith("bin/") and rel in repo_files for rel, _ in copies):
+            fail(f"client-copy map is wrong: {copies}")
+        # Every file in a profile scripts directory is a copy, never a link.
+        profile_scripts = re.compile(r"/\.hermes/profiles/[^/]+/scripts/[^/]+$")
+        if any(profile_scripts.search(path) for _, path in links):
+            fail(f"a profile scripts file is in the link map: {links}")
+        if not all(profile_scripts.search(path) for _, path in copies):
+            fail(f"a client copy is outside a profile scripts directory: {copies}")
 
         # A tree that matches the repository: no drift.
         for rel, target in system:
@@ -73,6 +87,10 @@ def main() -> int:
             path = Path(target)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.symlink_to(WORKER_HOST / rel)
+        for rel, target in copies:
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(WORKER_HOST / rel, path)
         clean = run(prefix, home, "--check")
         if clean.returncode != 0 or "DRIFT" in clean.stdout:
             fail(f"matching tree reported drift: {clean.stdout}{clean.stderr}")
@@ -86,27 +104,40 @@ def main() -> int:
         if aliased.returncode != 0 or "DRIFT" in aliased.stdout:
             fail(f"a symlinked start reported drift: {aliased.stdout}{aliased.stderr}")
 
-        # Content drift, a missing file, a copy instead of a link, a stray link.
+        # Content drift, a missing file, a copy instead of a link, a stray link,
+        # and for client copies: edited content, a missing file, a symlink.
         runner_target = Path(next(t for r, t in system if r == "libexec/agent-worker-runner"))
         runner_target.write_text("#!/bin/sh\n")
         sudoers_target = Path(next(t for r, t in system if r.startswith("etc/sudoers.d/")))
         sudoers_target.unlink()
-        pane = Path(next(t for r, t in links if r == "bin/worker-pane.sh"))
+        chain = Path(next(t for r, t in links if r == "bin/chain-workers.sh"))
+        chain.unlink()
+        shutil.copyfile(WORKER_HOST / "bin" / "chain-workers.sh", chain)
+        broker_link = Path(next(t for r, t in links if r == "libexec/agent-worker-broker"))
+        broker_link.unlink()
+        broker_link.symlink_to(WORKER_HOST / "bin" / "worker-pane.sh")
+        watchdog = Path(next(t for r, t in copies if r == "bin/worker-watchdog.sh"))
+        watchdog.write_text("#!/bin/sh\n")
+        wait = Path(next(t for r, t in copies if r == "bin/wait-for-workers.sh"))
+        wait.unlink()
+        # A symlink with the repository's own content is still drift: the cron
+        # guard blocks a script that resolves outside the profile scripts dir.
+        pane = Path(next(t for r, t in copies if r == "bin/worker-pane.sh"))
         pane.unlink()
-        shutil.copyfile(WORKER_HOST / "bin" / "worker-pane.sh", pane)
-        watch = Path(next(t for r, t in links if r == "bin/watch-worker.py"))
-        watch.unlink()
-        watch.symlink_to(WORKER_HOST / "bin" / "worker-pane.sh")
+        pane.symlink_to(WORKER_HOST / "bin" / "worker-pane.sh")
         drifted = run(prefix, home, "--check")
         expected = (
             f"DRIFT content   {runner_target} differs",
             f"DRIFT missing   {sudoers_target}",
-            f"DRIFT copy      {pane} is a copy of bin/worker-pane.sh (same content)",
-            f"DRIFT link      {watch} points at",
+            f"DRIFT copy      {chain} is a copy of bin/chain-workers.sh (same content)",
+            f"DRIFT link      {broker_link} points at",
+            f"DRIFT content   {watchdog} differs from bin/worker-watchdog.sh",
+            f"DRIFT missing   {wait} (copy of bin/wait-for-workers.sh)",
+            f"DRIFT symlink   {pane} points at",
         )
         if drifted.returncode != 1 or not all(line in drifted.stdout for line in expected):
             fail(f"drift was not reported: {drifted.stdout}{drifted.stderr}")
-        if drifted.stdout.count("DRIFT") != 4:
+        if drifted.stdout.count("DRIFT") != 7:
             fail(f"unexpected drift lines: {drifted.stdout}")
 
         # --apply refuses under the reboot hold, then while runs are active or
@@ -133,7 +164,7 @@ def main() -> int:
             fail(f"apply did not fail closed without a launcher: {unknown.stdout}{unknown.stderr}")
         if runner_target.read_text() != before or (prefix / "var/backups").exists():
             fail("a refused apply changed the tree")
-    print("PASS: install.sh --check reports every drift and --apply refuses on hold or active runs")
+    print("PASS: install.sh --check reports every drift, a symlink where a profile-scripts copy belongs included, and --apply refuses on hold or active runs")
     return 0
 
 

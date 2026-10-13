@@ -2,15 +2,23 @@
 # Compare or install the live worker-host system from this repository.
 #
 #   install.sh [--check]   read-only: sha256-compare every repository file with
-#                          its installed target and every client path with its
-#                          symlink into the repository; print DRIFT lines and
-#                          exit 1 on any drift.
+#                          its installed target and with its client copy, and
+#                          check every client link points into the repository;
+#                          print DRIFT lines and exit 1 on any drift.
 #   install.sh --apply     make the live copies come from the repository.
 #                          Refuses while any worker run is active, while
 #                          ~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT exists,
 #                          or while worker-host/ has uncommitted changes.
 #                          Each replaced file is copied first to
 #                          /var/backups/agent-worker/<timestamp>/<original path>.
+#
+# Client tools in a profile scripts directory (~/.hermes/profiles/*/scripts)
+# are real file copies, never symlinks: the Hermes cron scheduler resolves a
+# script symlink and blocks any script that resolves outside that directory.
+# A symlink there is drift even when its target has the same content. The
+# launcher, its helpers and the tests under the Cal workspace, and
+# chain-workers.sh (which finds its sibling tools through its resolved path),
+# stay symlinks into the repository.
 #
 # A systemd step --apply could not finish (daemon-reload after a unit changed,
 # the broker restart when a run started during the apply) is recorded in
@@ -63,6 +71,15 @@ SYSTEM_FILES=(
   "systemd/$MOUNT_UNIT|$UNITS/$MOUNT_UNIT|root:root:644"
 )
 
+# <repository file>|<client path that becomes a regular copy of it>
+CLIENT_COPIES=(
+  "bin/wait-for-workers.sh|$C/wait-for-workers.sh"
+  "bin/worker-watchdog.sh|$C/worker-watchdog.sh"
+  "bin/model-usage-watch-v20260930.py|$C/model-usage-watch-v20260930.py"
+  "bin/worker-pane.sh|$F/worker-pane.sh"
+  "bin/watch-worker.py|$F/watch-worker.py"
+)
+
 # <repository file>|<client path that becomes a symlink to it>
 CLIENT_LINKS=(
   "libexec/agent-worker-runner|$W/repo-worker"
@@ -73,11 +90,6 @@ CLIENT_LINKS=(
   "libexec/agent-worker-codex-auth-sync|$W/agent-worker-codex-auth-sync"
   "libexec/agent-worker-coordination-probe|$W/agent-worker-coordination-probe"
   "etc/agent-worker/defaults.json|$CAL/workspace/config/agent-worker-defaults.json"
-  "bin/wait-for-workers.sh|$C/wait-for-workers.sh"
-  "bin/worker-watchdog.sh|$C/worker-watchdog.sh"
-  "bin/model-usage-watch-v20260930.py|$C/model-usage-watch-v20260930.py"
-  "bin/worker-pane.sh|$F/worker-pane.sh"
-  "bin/watch-worker.py|$F/watch-worker.py"
   "bin/chain-workers.sh|$SKILL/chain-workers.sh"
 )
 for test in "$REPO"/tests/test-*; do
@@ -144,6 +156,7 @@ sha_of() {
 drift=0
 changed_system=()
 changed_links=()
+changed_copies=()
 unreadable=()
 
 check_system() {
@@ -193,6 +206,26 @@ check_links() {
   done
 }
 
+# A client copy must be a regular file with the repository's content; a symlink
+# is drift whatever it points at.
+check_copies() {
+  local entry rel path
+  for entry in "${CLIENT_COPIES[@]}"; do
+    IFS='|' read -r rel path <<<"$entry"
+    if [[ -L "$path" ]]; then
+      echo "DRIFT symlink   $path points at $(readlink "$path"); a copy of $rel is required"
+    elif [[ ! -e "$path" ]]; then
+      echo "DRIFT missing   $path (copy of $rel)"
+    elif [[ "$(sha_of "$path")" != "$(sha_of "$REPO/$rel")" ]]; then
+      echo "DRIFT content   $path differs from $rel"
+    else
+      continue
+    fi
+    drift=1
+    changed_copies+=("$entry")
+  done
+}
+
 # One systemctl argument line per step an earlier --apply left unfinished.
 need_reload=0
 need_restart=0
@@ -211,8 +244,9 @@ check_pending() {
 
 check_system
 check_links
+check_copies
 check_pending
-echo "checked ${#SYSTEM_FILES[@]} installed files and ${#CLIENT_LINKS[@]} client paths: ${#changed_system[@]} installed and ${#changed_links[@]} client paths drift"
+echo "checked ${#SYSTEM_FILES[@]} installed files and $(( ${#CLIENT_LINKS[@]} + ${#CLIENT_COPIES[@]} )) client paths: ${#changed_system[@]} installed and $(( ${#changed_links[@]} + ${#changed_copies[@]} )) client paths drift"
 
 if [[ $mode == check ]]; then
   exit "$drift"
@@ -317,14 +351,16 @@ trap report_pending EXIT
 
 stamp=$(date +%Y%m%d-%H%M%S)
 backup=$BACKUP_ROOT/$stamp
-if [[ $(( ${#changed_system[@]} + ${#changed_links[@]} )) -gt 0 ]]; then
+if [[ $(( ${#changed_system[@]} + ${#changed_links[@]} + ${#changed_copies[@]} )) -gt 0 ]]; then
   install_as root root 0700 -d "$backup"
 fi
 
 back_up() {
   if [[ -e "$1" || -L "$1" ]] || as_root test -e "$1"; then
     as_root mkdir -p "$backup$(dirname "$1")"
-    as_root cp -a "$1" "$backup$1"
+    # --remove-destination: a backup of the same path made in the same second
+    # (a symlink saved earlier) is replaced, never written through.
+    as_root cp -a --remove-destination "$1" "$backup$1"
   fi
 }
 
@@ -361,6 +397,18 @@ for entry in "${changed_links[@]}"; do
   echo "linked $path -> $REPO/$rel"
 done
 
+for entry in "${changed_copies[@]}"; do
+  IFS='|' read -r rel path <<<"$entry"
+  back_up "$path"
+  mkdir -p "$(dirname "$path")"
+  # A same-directory rename swaps the path in one step for running callers; it
+  # also replaces a symlink itself, never the file the symlink points at.
+  rm -f "$path.worker-host-new"
+  install -m "$(stat -c %a "$REPO/$rel")" "$REPO/$rel" "$path.worker-host-new"
+  mv -Tf "$path.worker-host-new" "$path"
+  echo "copied $REPO/$rel -> $path"
+done
+
 if [[ $need_reload -eq 1 ]]; then
   if run_systemctl $RELOAD; then
     need_reload=0
@@ -387,7 +435,7 @@ if [[ $need_restart -eq 1 ]]; then
   fi
 fi
 finished=1
-if [[ $(( ${#changed_system[@]} + ${#changed_links[@]} )) -gt 0 ]]; then
+if [[ $(( ${#changed_system[@]} + ${#changed_links[@]} + ${#changed_copies[@]} )) -gt 0 ]]; then
   echo "backups in $backup"
 fi
 if [[ $(( need_reload + need_restart )) -gt 0 ]]; then
