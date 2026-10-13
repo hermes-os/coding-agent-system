@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Run the worker-host tests against the repository copies.
-# Tests that need root (root-owned trust state, uid-0 policy files) run through
-# `sudo -n` when this user has it and are skipped otherwise, e.g. inside a
-# worker sandbox. test-agent-runtime-policy is not run: it probes the retired
-# OpenClaw runtime on the live host, not files in this repository.
+# Tests that need root (root-owned trust state, uid-0 policy files) run only
+# when WORKER_HOST_ROOT_TESTS=1, as root or through `sudo -n`; validate.sh does
+# not set it, so they are skipped by default. test-agent-runtime-policy is not
+# run: it probes the retired OpenClaw runtime on the live host, not files in
+# this repository.
 set -euo pipefail
 
 TESTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,7 +52,9 @@ for name in "${user_tests[@]}"; do
   run_test "$name" python3 -B
 done
 for name in "${root_tests[@]}"; do
-  if [[ $EUID -eq 0 ]]; then
+  if [[ ${WORKER_HOST_ROOT_TESTS:-} != 1 ]]; then
+    echo "SKIP $name (needs root; set WORKER_HOST_ROOT_TESTS=1 to run it)"
+  elif [[ $EUID -eq 0 ]]; then
     run_test "$name" python3 -B
   elif sudo -n true 2>/dev/null; then
     run_test "$name" sudo -n python3 -B

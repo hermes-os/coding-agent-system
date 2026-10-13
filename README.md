@@ -154,7 +154,10 @@ laid out by install target: `libexec/` (runner, broker, Hermes adapter and
 configs, Codex auth sync, coordination probe) for `/usr/local/libexec`, `etc/`
 for `/etc` (model policy, sudoers rule), `systemd/` for `/etc/systemd/system`,
 `bin/` for the client tools in the Cal and Foreman profiles, and `tests/`,
-which `validate.sh` runs.
+which `validate.sh` runs. The two root-only tests (`test-worker-broker-policy`,
+`test-worker-permission-policy`) run only with `WORKER_HOST_ROOT_TESTS=1`
+(as root or through `sudo -n`); `validate.sh` does not set it, so they are
+skipped by default: `WORKER_HOST_ROOT_TESTS=1 worker-host/tests/run-tests`.
 
 ```bash
 worker-host/install.sh --check   # read-only; prints DRIFT lines, exits 1 on drift

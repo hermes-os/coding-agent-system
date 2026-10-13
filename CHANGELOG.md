@@ -67,6 +67,9 @@ This file records user-visible changes to the portable coding-agent system.
 - `worker-host/install.sh --apply` refuses when an installed target cannot be
   read, instead of skipping it; `--check` now reports such a target as
   `DRIFT unreadable` instead of stopping silently at it.
+- `worker-host/tests/run-tests` runs the two root-only tests only when
+  `WORKER_HOST_ROOT_TESTS=1` is set (as root or through `sudo -n`).
+  `validate.sh` does not set it, so it no longer runs anything through sudo.
 
 ### Changed
 
