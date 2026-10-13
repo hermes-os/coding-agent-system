@@ -106,3 +106,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `repo-worker --agent hermes ... --task-file`.
 - What happens: one launch for ashwren-legacy returned no runId and started no run; the same command a minute later worked.
 - Found: Foreman launch of the ashwren-legacy align task, 2026-10-13.
+
+## agent-repo-check validates docs/plan against plan sections
+- Where: `agent-repo-check` (`PLAN_SECTIONS` check on `docs/plan/*.md`).
+- What happens: the check still requires plan-file sections, while the working agreement retires plan files; it keeps nudging agents toward writing plans.
+- Found: marvin-legal-management worker ade14070, 2026-10-13.
