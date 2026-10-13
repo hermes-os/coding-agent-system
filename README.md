@@ -171,6 +171,10 @@ runs `systemctl daemon-reload` only when a unit changed, and restarts only the
 broker service (never its socket). It also refuses while
 `~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT` exists, and while `worker-host/`
 has uncommitted changes or untracked files: it installs committed content only.
+The Cal workspace copies of `agent-hermes-worker` and
+`agent-worker-coordination-probe` (`~/.hermes/profiles/cal/workspace/scripts/`)
+are older than the installed ones; `--apply` replaces them with symlinks to the
+`worker-host/` copies, which match the installed versions.
 
 Before it installs a unit or the broker, `--apply` records the systemd steps it
 still owes (`daemon-reload`, `try-restart agent-worker-broker.service`) in

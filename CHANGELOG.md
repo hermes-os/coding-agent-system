@@ -70,6 +70,10 @@ This file records user-visible changes to the portable coding-agent system.
 - `worker-host/tests/run-tests` runs the two root-only tests only when
   `WORKER_HOST_ROOT_TESTS=1` is set (as root or through `sudo -n`).
   `validate.sh` does not set it, so it no longer runs anything through sudo.
+- `worker-host/install.sh --apply` replaces the Cal workspace copies of
+  `agent-hermes-worker` and `agent-worker-coordination-probe`, which are older
+  than the installed ones, with symlinks to the `worker-host/` copies, which
+  match the installed versions.
 
 ### Changed
 
