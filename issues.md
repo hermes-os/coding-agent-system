@@ -76,3 +76,18 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/tests/test-agent-runtime-policy` (moved from the cal workspace).
 - What happens: it reads `~/.hermes/profiles/cal/openclaw.json`, root's Claude and Codex sign-ins and the Codex Remote Control supervisor; the OpenClaw config is gone, so it fails with FileNotFoundError. `worker-host/tests/run-tests` does not run it.
 - Found: running the ten live worker tests, 2026-10-12.
+
+## install.sh can lose the pending record on a hard kill
+- Where: `worker-host/install.sh` line 293 (pending marker write).
+- What happens: `tee` empties `/var/backups/agent-worker/pending` before it writes it, so a hard kill at that instant leaves no record of an owed daemon-reload or broker restart.
+- Found: round 2 review of ff5da1e.
+
+## install.sh git status can take the shared index lock
+- Where: `worker-host/install.sh` line 260 (committed-content check).
+- What happens: plain `git status` may briefly take `index.lock` in the shared checkout, so a commit by another agent at that moment can fail.
+- Found: round 2 review of ff5da1e.
+
+## install.sh does not re-check a file between the commit check and its install
+- Where: `worker-host/install.sh`, `--apply` path after the `git status` check.
+- What happens: an edit made to `worker-host/` during an apply could still be installed as root.
+- Found: round 2 review of ff5da1e.
