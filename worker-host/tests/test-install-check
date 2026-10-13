@@ -34,14 +34,14 @@ def manifest(prefix: Path, home: Path) -> tuple[list[tuple[str, str]], list[tupl
     return system, links
 
 
-def run(prefix: Path, home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run(prefix: Path, home: Path, *args: str, install: Path = INSTALL) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "WORKER_HOST_PREFIX": str(prefix),
         "WORKER_HOST_HOME": str(home),
     }
     return subprocess.run(
-        ["bash", str(INSTALL), *args],
+        ["bash", str(install), *args],
         env=env,
         text=True,
         capture_output=True,
@@ -78,6 +78,13 @@ def main() -> int:
             fail(f"matching tree reported drift: {clean.stdout}{clean.stderr}")
         if "0 installed and 0 client paths drift" not in clean.stdout:
             fail(f"summary is wrong: {clean.stdout}")
+        # Started through a symlinked directory, links still resolve to the
+        # repository's physical path.
+        alias = base / "worker-host-alias"
+        alias.symlink_to(WORKER_HOST)
+        aliased = run(prefix, home, "--check", install=alias / "install.sh")
+        if aliased.returncode != 0 or "DRIFT" in aliased.stdout:
+            fail(f"a symlinked start reported drift: {aliased.stdout}{aliased.stderr}")
 
         # Content drift, a missing file, a copy instead of a link, a stray link.
         runner_target = Path(next(t for r, t in system if r == "libexec/agent-worker-runner"))

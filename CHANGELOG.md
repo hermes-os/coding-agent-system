@@ -61,6 +61,9 @@ This file records user-visible changes to the portable coding-agent system.
   exits 3; an apply stopped before `daemon-reload` prints that command.
   `--check` reports recorded steps as `PENDING`, and the next `--apply` runs
   them instead of reporting nothing to apply.
+- `worker-host/install.sh` resolves its repository with `pwd -P`, so
+  starting it through a symlinked path no longer reports every client link as
+  drift.
 
 ### Changed
 
