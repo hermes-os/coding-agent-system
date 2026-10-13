@@ -66,3 +66,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: rpo-wellness `.agents/skills/rpo-quality-gates/scripts/lib/review-common.sh` (`staged_candidate_fingerprint` and other fingerprint call sites).
 - What happens: the fingerprint hashes `git diff --cached` output, which changes with global `diff.mnemonicPrefix` and `diff.algorithm`, so the same staged change can fingerprint differently for a worker and for the host user.
 - Found: rpo-wellness fix worker fe6843cb, 2026-10-12.
+
+## Workers cannot be talked to from herdr
+- Where: `/usr/local/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` (`build_command`) and `repo-worker` (`--foreground` is unavailable with the worker broker).
+- What happens: each worker runs `hermes chat --oneshot` with no terminal attached. A herdr pane can only show the run through `watch-worker.py`, so herdr does not list the worker as an agent and Hermes cannot type to it.
+- Found: Hermes asked for interactive workers in herdr, 2026-10-12.
