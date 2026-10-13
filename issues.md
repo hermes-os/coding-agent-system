@@ -12,11 +12,6 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - What happens: it calls `repo-worker --resume-run` on any run it reads as limit-killed unless the runId is in the ledger's `not_limit` list. A run whose task a fresh worker already finished was restarted on a moved main.
 - Found: ashwren run 6b3f57c9 resumed itself after its task was done, 2026-10-11.
 
-## Runner refusal still names only GitHub
-- Where: `github_repository` caller in `worker-host/libexec/agent-worker-runner` (`resolve_repo`).
-- What happens: an origin that is not on `github.com` or `git.imhermes.dev` is refused with "repository origin must be a canonical GitHub URL", although Forgejo origins are accepted too.
-- Found: skill audit against the launcher code, 2026-10-12.
-
 ## Write runs leave worker-owned paths in .git
 - Where: canonical checkouts and lane clones after a write run (`.git/objects/xx`, refs).
 - What happens: host git fails with "insufficient permission for adding an object" on fetch, merge or push until the ACLs are reset by hand.

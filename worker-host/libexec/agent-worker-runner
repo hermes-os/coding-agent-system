@@ -636,7 +636,7 @@ def resolve_repo(path: Path) -> tuple[Path, Path]:
     repository = github_repository(root)
     if repository is None:
         raise SystemExit(
-            "repo-worker: repository origin must be a canonical GitHub URL"
+            "repo-worker: repository origin must be a forge URL"
         )
     if repository in DIRECT_REPOSITORIES:
         raise SystemExit("repo-worker: direct control-plane repositories cannot be delegated")

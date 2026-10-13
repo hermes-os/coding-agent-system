@@ -74,6 +74,9 @@ This file records user-visible changes to the portable coding-agent system.
   `agent-hermes-worker` and `agent-worker-coordination-probe`, which are older
   than the installed ones, with symlinks to the `worker-host/` copies, which
   match the installed versions.
+- The runner refuses an origin outside the accepted forges with "repository
+  origin must be a forge URL" instead of naming only GitHub; Forgejo
+  (`git.imhermes.dev`) origins were already accepted.
 
 ### Changed
 
