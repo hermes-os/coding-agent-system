@@ -132,3 +132,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: the worker environment (repo-worker Hermes adapter) running `precommit-gate.sh` in rpo-wellness.
 - What happens: the default pnpm store path is read-only and Playwright's Chromium is not installed, so the gate fails until the worker passes a /tmp pnpm store, `pnpm_config_verify_deps_before_run=false` and `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` by hand.
 - Found: worker d7606759 on rpo-wellness, 2026-10-14.
+
+## agent-trash fails inside the worker sandbox
+- Where: the worker environment (repo-worker Hermes adapter) calling `agent-trash`.
+- What happens: `agent-trash` fails with "Read-only file system" on `~/.local/share/Trash`, so workers cannot clean up their scratch copies and leave them in /tmp.
+- Found: worker cf27cd80 on tape-machine, 2026-10-14.
