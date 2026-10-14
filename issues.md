@@ -91,7 +91,7 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 ## agent-trash fails inside the worker sandbox
 - Where: worker sandbox (`repo-worker --access write`), `~/.local/share/Trash` of the worker user.
 - What happens: the trash directory sits on a read-only mount, so `agent-trash` fails; a worker had to set `XDG_DATA_HOME=/var/lib/agent-worker/.cache/xdg-data` to remove files.
-- Found: tape-machine worker f579fb5c, 2026-10-12.
+- Found: tape-machine worker f579fb5c, 2026-10-12; also tape-machine worker cf27cd80, 2026-10-14 (workers leave scratch copies in /tmp).
 
 ## File-mutation verifier warns about a file that a later edit changed
 - Where: Hermes harness file-mutation verifier, at the end of a worker's report.
@@ -133,7 +133,7 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - What happens: the default pnpm store path is read-only and Playwright's Chromium is not installed, so the gate fails until the worker passes a /tmp pnpm store, `pnpm_config_verify_deps_before_run=false` and `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` by hand.
 - Found: worker d7606759 on rpo-wellness, 2026-10-14.
 
-## agent-trash fails inside the worker sandbox
-- Where: the worker environment (repo-worker Hermes adapter) calling `agent-trash`.
-- What happens: `agent-trash` fails with "Read-only file system" on `~/.local/share/Trash`, so workers cannot clean up their scratch copies and leave them in /tmp.
-- Found: worker cf27cd80 on tape-machine, 2026-10-14.
+## install.sh --check ignores file mode on profile-script copies
+- Where: `worker-host/install.sh`, `check_copies`.
+- What happens: a copy that lost its exec bit reports no drift, but Foreman runs `worker-pane.sh` and `wait-for-workers.sh` directly, so they would fail with "Permission denied".
+- Found: review of dc9626f, 2026-10-14.
