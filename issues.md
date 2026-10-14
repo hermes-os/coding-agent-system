@@ -127,3 +127,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `.github/workflows/validate.yml` (macos-latest matrix leg), `tests/test_dispatch.py:377` and `:420` (`test_git_marker_replaced_after_mount_check_fails_closed`, `test_git_marker_descriptor_close_failure_fails_closed`).
 - What happens: on macOS both tests get no ValueError, so the GitHub Validate run is red on every push since 2026-09-04; the ubuntu leg passes. Whether macOS is still a supported host (the forge handoff names a `mac-cal` peer) decides between fixing dispatch on Darwin and dropping the leg.
 - Found: `gh run view 38414593686 -R hermes-os/coding-agent-system`, 2026-10-13.
+
+## Worker sandbox cannot run the rpo-wellness gate with its defaults
+- Where: the worker environment (repo-worker Hermes adapter) running `precommit-gate.sh` in rpo-wellness.
+- What happens: the default pnpm store path is read-only and Playwright's Chromium is not installed, so the gate fails until the worker passes a /tmp pnpm store, `pnpm_config_verify_deps_before_run=false` and `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium` by hand.
+- Found: worker d7606759 on rpo-wellness, 2026-10-14.
