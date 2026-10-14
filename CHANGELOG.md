@@ -12,6 +12,10 @@ This file records user-visible changes to the portable coding-agent system.
 - Harden canonical GitHub peer authorization reads with a 256 KiB limit,
   no-follow descriptor pinning, and fail-closed inode and metadata checks.
 - Report Xcode, `xcrun`, and simulator capabilities when available.
+- The usage watch routes `implementation` (code builds) to Sonnet 5.5 at
+  `high` effort instead of `xhigh`: a one-week owner cost trial from
+  2026-10-14. Review-fix rounds keep the Opus fixer; `guide_authoring`
+  stays at `xhigh`.
 
 ### Added
 

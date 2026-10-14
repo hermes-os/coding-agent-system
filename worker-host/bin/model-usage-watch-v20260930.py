@@ -63,7 +63,10 @@ def route(model, effort):
 # takes tough coding, Opus 5.5 high reviews and edits. No usage-burn targets.
 # Owner order 2026-10-08: review-fix rounds run on the Opus medium fixer, reviews
 # on Opus high, and a review's NIT findings go to a scoped Sonnet medium pass.
+# Owner order 2026-10-14: code builds run Sonnet 5.5 at high, not xhigh, as a
+# one-week cost trial; review-fix rounds still escalate to the Opus fixer.
 SONNET = route("claude-sonnet-5-5", "xhigh")
+SONNET_BUILD = route("claude-sonnet-5-5", "high")
 SONNET_NITS = route("claude-sonnet-5-5", "medium")
 OPUS_TOUGH = route("claude-opus-5.5", "medium")
 OPUS_REVIEW = route("claude-opus-5.5", "high")
@@ -80,7 +83,7 @@ def decide(anthropic):
     if anthropic.get("open") is not True:
         return "hold-anthropic-closed", {kind: HOLD for kind in KINDS}
     return "owner-plan", {
-        "implementation": SONNET,
+        "implementation": SONNET_BUILD,
         "tough_implementation": OPUS_TOUGH,
         "guide_authoring": SONNET,
         "professor_review": OPUS_REVIEW,
