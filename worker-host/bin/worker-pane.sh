@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Open a herdr tab that shows a repo-worker run live (read-only).
-# Usage: worker-pane.sh <runId> <short-label>
+# Usage: [WORKER_HOST=<ssh alias>] worker-pane.sh <runId> <short-label>
 # The tab opens in the herdr workspace named after the run's repo (lane clones
 # map to their canonical repo), so each repo's space holds its shell and its
 # live runs. Unknown repos fall back to a "workers" workspace.
 # Prints "<tab_id> <pane_id>".
 # WORKER_HOST=<ssh alias> (e.g. air) watches a run on that host: the tab still
-# opens in this host's herdr, and the viewer runs there over ssh.
+# opens in this host's herdr, and the viewer runs there over ssh. The other host
+# needs the same checkout path, since the viewer path is this host's.
 set -euo pipefail
 run=$1
 label=${2:-${run:0:8}}
+[[ $run =~ ^[0-9A-Za-z-]+$ ]] || { echo "bad run id: $run" >&2; exit 2; }
 # readlink -f: the client path is a symlink into worker-host/bin, where the viewer sits.
 viewer=$(dirname "$(readlink -f "$0")")/watch-worker.py
 root=/home/hermes/Projects/hermes-os
@@ -19,7 +21,7 @@ repos="ashwren-legacy ashwren coding-agent-system coding-agent-vm-setup hearth h
 meta=/var/lib/agent-worker/.local/state/agent-workers/runs/$run/metadata.json
 host=${WORKER_HOST:-}
 if [ -n "$host" ]; then
-  repo_path=$(ssh -o BatchMode=yes "$host" "sudo -n cat $meta" 2>/dev/null \
+  repo_path=$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$host" "sudo -n cat $meta" 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("repo",""))' 2>/dev/null || true)
 else
   repo_path=$(sudo -n python3 -c '

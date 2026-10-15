@@ -35,7 +35,7 @@ for spec in "$@"; do
     echo "LAUNCHED $packet (attempt $attempt) -> ${id:-FAILED: $(echo "$out" | tail -1)}"
     [ -z "$id" ] && exit 1
     # Every run gets a watch pane, chained ones too (Hermes watches all runs).
-    "$BIN/worker-pane.sh" "$id" "${packet%.md}" || echo "PANE FAILED for $id"
+    env -u WORKER_HOST "$BIN/worker-pane.sh" "$id" "${packet%.md}" || echo "PANE FAILED for $id"
     res=$("$WAIT" "$id"); echo "$res"
     echo "$res" | grep -q "status=failed" || break
     sleep $((attempt * 90))
