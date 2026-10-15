@@ -4,6 +4,8 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- Validate CI runs on Linux only: the macOS leg is removed (owner decision
+  2026-10-14; no Mac runs this system).
 - `worker-pane.sh` can watch a run on another host: `WORKER_HOST=<ssh alias>`
   (e.g. `air`) reads that host's run metadata and runs the viewer there over
   ssh; the tab still opens in this host's herdr. red-acre gets its own
