@@ -137,3 +137,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/install.sh --apply`.
 - What happens: on a host with an older worker install, `--apply` reports no drift afterwards, but runs still fail: it does not install the trusted Hermes runtime release that `agent-hermes-worker` pins (`TRUSTED_HERMES_SOURCE`, runs end `runtime_unavailable`), and it does not enable `agent-worker-broker.socket` (repo-worker says "worker broker unavailable"). `--check` reports neither.
 - Found: bringing up the MacBook Air worker host, 2026-10-14.
+
+## chain-workers.sh starts a job in a folder another chain is about to use
+- Where: `worker-host/bin/chain-workers.sh`.
+- What happens: two chains waiting on the same run both launch when it ends. When that run fails, the first chain's retry is refused ("repository already has an active run") and the second chain's job starts on top of the failed run's uncommitted work. Seen in red-acre-integrate: K2 fix1 failed on a provider fault, the J3 fix2 chain started in its tree and committed the failed run's work for it.
+- Found: Red Acre work, 2026-10-15 (runs 6a3d8332, eeb5b8ec).
