@@ -138,7 +138,12 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - What happens: a copy that lost its exec bit reports no drift, but Foreman runs `worker-pane.sh` and `wait-for-workers.sh` directly, so they would fail with "Permission denied".
 - Found: review of dc9626f, 2026-10-14.
 
-## MacBook Air worker host is out of date
-- Where: macbook-air-4 (`ssh air`), `/usr/local/libexec/agent-worker-runner` and `agent-worker-broker`.
-- What happens: both binaries differ from the iMac's installed copies (sha256 416f0a62/80c75673 on the Air, 163b70ad/36db4f6f on the iMac), so runs launched there would use an old runner and broker. The Air cannot take worker runs until `worker-host/install.sh` is applied there.
-- Found: Foreman sha256 check over `ssh air`, 2026-10-14.
+## MacBook Air cannot run workers: Claude login expired
+- Where: macbook-air-4 (`ssh air`), `/var/lib/agent-worker/.claude/.credentials.json`.
+- What happens: worker runs there end `provider_failed` at once. The agent-worker Claude OAuth login expired on 2026-09-12 and cannot refresh ("OAuth session expired and could not be refreshed"). The worker host itself is now current: `install.sh --apply` ran from 6f6e927 (`--check` shows no drift), `agent-worker-broker.socket` is enabled, and Hermes runtime release 9caa2133 was copied from the iMac to `/opt/agent-worker-hermes/releases/`. Expired file kept as `.credentials.json.bak-expired-20261014`.
+- Found: Foreman smoke runs 449db9a4 and 5fd2c1c1 on the Air, 2026-10-14.
+
+## install.sh does not bring up a second host
+- Where: `worker-host/install.sh --apply`.
+- What happens: on a host with an older worker install, `--apply` reports no drift afterwards, but runs still fail: it does not install the trusted Hermes runtime release that `agent-hermes-worker` pins (`TRUSTED_HERMES_SOURCE`, runs end `runtime_unavailable`), and it does not enable `agent-worker-broker.socket` (repo-worker says "worker broker unavailable"). `--check` reports neither.
+- Found: bringing up the MacBook Air worker host, 2026-10-14.
