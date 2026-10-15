@@ -137,3 +137,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/install.sh`, `check_copies`.
 - What happens: a copy that lost its exec bit reports no drift, but Foreman runs `worker-pane.sh` and `wait-for-workers.sh` directly, so they would fail with "Permission denied".
 - Found: review of dc9626f, 2026-10-14.
+
+## MacBook Air worker host is out of date
+- Where: macbook-air-4 (`ssh air`), `/usr/local/libexec/agent-worker-runner` and `agent-worker-broker`.
+- What happens: both binaries differ from the iMac's installed copies (sha256 416f0a62/80c75673 on the Air, 163b70ad/36db4f6f on the iMac), so runs launched there would use an old runner and broker. The Air cannot take worker runs until `worker-host/install.sh` is applied there.
+- Found: Foreman sha256 check over `ssh air`, 2026-10-14.
