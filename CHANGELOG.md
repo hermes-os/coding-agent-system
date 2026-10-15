@@ -4,6 +4,10 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- `worker-pane.sh` can watch a run on another host: `WORKER_HOST=<ssh alias>`
+  (e.g. `air`) reads that host's run metadata and runs the viewer there over
+  ssh; the tab still opens in this host's herdr. red-acre gets its own
+  workspace.
 - Add constrained GitHub peer handoffs with local host identity, bounded queue
   discovery without stale-label starvation, recipient-wide signals,
   immutable transition binding, canonical host authorization, post-lease PR
