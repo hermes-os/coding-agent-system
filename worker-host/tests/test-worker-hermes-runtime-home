@@ -50,8 +50,8 @@ with tempfile.TemporaryDirectory() as scratch:
     refused(home, "a plugins/ directory")
     (home / "plugins").rmdir()
 
-    for name in (".env", ".op.env"):
-        (home / name).write_text("HERMES_DISABLE_LAZY_INSTALLS=0\n")
+    for name in (".env", ".op.env", ".container-mode"):
+        (home / name).write_text("HERMES_DISABLE_LAZY_INSTALLS=0\n" if name != ".container-mode" else "backend=/bin/true\n")
         refused(home, f"a {name} file")
         (home / name).unlink()
         os.symlink("/nonexistent-env", home / name)
@@ -65,4 +65,4 @@ with tempfile.TemporaryDirectory() as scratch:
         if environment.get("HERMES_DISABLE_LAZY_INSTALLS") != "1":
             raise SystemExit(f"{access} runs may lazy-install packages into the run home")
 
-print("run homes cannot carry dependency environments or plugins")
+print("run homes cannot carry dependency environments, plugins, env files or a container launcher")

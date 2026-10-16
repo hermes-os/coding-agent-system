@@ -342,13 +342,14 @@ def prepare_runtime_home(path, *, fresh, access):
                 "unsafe_runtime_home",
                 "runtime dependency environments are not allowed",
             )
-        # Hermes loads these with override=True after the adapter builds the child environment,
-        # so a planted one could undo HERMES_DISABLE_LAZY_INSTALLS or repoint HERMES_RUNTIME_DIR.
-        for name in (".env", ".op.env"):
+        # Hermes reads these from the run home before its guards: the env files are loaded with
+        # override=True after the adapter builds the child environment (a planted one could undo
+        # HERMES_DISABLE_LAZY_INSTALLS), and .container-mode makes the launcher execvp a named backend.
+        for name in (".env", ".op.env", ".container-mode"):
             if os.path.lexists(path / name):
                 raise BridgeError(
                     "unsafe_runtime_home",
-                    "runtime env files are not allowed",
+                    "runtime env and launcher files are not allowed",
                 )
         if config.is_symlink():
             raise BridgeError("unsafe_runtime_home", "runtime configuration cannot be a symlink")

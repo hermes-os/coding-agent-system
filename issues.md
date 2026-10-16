@@ -167,3 +167,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `TRUSTED_DIRECT_PROVIDERS` (`bedrock`, `aws`, `amazon-bedrock`) and `worker-host/build-hermes-release.sh` `EXTRAS`.
 - What happens: neither the 9caa2133 nor the e3d78e60 release has boto3 (the `bedrock` extra). With lazy installs off for workers, a Bedrock run fails at provider setup.
 - Found: read-only review of a3c5766, 2026-10-16.
+
+## Run home checks are a denylist
+- Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `prepare_runtime_home` (refuses `plugins`, `installs`, `.env`, `.op.env`, `.container-mode` by name).
+- What happens: Hermes reads many names from `HERMES_HOME` (the worker-owned run home). Three review rounds of a4d86ab each found one more name that reaches code or a guard (`installs`, `.env`, `.container-mode`). Any name a later Hermes adds is accepted. Not yet checked: the pm store `<run home>/tools` (`tools/facts.json`, read by `pm.installed_package` and `env_for`) and `lsp/bin` (LSP servers; skipped today because worker repos are not trusted workspaces).
+- Found: reviews of a4d86ab, a3c5766 and 09ad092, 2026-10-16.
