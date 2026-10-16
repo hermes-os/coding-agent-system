@@ -38,8 +38,9 @@ CALLER_HOME=/home/$CALLER
 REPO=$CALLER_HOME/Projects/hermes-os/coding-agent-system
 CAL=$CALLER_HOME/.hermes/profiles/cal
 LAUNCHER=$CAL/workspace/scripts/repo-worker
-RELEASE=9caa21336d278b614e99a58e302f48894ff0dbd7   # [E:SRC:libexec/agent-worker-hermes/host/bin/agent-hermes-worker TRUSTED_HERMES_SOURCE]
-PY_DIR=cpython-3.11.16-linux-x86_64-gnu         # [E:same file, TRUSTED_HERMES_INTERPRETER]
+RELEASE=e3d78e60dd7a632bf01b21ece2f377f5aabc9aeb   # [E:SRC:libexec/agent-worker-hermes/host/bin/agent-hermes-worker TRUSTED_HERMES_SOURCE]
+PY_DIR=cpython-3.14.7-linux-x86_64-gnu          # [E:same file, TRUSTED_HERMES_INTERPRETER]
+PY_MINOR=3.14
 MOUNT_UNIT='var-lib-agent\x2dworker-coding\x2dagent\x2dsystem.mount'
 # Worker commit identity; the iMac's worker .gitconfig and `git config --global`
 # both say user.name=Hermes [E:raw-imac-2 "gitconfig user"]. Pass both or the
@@ -243,8 +244,8 @@ step "5. /opt/agent-worker-hermes parents"
 ensure_dir /opt/agent-worker-hermes          root root 0755
 ensure_dir /opt/agent-worker-hermes/releases root root 0755
 ensure_dir /opt/agent-worker-hermes/python   root root 0755
-if [[ ! -x /opt/agent-worker-hermes/releases/$RELEASE/source/.venv/bin/hermes || ! -x /opt/agent-worker-hermes/python/$PY_DIR/bin/python3.11 ]]; then
-  todo "copy the trusted Hermes runtime (~850 MB) root-owned from the iMac, then prove 0 non-root files: sudo -n tar -C /opt/agent-worker-hermes -cf - python releases/$RELEASE | ssh sim 'sudo -n tar -C /opt/agent-worker-hermes --same-owner -xpf - && sudo -n find /opt/agent-worker-hermes ! -user root | wc -l'"
+if [[ ! -x /opt/agent-worker-hermes/releases/$RELEASE/source/.venv/bin/hermes || ! -x /opt/agent-worker-hermes/python/$PY_DIR/bin/python$PY_MINOR ]]; then
+  todo "copy the trusted Hermes runtime root-owned from the iMac, then prove 0 non-root files: sudo -n tar -C /opt/agent-worker-hermes -cf - python/$PY_DIR python/cpython-$PY_MINOR-linux-x86_64-gnu releases/$RELEASE | ssh <host> 'sudo -n tar -C /opt/agent-worker-hermes --same-owner -xpf - && sudo -n find /opt/agent-worker-hermes ! -user root | wc -l' (or build it there: worker-host/build-hermes-release.sh <hermes-agent checkout> $RELEASE)"
 fi
 
 # --------------------------------------------------------- 6. system files via install.sh

@@ -22,15 +22,20 @@ from urllib.parse import quote
 
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 TOOLSETS = "file,search,terminal,skills"
+# Built by worker-host/build-hermes-release.sh; keep in step with bootstrap.sh RELEASE and PY_DIR.
 TRUSTED_HERMES_SOURCE = Path(
-    "/opt/agent-worker-hermes/releases/9caa21336d278b614e99a58e302f48894ff0dbd7/source"
+    "/opt/agent-worker-hermes/releases/e3d78e60dd7a632bf01b21ece2f377f5aabc9aeb/source"
 )
 TRUSTED_HERMES_LAUNCHER = TRUSTED_HERMES_SOURCE / ".venv/bin/hermes"
 TRUSTED_HERMES_PYTHON = TRUSTED_HERMES_SOURCE / ".venv/bin/python"
+TRUSTED_HERMES_SITE_PACKAGES = TRUSTED_HERMES_SOURCE / ".venv/lib/python3.14/site-packages"
+# Hermes stopped versioning its package (pyproject version 0.0.0), so these names stay put.
+TRUSTED_HERMES_EDITABLE_PTH = TRUSTED_HERMES_SITE_PACKAGES / "__editable__.hermes_agent-0.0.0.pth"
+TRUSTED_HERMES_EDITABLE_FINDER = TRUSTED_HERMES_SITE_PACKAGES / "__editable___hermes_agent_0_0_0_finder.py"
 TRUSTED_HERMES_INTERPRETER = Path(
-    "/opt/agent-worker-hermes/python/cpython-3.11.16-linux-x86_64-gnu/bin/python3.11"
+    "/opt/agent-worker-hermes/python/cpython-3.14.7-linux-x86_64-gnu/bin/python3.14"
 )
-TRUSTED_PYTHON_ALIAS = Path("/opt/agent-worker-hermes/python/cpython-3.11-linux-x86_64-gnu")
+TRUSTED_PYTHON_ALIAS = Path("/opt/agent-worker-hermes/python/cpython-3.14-linux-x86_64-gnu")
 WORKER_CODEX_HOME = Path("/var/lib/agent-worker/.codex")
 WORKER_HERMES_HOME = Path("/var/lib/agent-worker/.hermes")
 TRUSTED_DIRECT_PROVIDERS = frozenset(
@@ -866,7 +871,7 @@ def resolve_hermes_runtime():
         TRUSTED_HERMES_SOURCE,
         TRUSTED_HERMES_SOURCE / ".venv",
         TRUSTED_HERMES_SOURCE / ".venv/bin",
-        TRUSTED_HERMES_SOURCE / ".venv/lib/python3.11/site-packages",
+        TRUSTED_HERMES_SITE_PACKAGES,
         TRUSTED_HERMES_SOURCE / "agent",
         TRUSTED_HERMES_SOURCE / "hermes_cli",
         TRUSTED_HERMES_SOURCE / "plugins/model-providers",
@@ -881,10 +886,8 @@ def resolve_hermes_runtime():
         TRUSTED_HERMES_LAUNCHER,
         TRUSTED_HERMES_INTERPRETER,
         TRUSTED_HERMES_SOURCE / ".venv/pyvenv.cfg",
-        TRUSTED_HERMES_SOURCE / ".venv/lib/python3.11/site-packages/_virtualenv.pth",
-        TRUSTED_HERMES_SOURCE / ".venv/lib/python3.11/site-packages/__editable__.hermes_agent-0.21.0.pth",
-        TRUSTED_HERMES_SOURCE
-        / ".venv/lib/python3.11/site-packages/__editable___hermes_agent_0_21_0_finder.py",
+        TRUSTED_HERMES_EDITABLE_PTH,
+        TRUSTED_HERMES_EDITABLE_FINDER,
     ):
         _verify_deployment_path(
             path,

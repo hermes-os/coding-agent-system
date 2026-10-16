@@ -4,6 +4,12 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- Workers run Hermes e3d78e60 (2026-10-10) on Python 3.14.7 instead of 9caa2133
+  (2026-09-14) on 3.11. It retries a broken Anthropic stream frame instead of
+  failing the run. `worker-host/build-hermes-release.sh <checkout> <commit>`
+  builds a release beside the live one; the adapter and `bootstrap.sh` name it.
+  The old release stays on disk for a rollback.
+
 - `worker-host/bootstrap.sh` sets up a fresh Arch host as a repo-worker host
   (agent-worker user, worker home, tmpfiles, /opt parents, install.sh --apply,
   mount and broker socket) and lists what is left by hand: runtime copy,
