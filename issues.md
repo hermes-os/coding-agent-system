@@ -102,7 +102,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: worker run status in `repo-worker --output` / `wait-for-workers.sh`.
 - What happens: a reviewer that put `VERDICT: APPROVE` before `OUTCOME: COMPLETED` finished with status `blocked`; a worker whose only problem was a refused chmod also reported `blocked`. The status does not tell a finished run from a stuck one.
 - Also: the run's final text is the last assistant message. When background-process completion notices arrive after the report, the worker answers them, and that short answer replaces the `OUTCOME: COMPLETED` report in `final.txt` and the stream's `final` event; the status becomes `blocked` and the real report is only in the run's `state.db`.
-- Found: kestrel runs c36f5db8 and 13223cfb, 2026-10-13; marquee run 026f8a9b, 2026-10-16.
+- Also: a model name with a dot (`claude-opus-5.5`) makes the runtime print `⚠️  Normalized model 'claude-opus-5.5' to 'claude-opus-5-5' for anthropic.` as the first line of `final.txt`, above `OUTCOME: COMPLETED`, so an approving review ends as `blocked`.
+- Found: kestrel runs c36f5db8 and 13223cfb, 2026-10-13; marquee runs 026f8a9b and 8f2a31e4, 2026-10-16.
 
 ## repo-worker launch sometimes prints no runId
 - Where: `repo-worker --agent hermes ... --task-file`.
