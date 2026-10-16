@@ -48,7 +48,7 @@ fi
 # absolute paths, so the build happens at the final path; nothing points at it until the adapter does.
 sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 755 "$D" "$D/source"
 # A failed build leaves a caller-owned tree the adapter refuses; say how to clear it for a re-run.
-trap 'printf "build-hermes-release: failed; move %s away (sudo -n mv) before running again\n" "$D" >&2' ERR
+trap 'rc=$?; ((rc == 0)) || printf "build-hermes-release: failed; move %s away (sudo -n mv) before running again\n" "$D" >&2' EXIT
 git -C "$CHECKOUT" archive "$REL" | tar -x -C "$D/source"
 extra_args=()
 for extra in $EXTRAS; do extra_args+=(--extra "$extra"); done

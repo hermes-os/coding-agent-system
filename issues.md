@@ -162,3 +162,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `run_child` (`if returncode != 0: return returncode, None, ...`) with Hermes e3d78e60 `hermes_cli/cli_single_query.py` `_single_query_exit_code`.
 - What happens: Hermes 9caa2133 exited 0 with the reply when a one-shot turn stopped partway (iteration cap, `completed: False`). e3d78e60 exits 1 for `partial` or `completed: False`, so the adapter reports `provider_failed` and drops the partial reply.
 - Found: read-only review of a4d86ab, 2026-10-16.
+
+## The worker adapter admits Bedrock but the release cannot run it
+- Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `TRUSTED_DIRECT_PROVIDERS` (`bedrock`, `aws`, `amazon-bedrock`) and `worker-host/build-hermes-release.sh` `EXTRAS`.
+- What happens: neither the 9caa2133 nor the e3d78e60 release has boto3 (the `bedrock` extra). With lazy installs off for workers, a Bedrock run fails at provider setup.
+- Found: read-only review of a3c5766, 2026-10-16.

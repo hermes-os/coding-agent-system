@@ -50,6 +50,14 @@ with tempfile.TemporaryDirectory() as scratch:
     refused(home, "a plugins/ directory")
     (home / "plugins").rmdir()
 
+    for name in (".env", ".op.env"):
+        (home / name).write_text("HERMES_DISABLE_LAZY_INSTALLS=0\n")
+        refused(home, f"a {name} file")
+        (home / name).unlink()
+        os.symlink("/nonexistent-env", home / name)
+        refused(home, f"a dangling {name} symlink")
+        (home / name).unlink()
+
     adapter.prepare_runtime_home(home, fresh=False, access="write")
 
     for access in ("read", "write"):

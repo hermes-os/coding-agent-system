@@ -342,6 +342,14 @@ def prepare_runtime_home(path, *, fresh, access):
                 "unsafe_runtime_home",
                 "runtime dependency environments are not allowed",
             )
+        # Hermes loads these with override=True after the adapter builds the child environment,
+        # so a planted one could undo HERMES_DISABLE_LAZY_INSTALLS or repoint HERMES_RUNTIME_DIR.
+        for name in (".env", ".op.env"):
+            if os.path.lexists(path / name):
+                raise BridgeError(
+                    "unsafe_runtime_home",
+                    "runtime env files are not allowed",
+                )
         if config.is_symlink():
             raise BridgeError("unsafe_runtime_home", "runtime configuration cannot be a symlink")
         if fresh:
