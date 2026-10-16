@@ -360,6 +360,9 @@ declare -A AUTH_HOW=(
   [.hermes/auth.json]="API-key rows: sudo -u $WU -H env HERMES_HOME=$WH/.hermes /opt/agent-worker-hermes/releases/$RELEASE/source/.venv/bin/hermes auth add anthropic --type api-key --label <l> (iMac pool: anthropic 2, openrouter 1, openai-codex 1)"
   [.kimi/config.toml]="Kimi sign-in or key as $WU (method not recorded on the iMac)"
 )
+# Without a system tirith the worker Hermes prints a scanner warning ahead of
+# its OUTCOME line, and the runner then marks every run blocked.
+[[ -x /usr/local/bin/tirith ]] || todo "/usr/local/bin/tirith missing: sudo -n $REPO/bin/tirith-install, or copy the iMac's root 0755 binary"
 for f in .claude/.credentials.json .codex/auth.json .hermes/auth.json .kimi/config.toml; do
   # The broker accepts the owner with no group/other bits [E:SRC:agent-worker-broker path_auth_ok].
   if [[ -s $WH/$f && "$(stat -c %U "$WH/$f")" == "$WU" ]] && (( (8#$(stat -c %a "$WH/$f") & 8#077) == 0 )); then :; else
