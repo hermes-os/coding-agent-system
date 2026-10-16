@@ -9,6 +9,9 @@ This file records user-visible changes to the portable coding-agent system.
   failing the run. `worker-host/build-hermes-release.sh <checkout> <commit>`
   builds a release beside the live one; the adapter and `bootstrap.sh` name it.
   The old release stays on disk for a rollback.
+  Worker runs set `HERMES_DISABLE_LAZY_INSTALLS=1`, and a run home with an
+  `installs/` entry is refused, so a worker cannot add packages that the next
+  run loads into Hermes.
 
 - `worker-host/bootstrap.sh` sets up a fresh Arch host as a repo-worker host
   (agent-worker user, worker home, tmpfiles, /opt parents, install.sh --apply,

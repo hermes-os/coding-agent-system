@@ -157,3 +157,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: the `committer` helper workers use for every commit.
 - What happens: during a merge it fails with "cannot do a partial commit during a merge", so a worker merging branches must fall back to plain `git commit`, against the commit rule in AGENTS.md.
 - Found: Red Acre N2 merge, 2026-10-16 (run 349d149a, merge fe54e5e).
+
+## A worker turn that stops partway now fails with no result
+- Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `run_child` (`if returncode != 0: return returncode, None, ...`) with Hermes e3d78e60 `hermes_cli/cli_single_query.py` `_single_query_exit_code`.
+- What happens: Hermes 9caa2133 exited 0 with the reply when a one-shot turn stopped partway (iteration cap, `completed: False`). e3d78e60 exits 1 for `partial` or `completed: False`, so the adapter reports `provider_failed` and drops the partial reply.
+- Found: read-only review of a4d86ab, 2026-10-16.

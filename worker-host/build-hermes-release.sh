@@ -18,7 +18,7 @@ die() { printf 'build-hermes-release: %s\n' "$*" >&2; exit 1; }
 CHECKOUT=$1
 REL=$(git -C "$CHECKOUT" rev-parse --verify "$2^{commit}") || die "unknown commit $2"
 PY=${PY:-3.14.7}
-EXTRAS=${EXTRAS:-anthropic doc-extract uvloop}
+EXTRAS=${EXTRAS:-anthropic doc-extract uvloop vertex}
 MINOR=${PY%.*}
 ROOT=/opt/agent-worker-hermes
 PYDIR=$ROOT/python/cpython-$PY-linux-x86_64-gnu
@@ -33,7 +33,8 @@ if [[ ! -x $PYDIR/bin/python$MINOR ]]; then
   src=$("$UV" python find --managed-python --no-config "$PY") || die "uv has no managed CPython $PY (uv python install $PY)"
   src=$(dirname "$(dirname "$(readlink -f "$src")")")
   [[ $(basename "$src") == cpython-$PY-linux-x86_64-gnu ]] || die "unexpected interpreter dir $src"
-  sudo -n cp -a --no-preserve=ownership "$src" "$PYDIR.partial"
+  [[ -e $PYDIR.partial ]] && die "$PYDIR.partial is left from a failed copy; move it away (sudo -n mv) and run again"
+  sudo -n cp -aT --no-preserve=ownership "$src" "$PYDIR.partial"
   sudo -n chown -R root:root "$PYDIR.partial"
   sudo -n chmod -R go-w,go+rX "$PYDIR.partial"
   sudo -n mv -T "$PYDIR.partial" "$PYDIR"
@@ -46,6 +47,8 @@ fi
 # Built as the caller (uv uses the caller's cache), then handed to root. Editable installs record
 # absolute paths, so the build happens at the final path; nothing points at it until the adapter does.
 sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 755 "$D" "$D/source"
+# A failed build leaves a caller-owned tree the adapter refuses; say how to clear it for a re-run.
+trap 'printf "build-hermes-release: failed; move %s away (sudo -n mv) before running again\n" "$D" >&2' ERR
 git -C "$CHECKOUT" archive "$REL" | tar -x -C "$D/source"
 extra_args=()
 for extra in $EXTRAS; do extra_args+=(--extra "$extra"); done

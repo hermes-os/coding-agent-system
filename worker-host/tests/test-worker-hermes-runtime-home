@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Verify a Hermes run home cannot carry code into the trusted runtime.
+
+Hermes's pm activates a dependency environment named under HERMES_HOME/installs at boot, and
+lazy installs would write one there; plugins/ loads provider code the same way.
+"""
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+import os
+import sys
+import tempfile
+
+
+WORKER_HOST = Path(__file__).resolve().parents[1]
+ADAPTER = WORKER_HOST / "libexec" / "agent-worker-hermes" / "host" / "bin" / "agent-hermes-worker"
+
+loader = SourceFileLoader("agent_hermes_worker_home_test", str(ADAPTER))
+spec = spec_from_loader(loader.name, loader)
+adapter = module_from_spec(spec)
+sys.modules[loader.name] = adapter
+loader.exec_module(adapter)
+
+
+def refused(home, reason):
+    try:
+        adapter.prepare_runtime_home(home, fresh=False, access="write")
+    except adapter.BridgeError as exc:
+        if exc.code != "unsafe_runtime_home":
+            raise SystemExit(f"{reason}: refused with {exc.code}, not unsafe_runtime_home")
+        return
+    raise SystemExit(f"{reason}: the resume home was accepted")
+
+
+with tempfile.TemporaryDirectory() as scratch:
+    home = Path(scratch) / "run-home"
+    adapter.prepare_runtime_home(home, fresh=True, access="write")
+    adapter.prepare_runtime_home(home, fresh=False, access="write")
+
+    (home / "installs").mkdir()
+    refused(home, "an installs/ directory")
+    (home / "installs").rmdir()
+
+    os.symlink("/nonexistent-installs", home / "installs")
+    refused(home, "a dangling installs symlink")
+    (home / "installs").unlink()
+
+    (home / "plugins").mkdir()
+    refused(home, "a plugins/ directory")
+    (home / "plugins").rmdir()
+
+    adapter.prepare_runtime_home(home, fresh=False, access="write")
+
+    for access in ("read", "write"):
+        environment = adapter.build_environment(home, access)
+        if environment.get("HERMES_DISABLE_LAZY_INSTALLS") != "1":
+            raise SystemExit(f"{access} runs may lazy-install packages into the run home")
+
+print("run homes cannot carry dependency environments or plugins")

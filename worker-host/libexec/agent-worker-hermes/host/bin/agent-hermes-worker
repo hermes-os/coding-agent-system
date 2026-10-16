@@ -335,6 +335,13 @@ def prepare_runtime_home(path, *, fresh, access):
                 "unsafe_runtime_home",
                 "runtime provider plugins are not allowed",
             )
+        # Hermes's pm activates the dependency environment named under HERMES_HOME/installs at
+        # boot (site.addsitedir), so a worker-planted one would run inside the trusted runtime.
+        if os.path.lexists(path / "installs"):
+            raise BridgeError(
+                "unsafe_runtime_home",
+                "runtime dependency environments are not allowed",
+            )
         if config.is_symlink():
             raise BridgeError("unsafe_runtime_home", "runtime configuration cannot be a symlink")
         if fresh:
@@ -947,6 +954,8 @@ def build_environment(runtime_home, access):
     environment["AGENT_WORKER_MANAGED"] = "1"
     environment["AGENT_ACCESS_MODE"] = access
     environment["CODEX_HOME"] = str(WORKER_CODEX_HOME)
+    # The release is the whole dependency set; pm must never fetch packages into the run home.
+    environment["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
     if access == "write":
         environment["HERMES_YOLO_MODE"] = "1"
     return environment

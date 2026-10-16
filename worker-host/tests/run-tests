@@ -23,6 +23,7 @@ user_tests=(
   test-repo-worker-symlink-client
   test-worker-broker-session-id
   test-worker-hermes-resume-runtime
+  test-worker-hermes-runtime-home
   test-worker-provider-fallback
   test-worker-explicit-routing
   test-worker-codex-auth-sync
