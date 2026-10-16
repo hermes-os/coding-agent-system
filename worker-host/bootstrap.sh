@@ -52,6 +52,7 @@ note() { printf '  - %s\n' "$*"; }
 todo() { left+=("$*"); }
 # Print what is left even when a step aborts under set -e.
 print_left() {
+  ((${#left[@]})) || return 0
   printf '\n== left by hand\n'
   local item
   for item in "${left[@]}"; do note "$item"; done
@@ -274,7 +275,10 @@ else
   set +e
   check_out=$(sudo -u "$CALLER" -H bash "$REPO/worker-host/install.sh" --check 2>&1)
   set -e
-  if grep -qE '^DRIFT missing +/(usr|etc)/' <<<"$check_out"; then
+  printf '%s\n' "$check_out"
+  # Fresh host = the broker was never installed. A file added to install.sh
+  # later shows as missing on set-up hosts too; that is drift, not fresh.
+  if [[ ! -e /usr/local/libexec/agent-worker-broker ]]; then
     if ((DRY)); then
       echo "would run: install.sh --apply (fresh host: system files missing)"
     else
