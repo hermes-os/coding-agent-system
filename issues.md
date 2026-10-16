@@ -152,3 +152,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `/var/lib/agent-worker/.config/git/config` on every worker host (`.config` is agent-worker 0700, in the broker's `ReadWritePaths`, and the broker sets `XDG_CONFIG_HOME` to it).
 - What happens: git reads that file after the root-owned `/var/lib/agent-worker/.gitconfig`, so a worker can change its commit identity and `safe.directory` entries.
 - Found: review of `worker-host/bootstrap.sh`, 2026-10-15.
+
+## The worker Hermes runtime aborts a run on a broken stream frame
+- Where: the pinned worker runtime `/opt/agent-worker-hermes/releases/9caa21336d278b614e99a58e302f48894ff0dbd7` (`worker-host/bootstrap.sh:41` `RELEASE`), `agent/turn_recovery.py`.
+- What happens: when the Anthropic stream sends a corrupt frame, the SDK's jiter parser raises `ValueError: expected value at line 1 column 11`. The pinned runtime counts it as a non-retryable client error and the run fails. Hermes commit 144e9711b8 (2026-09-24, #65147, `agent/api_error_summary.py` `PROVIDER_STREAM_PARSE_MARKERS`) treats these as transient and retries; the pinned runtime is from 2026-09-14 and lacks it.
+- Found: marquee reviews e55a9910 and eec1e79a (claude-opus-5-5) both failed this way on 2026-10-16, after 10 and 14 API calls.
