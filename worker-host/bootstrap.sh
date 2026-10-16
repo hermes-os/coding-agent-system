@@ -280,7 +280,7 @@ else
   # later shows as missing on set-up hosts too; that is drift, not fresh.
   if [[ ! -e /usr/local/libexec/agent-worker-broker ]]; then
     if ((DRY)); then
-      echo "would run: install.sh --apply (fresh host: system files missing)"
+      echo "would run: install.sh --apply (fresh host: broker not installed)"
     else
       set +e
       sudo -u "$CALLER" -H bash "$REPO/worker-host/install.sh" --apply
