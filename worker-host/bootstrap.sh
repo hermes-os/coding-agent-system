@@ -3,7 +3,10 @@
 # parents, install.sh --apply, units) on a fresh Arch/Omarchy host. Mapped from
 # the iMac and the Air, which were set up by hand.
 #
-#   sudo bash worker-host/bootstrap.sh [--dry-run]
+#   sudo WORKER_GIT_NAME=<name> WORKER_GIT_EMAIL=<email> [ENABLE_CODEX_SYNC=1] \
+#     bash worker-host/bootstrap.sh [--dry-run]
+#
+# Variables go after `sudo`: its env_reset drops any set before it.
 #
 # Idempotent: every step checks first and changes only what differs, so it can
 # be rerun after each manual step (clone, runtime copy, logins). Phases that
@@ -47,6 +50,13 @@ WORKER_GIT_EMAIL=${WORKER_GIT_EMAIL:-}
 left=()
 note() { printf '  - %s\n' "$*"; }
 todo() { left+=("$*"); }
+# Print what is left even when a step aborts under set -e.
+print_left() {
+  printf '\n== left by hand\n'
+  local item
+  for item in "${left[@]}"; do note "$item"; done
+}
+trap print_left EXIT
 run() {
   if ((DRY)); then printf 'would run: %s\n' "$*"; else "$@"; fi
 }
@@ -88,7 +98,9 @@ ensure_file() {
 
 # ---------------------------------------------------------------- preflight
 step "0. preflight"
-if ((!DRY)) && [[ $EUID -ne 0 ]]; then echo "run with sudo" >&2; exit 1; fi
+# Root in both modes: a non-root dry run cannot see inside .broker and
+# reports false actions.
+if [[ $EUID -ne 0 ]]; then echo "run with sudo" >&2; exit 1; fi
 [[ -d /run/systemd/system ]] || { echo "systemd is not PID 1" >&2; exit 1; }
 getent passwd "$CALLER" >/dev/null || { echo "no user $CALLER" >&2; exit 1; }
 getent group "$CALLER" >/dev/null || { echo "no group $CALLER (broker socket group)" >&2; exit 1; }
@@ -129,6 +141,9 @@ if ! getent passwd "$WU" >/dev/null; then
   run useradd --system --gid "$WU" --home-dir "$WH" --no-create-home \
     --shell /usr/sbin/nologin --comment "" "$WU"
   echo "created user $WU"
+elif [[ "$(getent passwd "$WU" | cut -d: -f6,7)" != "$WH:/usr/sbin/nologin" ]]; then
+  echo "refusing: existing $WU has home/shell $(getent passwd "$WU" | cut -d: -f6,7), want $WH:/usr/sbin/nologin" >&2
+  exit 1
 fi
 if ((!DRY)); then
   [[ "$(passwd -S "$WU" | awk '{print $2}')" == L ]] || { passwd -l "$WU" >/dev/null; echo "locked $WU password"; }
@@ -203,8 +218,9 @@ if ((!DRY)); then
   fi
   chown root:root "$GC"; chmod 0644 "$GC"
 fi
-if [[ -z "$(git config --file "$GC" user.name 2>/dev/null || true)" ]] && [[ -z $WORKER_GIT_NAME ]]; then
-  todo "worker git identity: rerun with WORKER_GIT_NAME=... WORKER_GIT_EMAIL=... (the iMac's global values), or worker commits come out as agent-worker@localhost"
+if [[ -z "$(git config --file "$GC" user.name 2>/dev/null || true)" || -z "$(git config --file "$GC" user.email 2>/dev/null || true)" ]] \
+   && [[ -z $WORKER_GIT_NAME || -z $WORKER_GIT_EMAIL ]]; then
+  todo "worker git identity: rerun as sudo WORKER_GIT_NAME=... WORKER_GIT_EMAIL=... bash worker-host/bootstrap.sh (both, the iMac's global values), or worker commits come out as agent-worker@localhost"
 fi
 
 # --------------------------------------------------------- 4. runtime dirs (tmpfiles)
@@ -242,25 +258,38 @@ else
   # JSON list; with no launcher it counts runs as "unknown" and refuses
   # [E:SRC:install.sh active_runs/require_idle]. Pre-make the exact link it
   # wants, so it is not drift [E:SRC:install.sh CLIENT_LINKS first entry].
+  if [[ -e $LAUNCHER && ! -L $LAUNCHER ]]; then
+    echo "refusing: $LAUNCHER exists and is not a link" >&2; exit 1
+  fi
   if [[ ! -L $LAUNCHER ]]; then
+    run sudo -u "$CALLER" -H install -d -m 0700 "$CAL"
     run sudo -u "$CALLER" -H mkdir -p "$(dirname "$LAUNCHER")"
     run sudo -u "$CALLER" -H ln -s "$REPO/worker-host/libexec/agent-worker-runner" "$LAUNCHER"
   fi
   # install.sh writes client paths as the caller and system paths through
   # `sudo -n`; run it as root and the client copies end up root-owned.
   # It needs the caller's NOPASSWD sudo (sim: /etc/sudoers.d/99-omarchy-nopasswd-hermes [E:raw-sim]).
-  if ((DRY)); then
-    sudo -u "$CALLER" -H bash "$REPO/worker-host/install.sh" --check || true
-  else
-    set +e
-    sudo -u "$CALLER" -H bash "$REPO/worker-host/install.sh" --apply
-    rc=$?
-    set -e
-    case $rc in
-      0) ;;
-      3) todo "install.sh left a systemd step pending; run its printed command, then install.sh --check" ;;
-      *) echo "install.sh --apply failed ($rc)" >&2; exit "$rc" ;;
-    esac
+  # --apply only on a fresh host (an installed system file is missing). On a
+  # host already set up, drift is a deploy decision: list it, never apply it.
+  set +e
+  check_out=$(sudo -u "$CALLER" -H bash "$REPO/worker-host/install.sh" --check 2>&1)
+  set -e
+  if grep -qE '^DRIFT missing +/(usr|etc)/' <<<"$check_out"; then
+    if ((DRY)); then
+      echo "would run: install.sh --apply (fresh host: system files missing)"
+    else
+      set +e
+      sudo -u "$CALLER" -H bash "$REPO/worker-host/install.sh" --apply
+      rc=$?
+      set -e
+      case $rc in
+        0) ;;
+        3) todo "install.sh left a systemd step pending; run its printed command, then install.sh --check" ;;
+        *) todo "install.sh --apply refused or failed ($rc): read its output above, fix, rerun this script" ;;
+      esac
+    fi
+  elif grep -q '^DRIFT' <<<"$check_out"; then
+    todo "install.sh --check reports drift on an installed host; run install.sh --apply yourself when no run is active"
   fi
 
   # ------------------------------------------------------- 7. units
@@ -274,7 +303,7 @@ else
   run systemctl enable --now agent-worker-broker.socket
   if [[ ${ENABLE_CODEX_SYNC:-0} == 1 ]]; then
     run systemctl enable --now agent-worker-codex-auth-sync.timer
-  else
+  elif ! systemctl is-enabled -q agent-worker-codex-auth-sync.timer 2>/dev/null; then
     todo "decide on agent-worker-codex-auth-sync.timer (iMac on, Air off). It shares $CALLER's openai-codex grant from $CALLER_HOME/.hermes/auth.json into the worker stores; enable with ENABLE_CODEX_SYNC=1 only after $CALLER on sim has that login."
   fi
   if ((!DRY)) && ! findmnt -n "$WH/coding-agent-system" >/dev/null; then
@@ -287,9 +316,20 @@ else
   # installer was run with HOME=$WH, system root = the bind mount, coordination
   # repo $WH/.state/coordination; the files it wrote are root-owned
   # [E:raw-imac-2 ".agents/.kimi/.cursor"; configure-hosts.py main()]. It
-  # exits unless the coordination repo is a git checkout.
-  if sudo -u "$WU" -H git -C "$WH/.state/coordination" rev-parse --show-toplevel >/dev/null 2>&1; then
-    run env HOME="$WH" bash "$WH/coding-agent-system/install.sh" --coordination-repo "$WH/.state/coordination"
+  # exits unless the coordination repo is a git checkout. Run it once only
+  # (no managed-install.json yet): it writes as root and keeps old modes, so a
+  # rerun would turn the worker's own config files root-owned. Root's git needs
+  # an env-scope safe.directory for the agent-worker-owned clone, and
+  # GIT_CONFIG_GLOBAL keeps it off the worker-writable $WH/.config/git/config.
+  if [[ -f $WH/.agents/managed-install.json ]]; then
+    note "agent homes already installed (managed-install.json present); skipped"
+  elif sudo -u "$WU" -H git -C "$WH/.state/coordination" rev-parse --show-toplevel >/dev/null 2>&1; then
+    run env HOME="$WH" GIT_CONFIG_GLOBAL="$WH/.gitconfig" GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$WH/.state/coordination" \
+      bash "$WH/coding-agent-system/install.sh" --coordination-repo "$WH/.state/coordination"
+    for f in "$WH/.codex/config.toml" "$WH/.kimi/config.toml"; do
+      [[ -f $f ]] && { run chown "$WU:$WU" "$f"; run chmod 0600 "$f"; }
+    done
   else
     todo "coordination repo: as $WU make an ed25519 key $WH/.ssh/coordination_ed25519, an .ssh/config for git.imhermes.dev (User git, that IdentityFile), register the public key on Forgejo, then clone git@git.imhermes.dev:hermes/coding-agent-system.git to $WH/.state/coordination as $WU and rerun this script (it then runs the canonical installer for $WH)"
   fi
@@ -317,12 +357,12 @@ declare -A AUTH_HOW=(
   [.kimi/config.toml]="Kimi sign-in or key as $WU (method not recorded on the iMac)"
 )
 for f in .claude/.credentials.json .codex/auth.json .hermes/auth.json .kimi/config.toml; do
-  if [[ -s $WH/$f && "$(stat -c '%U %a' "$WH/$f")" == "$WU 600" ]]; then :; else
-    todo "$WH/$f absent or not $WU 0600: ${AUTH_HOW[$f]}"
+  # The broker accepts the owner with no group/other bits [E:SRC:agent-worker-broker path_auth_ok].
+  if [[ -s $WH/$f && "$(stat -c %U "$WH/$f")" == "$WU" ]] && (( (8#$(stat -c %a "$WH/$f") & 8#077) == 0 )); then :; else
+    todo "$WH/$f absent, not owned by $WU, or readable by others: ${AUTH_HOW[$f]}"
   fi
 done
 
-printf '\n== left by hand\n'
 # Packets live here, 0644, launched by full path [E:raw-imac-3 "acl home paths"; repo-worker skill].
 [[ -d $CALLER_HOME/Projects/cal-task-packets ]] || run sudo -u "$CALLER" -H install -d -m 0755 "$CALLER_HOME/Projects/cal-task-packets"
 clones_missing=()
@@ -331,4 +371,3 @@ for r in ashwren ashwren-legacy hearth inkwell kestrel marquee marvin-legal-mana
 done
 ((${#clones_missing[@]} == 0)) || todo "portfolio clones under $CALLER_HOME/Projects/hermes-os as $CALLER, fresh from the forge (never synced from another host): ${clones_missing[*]}; set user.name/user.email in each. The broker sets the agent-worker ACLs on a repo at its first launch."
 todo "verify: ~/.hermes/profiles/cal/workspace/scripts/repo-worker --self-test must print ok:true, then a read-only 3-line smoke run reaching completed with modelSource=request"
-for item in "${left[@]}"; do note "$item"; done
