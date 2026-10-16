@@ -4,6 +4,10 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- `worker-host/bootstrap.sh` sets up a fresh Arch host as a repo-worker host
+  (agent-worker user, worker home, tmpfiles, /opt parents, install.sh --apply,
+  mount and broker socket) and lists what is left by hand: runtime copy,
+  provider binaries, logins, clones. Run `--dry-run` first.
 - Validate CI runs on Linux only: the macOS leg is removed (owner decision
   2026-10-14; no Mac runs this system).
 - `worker-pane.sh` can watch a run on another host: `WORKER_HOST=<ssh alias>`

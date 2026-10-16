@@ -142,3 +142,8 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/bin/chain-workers.sh`.
 - What happens: two chains waiting on the same run both launch when it ends. When that run fails, the first chain's retry is refused ("repository already has an active run") and the second chain's job starts on top of the failed run's uncommitted work. Seen in red-acre-integrate: K2 fix1 failed on a provider fault, the J3 fix2 chain started in its tree and committed the failed run's work for it.
 - Found: Red Acre work, 2026-10-15 (runs 6a3d8332, eeb5b8ec).
+
+## install.sh --apply refuses on a fresh host
+- Where: `worker-host/install.sh` (active-run idle check).
+- What happens: with no `repo-worker` launcher yet, it cannot list active runs, counts them as unknown and refuses, so it cannot do a first install. `worker-host/bootstrap.sh` works around it by linking the launcher first.
+- Found: read-only mapping of the iMac and Air worker hosts for sim, 2026-10-15.
