@@ -180,3 +180,9 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 Where: the agent-worker sandbox (repo-worker --agent hermes, write access).
 What happens: `agent-trash` fails because `~/.local/share/Trash` is read-only in the sandbox, so workers fall back to `mv` into scratch to remove a stray file (red-acre, run 50bd92ce, a `studio/__pycache__`).
 How found: worker report, 2026-10-20.
+
+## A worker's full report is lost when a late process notice arrives after it
+
+Where: repo-worker runs on the hermes agent (final.txt and stream.log keep only the last assistant message).
+What happens: the worker writes its report, then a late background-process notice makes it answer once more; that short answer replaces the report, so the findings with file:line and fixes are gone (red-acre review run 7dbcac7d, 2026-10-21; earlier runs show the same "late completions" reply).
+How found: Foreman read `repo-worker --output`, final.txt and stream.log; only the summary was left.
