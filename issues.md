@@ -91,7 +91,7 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 ## agent-trash fails inside the worker sandbox
 - Where: worker sandbox (`repo-worker --access write`), `~/.local/share/Trash` of the worker user.
 - What happens: the trash directory sits on a read-only mount, so `agent-trash` fails; a worker had to set `XDG_DATA_HOME=/var/lib/agent-worker/.cache/xdg-data` to remove files.
-- Found: tape-machine worker f579fb5c, 2026-10-12; also tape-machine worker cf27cd80, 2026-10-14 (workers leave scratch copies in /tmp).
+- Found: tape-machine worker f579fb5c, 2026-10-12; also tape-machine worker cf27cd80, 2026-10-14 (workers leave scratch copies in /tmp); red-acre run 50bd92ce, 2026-10-20 (fell back to `mv` into scratch); imhermes-dev run 3b3d4106, 2026-10-21.
 
 ## File-mutation verifier warns about a file that a later edit changed
 - Where: Hermes harness file-mutation verifier, at the end of a worker's report.
@@ -174,12 +174,6 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `prepare_runtime_home` (refuses `plugins`, `installs`, `.env`, `.op.env`, `.container-mode` by name).
 - What happens: Hermes reads many names from `HERMES_HOME` (the worker-owned run home). Three review rounds of a4d86ab each found one more name that reaches code or a guard (`installs`, `.env`, `.container-mode`). Any name a later Hermes adds is accepted. Not yet checked: the pm store `<run home>/tools` (`tools/facts.json`, read by `pm.installed_package` and `env_for`) and `lsp/bin` (LSP servers; skipped today because worker repos are not trusted workspaces).
 - Found: reviews of a4d86ab, a3c5766 and 09ad092, 2026-10-16.
-
-## agent-trash fails inside worker sandboxes
-
-Where: the agent-worker sandbox (repo-worker --agent hermes, write access).
-What happens: `agent-trash` fails because `~/.local/share/Trash` is read-only in the sandbox, so workers fall back to `mv` into scratch to remove a stray file (red-acre, run 50bd92ce, a `studio/__pycache__`).
-How found: worker report, 2026-10-20.
 
 ## A worker's full report is lost when a late process notice arrives after it
 
