@@ -174,3 +174,9 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 - Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `prepare_runtime_home` (refuses `plugins`, `installs`, `.env`, `.op.env`, `.container-mode` by name).
 - What happens: Hermes reads many names from `HERMES_HOME` (the worker-owned run home). Three review rounds of a4d86ab each found one more name that reaches code or a guard (`installs`, `.env`, `.container-mode`). Any name a later Hermes adds is accepted. Not yet checked: the pm store `<run home>/tools` (`tools/facts.json`, read by `pm.installed_package` and `env_for`) and `lsp/bin` (LSP servers; skipped today because worker repos are not trusted workspaces).
 - Found: reviews of a4d86ab, a3c5766 and 09ad092, 2026-10-16.
+
+## agent-trash fails inside worker sandboxes
+
+Where: the agent-worker sandbox (repo-worker --agent hermes, write access).
+What happens: `agent-trash` fails because `~/.local/share/Trash` is read-only in the sandbox, so workers fall back to `mv` into scratch to remove a stray file (red-acre, run 50bd92ce, a `studio/__pycache__`).
+How found: worker report, 2026-10-20.
