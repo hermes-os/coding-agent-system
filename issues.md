@@ -180,3 +180,9 @@ The coordinator's tooling log: known problems with the agent tools and the worke
 Where: repo-worker runs on the hermes agent (final.txt and stream.log keep only the last assistant message).
 What happens: the worker writes its report, then a late background-process notice makes it answer once more; that short answer replaces the report, so the findings with file:line and fixes are gone (red-acre review run 7dbcac7d, 2026-10-21; earlier runs show the same "late completions" reply).
 How found: Foreman read `repo-worker --output`, final.txt and stream.log; only the summary was left.
+
+## A broken stream chunk ends a worker run as a non-retryable error
+
+Where: worker Hermes runtime 9caa2133 on sim (`agent/chat_completion_helpers.py` `_call_anthropic`, anthropic SDK `accumulate_event` partial JSON of a tool input).
+What happens: a streamed tool-call input that is not valid JSON raises `ValueError: expected value at line 1 column 11`. The loop retries once, then calls it a "Non-retryable client error" and the run ends `failed` with no report ("Hermes provider exited with a failure status").
+How found: marquee review run ffb6fab1 (claude-opus-5-5, 2026-10-22), `logs/agent.log` in its run home; a fresh run of the same packet was started.
