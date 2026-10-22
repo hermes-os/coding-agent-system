@@ -4,6 +4,10 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- A worker run rides out an internet drop of up to about 15 minutes: worker
+  configs set `agent.api_max_retries: 12` (5 s doubling backoff, capped at
+  120 s) instead of the default 3, which ended every running worker within
+  seconds of a drop. Takes effect on a host at its next `install.sh --apply`.
 - Workers run Hermes e3d78e60 (2026-10-10) on Python 3.14.7 instead of 9caa2133
   (2026-09-14) on 3.11. It retries a broken Anthropic stream frame instead of
   failing the run. `worker-host/build-hermes-release.sh <checkout> <commit>`

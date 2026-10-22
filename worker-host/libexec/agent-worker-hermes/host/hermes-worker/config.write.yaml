@@ -12,6 +12,9 @@ toolsets:
   - skills
 agent:
   reasoning_effort: medium
+  # Worker hosts lose their internet for 1 to 15 minutes now and then; 12 retries with
+  # the 5 s doubling backoff (capped at 120 s) wait about 15 minutes before a run ends.
+  api_max_retries: 12
 memory:
   memory_enabled: false
   user_profile_enabled: false
