@@ -187,3 +187,15 @@ Where: worker Hermes runtime 9caa2133 on sim (`agent/chat_completion_helpers.py`
 What happens: a streamed tool-call input that is not valid JSON raises `ValueError: expected value at line 1 column 11`. The loop retries once, then calls it a "Non-retryable client error" and the run ends `failed` with no report ("Hermes provider exited with a failure status").
 How found: marquee review run ffb6fab1 (claude-opus-5-5, 2026-10-22), `logs/agent.log` in its run home; a fresh run of the same packet was started.
 Still happens on runtime e3d78e60: marquee review run 08ddb7b8 (claude-opus-5-5, 2026-10-22 18:17), same error after 55 API calls, "Streaming failed before delivery" then "Non-retryable client error". Again in run a47ff056 (18:33, after a 429). In e3d78e60 the text "expected value at line" is a listed stream-parse marker (`agent/api_error_summary.py:19`, used by `turn_api_error.py:_is_local_validation_error`), yet the run still ends at `agent/turn_recovery.py:1106`, so the error reaches that path through a classification that does not check the marker.
+
+## Workers cannot reach the GPU, so GPU frame timing runs only on the host
+
+Where: the worker sandbox on the iMac (agent-worker-runner unit; no `/dev/dri` inside).
+What happens: a worker's headless Chromium falls back to llvmpipe or SwiftShader, and a headless sway with `WLR_RENDERER=gles2` fails with "Failed to open '/dev/dri/renderD128'". Every speed number a worker records is CPU only, and Foreman reruns the scripts on the host for the GPU numbers.
+How found: Red Acre engine test run 758c362c (2026-10-24), its README notes and `native-sway-gles2.log`.
+
+## The worker cargo proxy pins CARGO_HOME to the worker home
+
+Where: `worker-host/bootstrap.sh`, the Rust proxy in the worker `.local/bin`.
+What happens: the proxy exports `CARGO_HOME=/var/lib/agent-worker/.cache/cargo`, which overrides a packet's `CARGO_HOME=/tmp/...`. Where that folder is read-only, the worker calls `/usr/bin/cargo` directly to get past it.
+How found: Red Acre engine test run 758c362c (2026-10-24), its report.
