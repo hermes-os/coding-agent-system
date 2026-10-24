@@ -203,5 +203,5 @@ How found: Red Acre engine test run 758c362c (2026-10-24), its report.
 ## Read-only reviewers get no Rust toolchain on the PATH
 
 Where: the worker sandbox for `--access read` runs on the iMac.
-What happens: a reviewer found no Rust toolchain and installed its own in `/tmp/rv-rustup` to run `cargo test`. With that toolchain absent, a mise `cargo-clippy` wrapper on the PATH ran a different toolchain without the wasm32 std, so wasm32 clippy failed with "can't find crate for std". Write-mode workers on the same host build fine.
-How found: Red Acre engine base review 29fbdb20 (2026-10-24), its report.
+What happens: a reviewer found no Rust toolchain and installed its own in `/tmp/rv-rustup` to run `cargo test`. With that toolchain absent, a mise `cargo-clippy` wrapper on the PATH ran a different toolchain without the wasm32 std, so wasm32 clippy failed with "can't find crate for std". Write-mode workers hit the same root: plain `/usr/bin/cargo` fails unless `RUSTUP_HOME=/var/lib/agent-worker/.state/rustup` is set, and with it the toolchain has the wasm32 target. The sandbox does not export that RUSTUP_HOME.
+How found: Red Acre engine base review 29fbdb20 and fix worker beff40cb (2026-10-24), their reports.
