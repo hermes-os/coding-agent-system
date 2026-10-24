@@ -202,6 +202,9 @@ if [[ ! -L $WH/.state/rustup/toolchains/worker-stable ]]; then
   run ln -s "$TC" "$WH/.state/rustup/toolchains/worker-stable"
   run chown -h "$WU:$WU" "$WH/.state/rustup/toolchains/worker-stable"
 fi
+# Red Acre's Rust rebuild ships a browser demo, so workers build wasm and run wasm-opt.
+[[ -d $TC/lib/rustlib/wasm32-unknown-unknown ]] || todo "add the wasm target to the worker toolchain: rustup target add wasm32-unknown-unknown (as hermes), then sudo cp -r ~hermes/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/wasm32-unknown-unknown $TC/lib/rustlib/ and chown -R root:root it (same rustc version on both sides)"
+command -v wasm-opt >/dev/null || todo "install binaryen (wasm-opt): sudo pacman -S --needed binaryen"
 [[ -x $TC/bin/rustc ]] || todo "copy the worker Rust toolchain root-owned from the iMac: sudo -n tar -C $WH/toolchains -cf - stable-x86_64-unknown-linux-gnu | ssh sim 'sudo -n tar -C $WH/toolchains --same-owner -xpf -' (iMac has Rust 1.98.0 there; android/ (iMac only, not on the Air) is optional)"
 
 # --------------------------------------------------------- 3. worker git identity
