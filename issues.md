@@ -205,3 +205,9 @@ How found: Red Acre engine test run 758c362c (2026-10-24), its report.
 Where: the worker sandbox for `--access read` runs on the iMac.
 What happens: a reviewer found no Rust toolchain and installed its own in `/tmp/rv-rustup` to run `cargo test`. With that toolchain absent, a mise `cargo-clippy` wrapper on the PATH ran a different toolchain without the wasm32 std, so wasm32 clippy failed with "can't find crate for std". Write-mode workers hit the same root: plain `/usr/bin/cargo` fails unless `RUSTUP_HOME=/var/lib/agent-worker/.state/rustup` is set, and with it the toolchain has the wasm32 target. The sandbox does not export that RUSTUP_HOME.
 How found: Red Acre engine base review 29fbdb20 and fix worker beff40cb (2026-10-24), their reports.
+
+## Workers cannot look at images
+
+Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` (`TOOLSETS = "file,search,terminal,skills"`) and `host/hermes-worker/config.{read,write}.yaml` (`toolsets`).
+What happens: a worker has no image tool. An art worker cannot look at what it draws, and a UI worker or reviewer cannot look at its own screenshots. The Red Acre art test worker (55faa0fe, red-acre 5206d24) ended blocked on "look at your 8x previews" and judged its art from text grids; the potato's flowering stage reads as a frog face, which a look would have caught.
+How found: Red Acre art test, 2026-10-24.
