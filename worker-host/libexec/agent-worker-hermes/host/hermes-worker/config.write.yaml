@@ -10,6 +10,7 @@ toolsets:
   - search
   - terminal
   - skills
+  - vision
 agent:
   reasoning_effort: medium
   # Worker hosts lose their internet for 1 to 15 minutes now and then; 12 retries with

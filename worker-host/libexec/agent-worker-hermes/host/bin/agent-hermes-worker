@@ -21,7 +21,8 @@ from urllib.parse import quote
 
 
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
-TOOLSETS = "file,search,terminal,skills"
+# vision: art and UI workers must look at the pictures they make (vision_analyze attaches images natively).
+TOOLSETS = "file,search,terminal,skills,vision"
 # Built by worker-host/build-hermes-release.sh; keep in step with bootstrap.sh RELEASE and PY_DIR.
 TRUSTED_HERMES_SOURCE = Path(
     "/opt/agent-worker-hermes/releases/e3d78e60dd7a632bf01b21ece2f377f5aabc9aeb/source"
