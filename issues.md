@@ -205,3 +205,9 @@ How found: Red Acre engine test run 758c362c (2026-10-24), its report.
 Where: the worker sandbox for `--access read` runs on the iMac.
 What happens: a reviewer found no Rust toolchain and installed its own in `/tmp/rv-rustup` to run `cargo test`. With that toolchain absent, a mise `cargo-clippy` wrapper on the PATH ran a different toolchain without the wasm32 std, so wasm32 clippy failed with "can't find crate for std". Write-mode workers hit the same root: plain `/usr/bin/cargo` fails unless `RUSTUP_HOME=/var/lib/agent-worker/.state/rustup` is set, and with it the toolchain has the wasm32 target. The sandbox does not export that RUSTUP_HOME.
 How found: Red Acre engine base review 29fbdb20 and fix worker beff40cb (2026-10-24), their reports.
+
+## Tool-name repair notices in a worker's final text hide its OUTCOME line
+
+Where: `worker-host/libexec/agent-worker-runner` `reported_outcome` (reads only the first non-empty line), and the Hermes harness, which prints `🔧 Auto-repaired tool name: 'mcp__tool_describe' -> 'tool_describe'` into the agent's final text.
+What happens: a worker that calls `mcp__tool_describe` or `mcp__tool_call` gets these notices as the first lines of its final text. Its report starts `OUTCOME: COMPLETED` on the next line, but the run ends `status=blocked`, "worker exited without a machine-readable terminal outcome". Runs without the notices end `completed`.
+How found: Red Acre runs on sim 2026-10-25: bfaead6e (farm rules) and 5f5cf248 (its review) blocked with the notices first; 02f61ed0 (HUD sketches) completed without them (`repo-worker --output <run>`).
