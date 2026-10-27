@@ -234,3 +234,9 @@ How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eeb
 - Where: worker-host/install.sh (the active-runs guard), worker-host/libexec/agent-worker-hermes/host/hermes-worker/config.*.yaml.
 - What happens: a host that still has the 3-retry config loses a worker run on every 5-minute internet drop, and the fix (api_max_retries: 12) needs --apply, which refuses while any run is active. On a busy host there is no gap, so the host keeps losing runs all day.
 - Found: sim on 2026-10-27, two runs lost that way (a000f02f, d52e7ec8). Workaround used, safe only because the adapter builds each run's config.yaml from the template at launch: back the two installed yamls up and copy the repo's versions in when the only diff is api_max_retries. A real fix: install.sh gets a flag that replaces the retry settings alone while runs are active.
+
+
+## chain-workers.sh gives up after 6 minutes when the host's slots are full
+- Where: `worker-host/bin/chain-workers.sh` (the inner `for try in 1..6` loop, `sleep 60`, then `exit 1`).
+- What happens: when the previous run ends and other chats hold every slot on the host, the chain waits only 6 minutes for a slot, prints `FAILED: repo-worker: N runs already active`, and drops the rest of the chain. The queued job never starts, and nothing tells the coordinator until the chain's own notice.
+- Found: red-acre pause-a after title-a 54631b9b on the iMac, 2026-10-27 (7 runs from other chats, limit 2); the job was moved to the Pro by hand.
