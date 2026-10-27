@@ -212,3 +212,9 @@ How found: Red Acre engine base review 29fbdb20 and fix worker beff40cb (2026-10
 Where: `worker-host/libexec/agent-worker-runner` `reported_outcome` (reads only the first non-empty line), and the Hermes harness, which prints `🔧 Auto-repaired tool name: 'mcp__tool_describe' -> 'tool_describe'` (and, after a context compaction, `⟳ compacting context…`) into the agent's final text.
 What happens: a worker that calls `mcp__tool_describe` or `mcp__tool_call` gets these notices as the first lines of its final text. Its report starts `OUTCOME: COMPLETED` on the next line, but the run ends `status=blocked`, "worker exited without a machine-readable terminal outcome". Runs without the notices end `completed`.
 How found: Red Acre runs on sim 2026-10-25: bfaead6e (farm rules) and 5f5cf248 (its review) blocked with the notices first; 02f61ed0 (HUD sketches) completed without them (`repo-worker --output <run>`). On the iMac (e3d78e60), 0fba52a9 (Red Acre clock and light) blocked with `⟳ compacting context…` first.
+
+## Workers on sim have no vision_analyze
+
+Where: the worker runtime on sim (repo-worker `--agent hermes`); the iMac's e3d78e60 runtime has the tool.
+What happens: a packet that asks the worker to look at its own shots (`vision_analyze`) cannot be met on sim: the tool is not in the session and tool search does not find it. The worker measures pixels instead and ends BLOCKED; Foreman looks at the shots on the host.
+How found: Red Acre play-farm worker 7f1d09fb on sim (2026-10-26), its report; the iMac menu-mockups worker 4d7852d8 the same day used the tool.
