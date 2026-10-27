@@ -359,8 +359,8 @@ done
 # [E:SRC:agent-worker-broker path_auth_ok]. Never copy one host's OAuth file to
 # another: refresh tokens are single-use.
 declare -A AUTH_HOW=(
-  [.claude/.credentials.json]="owner runs: ssh -t sim sudo -u $WU -H $WH/.local/bin/claude auth login"
-  [.codex/auth.json]="codex sign-in as $WU, or ENABLE_CODEX_SYNC=1 once $CALLER on sim holds the openai-codex grant (whether the sync creates a missing store is unverified)"
+  [.claude/.credentials.json]="owner runs: ssh -t $(uname -n) sudo -u $WU -H $WH/.local/bin/claude auth login"
+  [.codex/auth.json]="codex sign-in as $WU, or ENABLE_CODEX_SYNC=1 once $CALLER on this host holds the openai-codex grant (whether the sync creates a missing store is unverified)"
   [.hermes/auth.json]="API-key rows: sudo -u $WU -H env HERMES_HOME=$WH/.hermes /opt/agent-worker-hermes/releases/$RELEASE/source/.venv/bin/hermes auth add anthropic --type api-key --label <l> (iMac pool: anthropic 2, openrouter 1, openai-codex 1)"
   [.kimi/config.toml]="Kimi sign-in or key as $WU (method not recorded on the iMac)"
 )

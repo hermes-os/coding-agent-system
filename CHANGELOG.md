@@ -4,6 +4,8 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- bootstrap.sh's "left by hand" list names the host it runs on in the Claude login command, not `sim` on every host.
+
 - Hermes workers get the `vision` toolset (read and write runs), so art and UI workers can look at the images and screenshots they make. `vision_analyze` attaches the image natively for a vision-capable model.
 
 - A worker run rides out an internet drop of up to about 15 minutes: worker
