@@ -224,3 +224,8 @@ How found: Red Acre play-farm worker 7f1d09fb on sim (2026-10-26), its report; t
 Where: repo-worker `--output` on sim (agent-workers state under `/var/lib/agent-worker/.local/state/agent-workers/runs/<runId>/`).
 What happens: a worker run that stops without writing `final.txt` leaves `repo-worker --output <runId>` printing "final output is not available for run <runId>". The run's `stream.log` is gone too (the runs/ folder is not in the user's home), so there is no way to see what it did before it stopped. Whatever it committed stays in the clone, but anything uncommitted is only visible with `git status` in the clone itself.
 How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eebd33 (save-clock fix3), ec681976 (play-farm fix1), and 2f551689 (a soft-rounding review) all stopped with no report; three of the four left uncommitted work in their clones. Recovered by reading `git status` in each clone and relaunching a finisher worker on the same clone.
+
+## A delegate_task child with an output_schema can lose its whole report
+- Where: Foreman's `delegate_task` (Hermes harness), background children with `output_schema`.
+- What happens: two host-setup children on 2026-10-27 ended `failed`. One stopped with "session storage was busy (another Hermes process was writing to the state database)". The other had its report rejected as not JSON; the retry turn no longer held the report, so it returned "nothing verified". In both cases the work on the host was done or half done, but no record of it came back.
+- Found: deleg_db83d360 and deleg_4b317e4b (MacBook Pro worker-host setup); the Foreman re-read the host state by hand.
