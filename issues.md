@@ -218,3 +218,9 @@ How found: Red Acre runs on sim 2026-10-25: bfaead6e (farm rules) and 5f5cf248 (
 Where: the worker runtime on sim (repo-worker `--agent hermes`); the iMac's e3d78e60 runtime has the tool.
 What happens: a packet that asks the worker to look at its own shots (`vision_analyze`) cannot be met on sim: the tool is not in the session and tool search does not find it. The worker measures pixels instead and ends BLOCKED; Foreman looks at the shots on the host.
 How found: Red Acre play-farm worker 7f1d09fb on sim (2026-10-26), its report; the iMac menu-mockups worker 4d7852d8 the same day used the tool.
+
+## A run that stops without its report loses the run's output
+
+Where: repo-worker `--output` on sim (agent-workers state under `/var/lib/agent-worker/.local/state/agent-workers/runs/<runId>/`).
+What happens: a worker run that stops without writing `final.txt` leaves `repo-worker --output <runId>` printing "final output is not available for run <runId>". The run's `stream.log` is gone too (the runs/ folder is not in the user's home), so there is no way to see what it did before it stopped. Whatever it committed stays in the clone, but anything uncommitted is only visible with `git status` in the clone itself.
+How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eebd33 (save-clock fix3), ec681976 (play-farm fix1), and 2f551689 (a soft-rounding review) all stopped with no report; three of the four left uncommitted work in their clones. Recovered by reading `git status` in each clone and relaunching a finisher worker on the same clone.
