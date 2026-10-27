@@ -229,3 +229,8 @@ How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eeb
 - Where: Foreman's `delegate_task` (Hermes harness), background children with `output_schema`.
 - What happens: two host-setup children on 2026-10-27 ended `failed`. One stopped with "session storage was busy (another Hermes process was writing to the state database)". The other had its report rejected as not JSON; the retry turn no longer held the report, so it returned "nothing verified". In both cases the work on the host was done or half done, but no record of it came back.
 - Found: deleg_db83d360 and deleg_4b317e4b (MacBook Pro worker-host setup); the Foreman re-read the host state by hand.
+
+## install.sh --apply refuses while runs are active, and that is the only way to fix a host's retry limit
+- Where: worker-host/install.sh (the active-runs guard), worker-host/libexec/agent-worker-hermes/host/hermes-worker/config.*.yaml.
+- What happens: a host that still has the 3-retry config loses a worker run on every 5-minute internet drop, and the fix (api_max_retries: 12) needs --apply, which refuses while any run is active. On a busy host there is no gap, so the host keeps losing runs all day.
+- Found: sim on 2026-10-27, two runs lost that way (a000f02f, d52e7ec8). Workaround used, safe only because the adapter builds each run's config.yaml from the template at launch: back the two installed yamls up and copy the repo's versions in when the only diff is api_max_retries. A real fix: install.sh gets a flag that replaces the retry settings alone while runs are active.
