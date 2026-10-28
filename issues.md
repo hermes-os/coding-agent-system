@@ -240,3 +240,8 @@ How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eeb
 - Where: `worker-host/bin/chain-workers.sh` (the inner `for try in 1..6` loop, `sleep 60`, then `exit 1`).
 - What happens: when the previous run ends and other chats hold every slot on the host, the chain waits only 6 minutes for a slot, prints `FAILED: repo-worker: N runs already active`, and drops the rest of the chain. The queued job never starts, and nothing tells the coordinator until the chain's own notice.
 - Found: red-acre pause-a after title-a 54631b9b on the iMac, 2026-10-27 (7 runs from other chats, limit 2); the job was moved to the Pro by hand.
+
+## model-usage-watch holds all work on a wrong full Claude session
+- Where: `worker-host/bin/model-usage-watch-v20260930.py` (`decide`, `read_usage`), output `model-routing-live.json`.
+- What happens: on 2026-10-28 06:20 the watcher wrote `phase: hold-anthropic-closed` with `session_used: 100.0` (reset 16:10 UTC) and `week_used: 0.0`. Hermes reports that the session is not full. Every role reads HOLD, so a coordinator that follows the routing file launches nothing.
+- Found: Foreman read the routing file before relaunching the Red Acre lanes after the weekly reset, 2026-10-28.
