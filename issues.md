@@ -240,3 +240,8 @@ How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eeb
 - Where: `worker-host/bin/chain-workers.sh` (the inner `for try in 1..6` loop, `sleep 60`, then `exit 1`).
 - What happens: when the previous run ends and other chats hold every slot on the host, the chain waits only 6 minutes for a slot, prints `FAILED: repo-worker: N runs already active`, and drops the rest of the chain. The queued job never starts, and nothing tells the coordinator until the chain's own notice.
 - Found: red-acre pause-a after title-a 54631b9b on the iMac, 2026-10-27 (7 runs from other chats, limit 2); the job was moved to the Pro by hand.
+
+## Every Hermes launch hides the run list from the host owner for up to a second
+- Where: `worker-host/libexec/agent-worker-broker` `launch()`, `ensure_directory(HERMES_RUNTIME_ROOT, mode=0o700, ...)`.
+- What happens: the chmod 0700 zeroes the ACL mask on `/var/lib/agent-worker/.hermes-worker`, so the `u:hermes:r-x` grant the Hermes adapter sets stops working until a running adapter renews it (at most a second) or the new run's adapter starts. If the launch fails before its adapter runs and no other Hermes run is live, `hermes` cannot list or enter any run home until the next Hermes run.
+- Found: reading the broker while adding the state.db read grant (e6ab0ff).
