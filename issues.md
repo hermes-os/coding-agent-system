@@ -250,3 +250,8 @@ How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eeb
 - Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `grant_state_read` (`u:hermes:--x` on each Hermes run home).
 - What happens: with `--x` on the run home, `hermes` can open any top-level entry it knows the name of, so that entry's other bits decide its access: a top-level file left 0644 (or a folder 0755) becomes readable by `hermes`, not just `state.db*`. The grant does not check the other entries' modes. Live hosts are clean today because workers run with `UMask=0077`; a file made with an explicit mode or a later chmod is not covered.
 - Found: review of e6ab0ff (read grant on state.db).
+
+## model-usage-watch holds all work on a wrong full Claude session
+- Where: `worker-host/bin/model-usage-watch-v20260930.py` (`decide`, `read_usage`), output `model-routing-live.json`.
+- What happens: on 2026-10-28 06:20 the watcher wrote `phase: hold-anthropic-closed` with `session_used: 100.0` (reset 16:10 UTC) and `week_used: 0.0`. Hermes reports that the session is not full. Every role reads HOLD, so a coordinator that follows the routing file launches nothing.
+- Found: Foreman read the routing file before relaunching the Red Acre lanes after the weekly reset, 2026-10-28.
