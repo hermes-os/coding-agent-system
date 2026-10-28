@@ -4,14 +4,17 @@
 import argparse
 import base64
 import contextlib
+import errno
 import fcntl
 import json
 import os
+import pwd
 import re
 import selectors
 import signal
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -84,6 +87,20 @@ FALLBACK_AUTH_PROVIDERS = ("openai-codex", "openrouter")
 BRIDGE_STATE_NAME = "bridge-state.json"
 BRIDGE_STATE_VERSION = 1
 NATIVE_STATE_NAME = "state.db"
+# The host owner (shoulder, a read-only TUI run as this user) may read each run's state.db and its
+# SQLite sidecars, and traverse to them. Nothing else in a run home is granted: auth.json and the
+# rest stay owner-only. The name is fixed here, never taken from the worker's environment.
+STATE_READER_NAME = "hermes"
+STATE_READ_FILES = (NATIVE_STATE_NAME, f"{NATIVE_STATE_NAME}-wal", f"{NATIVE_STATE_NAME}-shm")
+# Hermes chmods state.db and its sidecars to 0600 on every writer open, which zeroes the ACL mask,
+# and SQLite recreates -wal/-shm without an ACL after the last connection closes; so it is reapplied this often.
+STATE_GRANT_REFRESH_SECONDS = 1.0
+ACL_READ, ACL_TRAVERSE, ACL_LIST = 0o4, 0o1, 0o5
+_ACL_ACCESS_XATTR = "system.posix_acl_access"
+_ACL_DEFAULT_XATTR = "system.posix_acl_default"
+_ACL_XATTR_VERSION = 2
+_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_MASK, _ACL_OTHER = 0x01, 0x02, 0x04, 0x10, 0x20
+_ACL_UNDEFINED_ID = 0xFFFFFFFF
 NATIVE_REQUIRED_SESSION_COLUMNS = {
     "id",
     "parent_session_id",
@@ -297,6 +314,156 @@ def _replace_readonly_file(path, content):
         temporary.unlink(missing_ok=True)
 
 
+def _state_reader_uid():
+    try:
+        return pwd.getpwnam(STATE_READER_NAME).pw_uid
+    except KeyError:
+        return None
+
+
+def _acl_entries(target, name=_ACL_ACCESS_XATTR):
+    """Sorted (tag, perm, id) entries of a POSIX ACL; () when there is none; None if malformed."""
+    try:
+        if isinstance(target, int):
+            raw = os.getxattr(target, name)
+        else:
+            raw = os.getxattr(target, name, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, errno.EOPNOTSUPP, errno.ENOTSUP):
+            return ()
+        raise
+    if len(raw) < 4 or (len(raw) - 4) % 8 or struct.unpack_from("<I", raw)[0] != _ACL_XATTR_VERSION:
+        return None
+    return sorted(struct.iter_unpack("<HHI", raw[4:]))
+
+
+def _state_grant_entries(owner_perm, reader_uid, perm):
+    return [
+        (_ACL_USER_OBJ, owner_perm, _ACL_UNDEFINED_ID),
+        (_ACL_USER, perm, reader_uid),
+        (_ACL_GROUP_OBJ, 0, _ACL_UNDEFINED_ID),
+        (_ACL_MASK, perm, _ACL_UNDEFINED_ID),
+        (_ACL_OTHER, 0, _ACL_UNDEFINED_ID),
+    ]
+
+
+def _private_or_state_grant(target, info, perm):
+    """Owner-only, or owner plus exactly the state reader's `perm` and nothing for group or other.
+
+    With an ACL the group mode bits are the ACL mask, so the grant shows up as group bits."""
+    mode = stat.S_IMODE(info.st_mode)
+    if not mode & 0o077:
+        return True
+    reader = _state_reader_uid()
+    if reader is None or mode & 0o077 != perm << 3:
+        return False
+    try:
+        entries = _acl_entries(target)
+    except OSError:
+        return False
+    return entries == _state_grant_entries((mode >> 6) & 0o7, reader, perm)
+
+
+def _grant_state_reader(path, perm, *, directory, reader):
+    """Give the state reader exactly `perm` on one entry this process owns.
+
+    Returns True when granted, None when there is nothing to grant, False when refused or failed.
+    The ACL is set through a descriptor opened without following symlinks and replaces the whole
+    access ACL with owner + reader, so group and other end with nothing whatever they had."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    if directory:
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    try:
+        info = os.fstat(descriptor)
+        if directory:
+            kind_ok = stat.S_ISDIR(info.st_mode)
+        else:
+            # A second link could be another file's name, e.g. auth.json.
+            kind_ok = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+        if not kind_ok or info.st_uid != os.geteuid():
+            return False
+        # A default ACL would pass the grant on to every new file below it.
+        if directory and _acl_entries(descriptor, _ACL_DEFAULT_XATTR) != ():
+            return False
+        wanted = _state_grant_entries((stat.S_IMODE(info.st_mode) >> 6) & 0o7, reader, perm)
+        if _acl_entries(descriptor) != wanted:
+            encoded = struct.pack("<I", _ACL_XATTR_VERSION) + b"".join(
+                struct.pack("<HHI", *entry) for entry in wanted
+            )
+            os.setxattr(descriptor, _ACL_ACCESS_XATTR, encoded)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def grant_state_read(runtime_home):
+    """Let the state reader list the run homes, enter this one and read state.db*; nothing else.
+
+    Returns the names that could not be granted. A failure leaves the entry as it was (one
+    setxattr either lands or not), so it never leaves broader access behind."""
+    reader = _state_reader_uid()
+    if reader is None:
+        return []
+    failed = []
+    parent = runtime_home.parent
+    try:
+        parent_info = parent.lstat()
+    except OSError:
+        parent_info = None
+    # The shared parent is touched only while it is this worker's own private directory: replacing
+    # its ACL must not take away access someone set on purpose.
+    if (
+        parent_info is not None
+        and stat.S_ISDIR(parent_info.st_mode)
+        and parent_info.st_uid == os.geteuid()
+        and _private_or_state_grant(parent, parent_info, ACL_LIST)
+    ):
+        if _grant_state_reader(parent, ACL_LIST, directory=True, reader=reader) is False:
+            failed.append(str(parent))
+    if _grant_state_reader(runtime_home, ACL_TRAVERSE, directory=True, reader=reader) is False:
+        failed.append(str(runtime_home))
+    for name in STATE_READ_FILES:
+        if _grant_state_reader(runtime_home / name, ACL_READ, directory=False, reader=reader) is False:
+            failed.append(str(runtime_home / name))
+    return failed
+
+
+class StateReadGrant:
+    """Keeps the state reader's grant in place for the whole run; it is optional, so a failure
+    is reported once and never stops the run."""
+
+    def __init__(self, runtime_home):
+        self.runtime_home = runtime_home
+        self.next_refresh = 0.0
+        self.reported = False
+
+    def refresh(self, *, force=False):
+        now = time.monotonic()
+        if not force and now < self.next_refresh:
+            return
+        self.next_refresh = now + STATE_GRANT_REFRESH_SECONDS
+        try:
+            failed = grant_state_read(self.runtime_home)
+        except Exception:  # the grant is optional; nothing in it may end a run
+            failed = [str(self.runtime_home)]
+        if failed and not self.reported:
+            self.reported = True
+            emit(
+                "warning",
+                code="state_read_grant_failed",
+                message="the host owner cannot read this run's Hermes state; the run continues",
+                paths=failed,
+            )
+
+
 def check_directory(path, *, fresh):
     try:
         if path.is_symlink():
@@ -316,11 +483,16 @@ def check_directory(path, *, fresh):
         raise
     except OSError as exc:
         raise BridgeError("unsafe_runtime_home", "runtime home cannot be prepared") from exc
+    try:
+        default_acl = _acl_entries(path, _ACL_DEFAULT_XATTR)
+    except OSError:
+        default_acl = None
     if (
         not stat.S_ISDIR(info.st_mode)
         or info.st_uid != os.geteuid()
-        or info.st_mode & 0o077
+        or not _private_or_state_grant(path, info, ACL_TRAVERSE)
         or (info.st_mode & 0o700) != 0o700
+        or default_acl != ()
     ):
         raise BridgeError("unsafe_runtime_home", "runtime home ownership or mode is unsafe")
 
@@ -592,7 +764,11 @@ def _native_state_connection(runtime_home):
     state = runtime_home / NATIVE_STATE_NAME
     try:
         info = state.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or not _private_or_state_grant(state, info, ACL_READ)
+        ):
             raise BridgeError("resume_state_invalid", "native session state is unsafe")
         connection = sqlite3.connect(
             f"file:{quote(str(state), safe='/')}?mode=ro", uri=True, timeout=0.5, check_same_thread=False
@@ -995,7 +1171,7 @@ def build_command(runtime, args, resume_session):
     return command
 
 
-def run_child(command, task, environment, args, broker_session_id, resume_session):
+def run_child(command, task, environment, args, broker_session_id, resume_session, *, tick=None):
     try:
         child = subprocess.Popen(
             command,
@@ -1116,6 +1292,8 @@ def run_child(command, task, environment, args, broker_session_id, resume_sessio
             open_streams[stream.fileno()] = stream
 
         while True:
+            if tick is not None:
+                tick()
             returncode = child.poll()
             if returncode is not None and not shutdown_started:
                 begin_shutdown()
@@ -1243,9 +1421,12 @@ def main(argv=None):
             started_fields["resumed_from_native_session_id"] = resume_session
             started_fields["effective_resume_native_session_id"] = resume_info["effective_session_id"]
         emit("started", **started_fields)
+        state_grant = StateReadGrant(runtime_home)
         returncode, result, session_ids, was_interrupted = run_child(
-            command, task, environment, args, broker_session_id, resume_session
+            command, task, environment, args, broker_session_id, resume_session, tick=state_grant.refresh
         )
+        # Catches a mask reset or a recreated sidecar from Hermes's last second, so the finished run stays readable.
+        state_grant.refresh(force=True)
         sync_worker_auth(runtime_home, args.provider)
         if args.fresh_session and session_ids:
             _record_bridge_bindings(runtime_home, session_ids, broker_session_id, args.access)

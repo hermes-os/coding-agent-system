@@ -4,6 +4,18 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- The host owner (`hermes`) can read each Hermes worker run's `state.db`,
+  `state.db-wal` and `state.db-shm`, so a read-only viewer such as shoulder can
+  show what a run is doing. The adapter grants exactly these POSIX ACLs and
+  renews them every second while a run is live: `u:hermes:r-x` on
+  `.hermes-worker`, `u:hermes:--x` on the run home, `u:hermes:r--` on the three
+  database files. `auth.json`, `config.yaml` and everything else in a run home
+  stay owner-only. No default ACL is used. A grant that fails is reported once
+  as a `warning` event and does not stop the run. Resume accepts a home or
+  `state.db` that carries exactly this grant and refuses any other group, other
+  or default-ACL access. Run homes made before this change get the grant only
+  when they are resumed. Takes effect on a host at its next `install.sh --apply`.
+
 - bootstrap.sh's "left by hand" list names the host it runs on in the Claude login command, not `sim` on every host.
 
 - Hermes workers get the `vision` toolset (read and write runs), so art and UI workers can look at the images and screenshots they make. `vision_analyze` attaches the image natively for a vision-capable model.

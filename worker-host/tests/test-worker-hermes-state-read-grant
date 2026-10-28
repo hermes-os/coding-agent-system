@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Verify the host owner can read a Hermes run's state.db files and nothing that holds credentials.
+
+The grant is checked with a real getfacl round trip. The grant user is STATE_READ_TEST_USER
+(default nobody): the files belong to the user running the test, who can read them anyway, so a
+second user shows that the ACL, not ownership, carries the access.
+"""
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+import json
+import os
+import pwd
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+
+WORKER_HOST = Path(__file__).resolve().parents[1]
+ADAPTER = WORKER_HOST / "libexec" / "agent-worker-hermes" / "host" / "bin" / "agent-hermes-worker"
+
+loader = SourceFileLoader("agent_hermes_worker_state_grant_test", str(ADAPTER))
+spec = spec_from_loader(loader.name, loader)
+adapter = module_from_spec(spec)
+sys.modules[loader.name] = adapter
+loader.exec_module(adapter)
+
+READER = os.environ.get("STATE_READ_TEST_USER", "nobody")
+try:
+    pwd.getpwnam(READER)
+except KeyError:
+    raise SystemExit(f"grant user {READER} does not exist; set STATE_READ_TEST_USER")
+adapter.STATE_READER_NAME = READER
+# Workers run with UMask=0077.
+os.umask(0o077)
+
+
+def acl(path):
+    output = subprocess.run(
+        ["getfacl", "--omit-header", "--absolute-names", "--physical", "--", str(path)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    # "#effective:" annotations only appear when the mask narrows an entry; strip them.
+    return {line.split("#")[0].strip() for line in output.splitlines() if line.strip()}
+
+
+def default_acl(path):
+    output = subprocess.run(
+        ["getfacl", "--omit-header", "--absolute-names", "--default", "--", str(path)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return {line.strip() for line in output.splitlines() if line.strip()}
+
+
+def granted(path, perm, owner="rw-"):
+    return acl(path) == {f"user::{owner}", f"user:{READER}:{perm}", "group::---", "mask::" + perm, "other::---"}
+
+
+def require_granted(path, perm, owner="rw-"):
+    if not granted(path, perm, owner):
+        raise SystemExit(f"{path.name}: expected only u:{READER}:{perm}, got {sorted(acl(path))}")
+
+
+def require_private(path):
+    entries = acl(path)
+    if any(entry.startswith(f"user:{READER}:") or entry.startswith("mask::") for entry in entries):
+        raise SystemExit(f"{path.name} is granted to {READER}: {sorted(entries)}")
+    if os.lstat(path).st_mode & 0o077:
+        raise SystemExit(f"{path.name} has group or other mode bits: {oct(os.lstat(path).st_mode)}")
+
+
+def refused(home, reason):
+    try:
+        adapter.check_directory(home, fresh=False)
+    except adapter.BridgeError as exc:
+        if exc.code != "unsafe_runtime_home":
+            raise SystemExit(f"{reason}: refused with {exc.code}, not unsafe_runtime_home")
+        return
+    raise SystemExit(f"{reason}: the resume home was accepted")
+
+
+def native_schema(connection):
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, cwd TEXT,"
+        " model_config TEXT, source TEXT, started_at REAL, ended_at REAL, end_reason TEXT,"
+        " last_activity_at REAL, session_key TEXT)"
+    )
+    connection.execute("CREATE TABLE IF NOT EXISTS messages (session_id TEXT, timestamp REAL)")
+    connection.commit()
+
+
+with tempfile.TemporaryDirectory() as scratch:
+    scratch = Path(scratch)
+    shared = scratch / "worker-hermes"
+    shared.mkdir(mode=0o700)
+    (shared / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {"openrouter": [{"id": "k", "access_token": "test-not-a-secret"}]},
+    }))
+    adapter.WORKER_HERMES_HOME = shared
+
+    root = scratch / ".hermes-worker"
+    root.mkdir(mode=0o700)
+    home = root / "8d0f3e8e-0c55-4b4e-9a53-6c1f00e3f6a1"
+    adapter.prepare_runtime_home(home, fresh=True, access="write")
+    adapter.seed_worker_auth(home, "openrouter")
+    if not (home / "auth.json").is_file():
+        raise SystemExit("the adapter did not seed auth.json")
+
+    # What Hermes does: a WAL database kept open, every file chmodded 0600.
+    writer = sqlite3.connect(home / "state.db")
+    native_schema(writer)
+    writer.execute("INSERT INTO sessions (id) VALUES ('20261028_120000_abcdef')")
+    writer.commit()
+    for name in adapter.STATE_READ_FILES:
+        if not (home / name).exists():
+            raise SystemExit(f"SQLite did not create {name}")
+        os.chmod(home / name, 0o600)
+
+    grant = adapter.StateReadGrant(home)
+    grant.refresh(force=True)
+    if grant.reported:
+        raise SystemExit("the grant reported a failure on a clean run home")
+    require_granted(root, "r-x", owner="rwx")
+    require_granted(home, "--x", owner="rwx")
+    for name in adapter.STATE_READ_FILES:
+        require_granted(home / name, "r--")
+    for name in ("auth.json", "config.yaml", ".no-bundled-skills"):
+        require_private(home / name)
+    if default_acl(home) or default_acl(root):
+        raise SystemExit("a default ACL would pass the grant on to new files")
+
+    # Files made after the grant (Hermes's own writes, a private subdirectory) stay private.
+    (home / "models_dev_cache.json").write_text("{}")
+    (home / "sessions").mkdir(mode=0o700, exist_ok=True)
+    (home / "sessions" / "transcript.json").write_text("[]")
+    adapter._write_private_json(home / "auth.json", {"version": 1, "providers": {}})
+    grant.refresh(force=True)
+    for path in (home / "models_dev_cache.json", home / "sessions", home / "sessions" / "transcript.json",
+                 home / "auth.json"):
+        require_private(path)
+
+    # Hermes's next writer open chmods 0600 and zeroes the mask; the refresh restores it.
+    os.chmod(home / "state.db", 0o600)
+    os.chmod(home, 0o700)
+    if granted(home / "state.db", "r--"):
+        raise SystemExit("chmod 0600 did not reset the mask; the reset case is not exercised")
+    grant.refresh(force=True)
+    require_granted(home / "state.db", "r--")
+    require_granted(home, "--x", owner="rwx")
+
+    # Hermes closes, SQLite removes -wal/-shm and recreates them without an ACL on the next open.
+    writer.close()
+    for name in ("state.db-wal", "state.db-shm"):
+        if (home / name).exists():
+            raise SystemExit(f"{name} survived the last close; the recreate case is not exercised")
+    writer = sqlite3.connect(home / "state.db")
+    writer.execute("INSERT INTO sessions (id) VALUES ('20261028_120001_abcdef')")
+    writer.commit()
+    if granted(home / "state.db-wal", "r--"):
+        raise SystemExit("the recreated WAL already carried the grant; the case is not exercised")
+    grant.refresh(force=True)
+    for name in adapter.STATE_READ_FILES:
+        require_granted(home / name, "r--")
+
+    # The refresh is throttled, so the supervision loop can call it every iteration.
+    os.chmod(home / "state.db", 0o600)
+    grant.refresh()
+    if granted(home / "state.db", "r--"):
+        raise SystemExit("an unforced refresh ran inside the refresh interval")
+    grant.refresh(force=True)
+
+    # The adapter's own resume checks accept the granted home and database.
+    adapter.prepare_runtime_home(home, fresh=False, access="write")
+    adapter._native_state_connection(home).close()
+
+    # A planted symlink or second link under a state name is never granted.
+    writer.close()
+    for name in ("state.db-wal", "state.db-shm"):
+        (home / name).unlink(missing_ok=True)
+    os.symlink("auth.json", home / "state.db-shm")
+    os.link(home / "auth.json", home / "state.db-wal")
+    refusing = adapter.StateReadGrant(home)
+    refusing.refresh(force=True)
+    if not refusing.reported:
+        raise SystemExit("a planted symlink or hard link was not reported")
+    require_private(home / "auth.json")
+    (home / "state.db-shm").unlink()
+    (home / "state.db-wal").unlink()
+
+    # check_directory still refuses any other group or other access.
+    for mode, reason in ((0o770, "group rwx"), (0o707, "other rwx"), (0o750, "group r-x"), (0o711, "other --x")):
+        os.chmod(home, mode)
+        refused(home, f"a resume home with {reason}")
+    os.chmod(home, 0o700)
+    grant.refresh(force=True)
+    subprocess.run(["setfacl", "-m", f"u:{READER}:r-x", str(home)], check=True)
+    refused(home, f"a resume home granting {READER} r-x")
+    subprocess.run(["setfacl", "-m", f"u:{READER}:--x,g:{os.getgid()}:--x", str(home)], check=True)
+    refused(home, "a resume home with an extra group entry")
+    subprocess.run(["setfacl", "-b", str(home)], check=True)
+    grant.refresh(force=True)
+    adapter.check_directory(home, fresh=False)
+    subprocess.run(["setfacl", "-d", "-m", f"u:{READER}:r--", str(home)], check=True)
+    refused(home, "a resume home with a default ACL")
+    if str(home) not in adapter.grant_state_read(home):
+        raise SystemExit("a home with a default ACL was granted without a report")
+    subprocess.run(["setfacl", "-k", str(home)], check=True)
+    adapter.check_directory(home, fresh=False)
+
+    # A granted database that also lets group or other in is refused at resume.
+    os.chmod(home / "state.db", 0o644)
+    try:
+        adapter._native_state_connection(home)
+    except adapter.BridgeError as exc:
+        if exc.code != "resume_state_invalid":
+            raise SystemExit(f"an open state.db was refused with {exc.code}")
+    else:
+        raise SystemExit("an other-readable state.db was accepted at resume")
+
+print(f"{READER} reads state.db, -wal and -shm and traverses to them; auth.json, config.yaml and new files stay private")
