@@ -444,7 +444,7 @@ with tempfile.TemporaryDirectory() as scratch:
 if os.geteuid() == 0:
     other_owner_case()
 elif subprocess.run(["unshare", "--map-auto", "--map-root-user", "python3", "-c",
-                     "import os,tempfile; p=tempfile.mkstemp()[1]; os.chown(p,1,1)"],
+                     "import os,tempfile; p=tempfile.mkstemp()[1]; os.chown(p,1,1); os.unlink(p)"],
                     capture_output=True).returncode == 0:
     # Root mapped in a user namespace can set an ACL on a file it does not own, as real root can.
     subprocess.run(["unshare", "--map-auto", "--map-root-user", sys.executable, "-B", __file__, "--other-owner"],
