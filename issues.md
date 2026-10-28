@@ -245,3 +245,8 @@ How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eeb
 - Where: `worker-host/libexec/agent-worker-broker` `launch()`, `ensure_directory(HERMES_RUNTIME_ROOT, mode=0o700, ...)`.
 - What happens: the chmod 0700 zeroes the ACL mask on `/var/lib/agent-worker/.hermes-worker`, so the `u:hermes:r-x` grant the Hermes adapter sets stops working until a running adapter renews it (at most a second) or the new run's adapter starts. If the launch fails before its adapter runs and no other Hermes run is live, `hermes` cannot list or enter any run home until the next Hermes run.
 - Found: reading the broker while adding the state.db read grant (e6ab0ff).
+
+## The run-home traverse grant makes top-level other bits count for the host owner
+- Where: `worker-host/libexec/agent-worker-hermes/host/bin/agent-hermes-worker` `grant_state_read` (`u:hermes:--x` on each Hermes run home).
+- What happens: with `--x` on the run home, `hermes` can open any top-level entry it knows the name of, so that entry's other bits decide its access: a top-level file left 0644 (or a folder 0755) becomes readable by `hermes`, not just `state.db*`. The grant does not check the other entries' modes. Live hosts are clean today because workers run with `UMask=0077`; a file made with an explicit mode or a later chmod is not covered.
+- Found: review of e6ab0ff (read grant on state.db).
