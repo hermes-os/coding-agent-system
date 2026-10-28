@@ -312,6 +312,26 @@ with tempfile.TemporaryDirectory() as scratch:
     require_private(home / "auth.json")
     (home / "state.db-wal").unlink()
 
+    # The same two with a real database behind them, which the header check would pass: only the
+    # no-follow open and the one-link check keep the decoy private.
+    decoy = scratch / "decoy.db"
+    decoy_db = sqlite3.connect(decoy)
+    native_schema(decoy_db)
+    decoy_db.close()
+    os.chmod(decoy, 0o600)
+    os.rename(home / "state.db", home / "state.db.aside")
+    os.symlink(decoy, home / "state.db")
+    if str(home / "state.db") not in grant_state_read(home):
+        raise SystemExit("a state.db symlink to a database elsewhere was not reported")
+    require_private(decoy)
+    (home / "state.db").unlink()
+    os.link(decoy, home / "state.db")
+    if str(home / "state.db") not in grant_state_read(home):
+        raise SystemExit("a state.db hard link to a database elsewhere was not reported")
+    require_private(decoy)
+    (home / "state.db").unlink()
+    os.rename(home / "state.db.aside", home / "state.db")
+
     # auth.json renamed to a state name is refused: it does not start the way SQLite writes that file.
     for name in adapter.STATE_READ_FILES:
         aside = home / f"{name}.aside"
