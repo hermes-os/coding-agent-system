@@ -22,8 +22,9 @@ This file records user-visible changes to the portable coding-agent system.
   which installs the adapter file and adds the client test symlink
   `~/.hermes/profiles/cal/workspace/scripts/test-worker-hermes-state-read-grant`
   (no broker restart). Rolling the adapter back to an older version: it refuses
-  to resume a run home this adapter granted, so first run `setfacl -b` on those
-  run homes and on their `state.db` files.
+  to resume a run home this adapter granted, so first run `setfacl -b` on
+  `.hermes-worker` (it carries `u:hermes:r-x`), on those run homes and on their
+  `state.db` files.
 
 - bootstrap.sh's "left by hand" list names the host it runs on in the Claude login command, not `sim` on every host.
 
