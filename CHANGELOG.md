@@ -9,7 +9,9 @@ This file records user-visible changes to the portable coding-agent system.
   show what a run is doing. The adapter grants exactly these POSIX ACLs and
   renews them every second while a run is live: `u:hermes:r-x` on
   `.hermes-worker`, `u:hermes:--x` on the run home, `u:hermes:r--` on the three
-  database files. `auth.json`, `config.yaml` and everything else in a run home
+  database files, each only while it is empty or starts the way SQLite writes
+  it (another file renamed to a state name is refused and reported).
+  `auth.json`, `config.yaml` and everything else in a run home
   stay owner-only. No default ACL is used. A grant that fails is reported once
   as a `warning` event and does not stop the run. Resume accepts a home or
   `state.db` that carries exactly this grant and refuses any other group, other

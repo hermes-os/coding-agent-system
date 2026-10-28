@@ -366,14 +366,40 @@ def _private_or_state_grant(target, info, perm):
 
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_WAL_MAGICS = (0x377F0682, 0x377F0683)
+# The wal-index header's first field, iVersion, in the host's byte order: the -shm file is never
+# shared between hosts, so SQLite writes it natively.
+_WAL_INDEX_VERSION = 3007000
 
 
-def _grant_open_entry(descriptor, perm, *, directory, reader):
+def _state_file_header(name, descriptor):
+    """True when the file is empty or starts the way SQLite writes `name`, so another file renamed
+    to a state name (auth.json starts with "{") is never granted. None for a -shm that SQLite has
+    sized but not filled in yet: it is retried at the next refresh and not reported."""
+    head = os.pread(descriptor, 16, 0)
+    if not head:
+        return True
+    if name == NATIVE_STATE_NAME:
+        return head == _SQLITE_HEADER
+    if len(head) < 4:
+        return False
+    if name == f"{NATIVE_STATE_NAME}-wal":
+        return struct.unpack_from(">I", head)[0] in _WAL_MAGICS
+    if name == f"{NATIVE_STATE_NAME}-shm":
+        if head == bytes(16):
+            return None
+        return struct.unpack_from("=I", head)[0] == _WAL_INDEX_VERSION
+    return False
+
+
+def _grant_open_entry(descriptor, perm, *, directory, reader, name=None):
     """Give the state reader exactly `perm` on an open entry this process owns.
 
-    Returns True when granted, False when refused; raises OSError when the grant cannot be read or
-    set. The new ACL replaces the whole access ACL with owner + reader, so group and other end with
-    nothing whatever they had, and a failed setxattr leaves the entry as it was."""
+    Returns True when granted, None when a state file is not ready yet, False when refused; raises
+    OSError when the grant cannot be read or set. The new ACL replaces the whole access ACL with
+    owner + reader, so group and other end with nothing whatever they had, and a failed setxattr
+    leaves the entry as it was."""
     info = os.fstat(descriptor)
     if directory:
         kind_ok = stat.S_ISDIR(info.st_mode)
@@ -385,6 +411,10 @@ def _grant_open_entry(descriptor, perm, *, directory, reader):
     # A default ACL would pass the grant on to every new file below it.
     if directory and _acl_entries(descriptor, _ACL_DEFAULT_XATTR) != ():
         return False
+    if not directory:
+        header = _state_file_header(name, descriptor)
+        if header is not True:
+            return header
     wanted = _state_grant_entries((stat.S_IMODE(info.st_mode) >> 6) & 0o7, reader, perm)
     if _acl_entries(descriptor) != wanted:
         encoded = struct.pack("<I", _ACL_XATTR_VERSION) + b"".join(
@@ -405,7 +435,7 @@ def _grant_state_reader(name, perm, *, directory, reader, dir_fd):
     except OSError:
         return False
     try:
-        return _grant_open_entry(descriptor, perm, directory=directory, reader=reader)
+        return _grant_open_entry(descriptor, perm, directory=directory, reader=reader, name=name)
     except OSError:
         return False
     finally:

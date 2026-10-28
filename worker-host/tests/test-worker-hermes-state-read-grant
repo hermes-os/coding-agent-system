@@ -295,6 +295,35 @@ with tempfile.TemporaryDirectory() as scratch:
     require_private(home / "auth.json")
     (home / "state.db-wal").unlink()
 
+    # auth.json renamed to a state name is refused: it does not start the way SQLite writes that file.
+    for name in adapter.STATE_READ_FILES:
+        aside = home / f"{name}.aside"
+        if (home / name).exists():
+            os.rename(home / name, aside)
+        os.rename(home / "auth.json", home / name)
+        if str(home / name) not in adapter.grant_state_read(home):
+            raise SystemExit(f"auth.json renamed to {name} was not reported")
+        require_private(home / name)
+        os.rename(home / name, home / "auth.json")
+        if aside.exists():
+            os.rename(aside, home / name)
+
+    # SQLite's own first states pass: an empty file under each name, and a -shm it has sized but not
+    # yet filled in is left for the next refresh without a report.
+    for name in ("state.db-wal", "state.db-shm"):
+        (home / name).write_bytes(b"")
+    if adapter.grant_state_read(home):
+        raise SystemExit("an empty -wal or -shm was refused")
+    for name in ("state.db-wal", "state.db-shm"):
+        require_granted(home / name, "r--")
+    (home / "state.db-shm").unlink()
+    (home / "state.db-shm").write_bytes(bytes(32768))
+    if adapter.grant_state_read(home):
+        raise SystemExit("a zero-filled -shm was reported")
+    require_private(home / "state.db-shm")
+    for name in ("state.db-wal", "state.db-shm"):
+        (home / name).unlink()
+
     # A run home swapped for a symlink grants nothing behind it, not even under the state names.
     elsewhere = scratch / "elsewhere"
     elsewhere.mkdir(mode=0o700)
