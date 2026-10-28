@@ -16,7 +16,12 @@ This file records user-visible changes to the portable coding-agent system.
   as a `warning` event and does not stop the run. Resume accepts a home or
   `state.db` that carries exactly this grant and refuses any other group, other
   or default-ACL access. Run homes made before this change get the grant only
-  when they are resumed. Takes effect on a host at its next `install.sh --apply`.
+  when they are resumed. Takes effect on a host at its next `install.sh --apply`,
+  which installs the adapter file and adds the client test symlink
+  `~/.hermes/profiles/cal/workspace/scripts/test-worker-hermes-state-read-grant`
+  (no broker restart). Rolling the adapter back to an older version: it refuses
+  to resume a run home this adapter granted, so first run `setfacl -b` on those
+  run homes and on their `state.db` files.
 
 - bootstrap.sh's "left by hand" list names the host it runs on in the Claude login command, not `sim` on every host.
 
