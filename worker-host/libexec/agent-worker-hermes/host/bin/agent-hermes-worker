@@ -364,40 +364,48 @@ def _private_or_state_grant(target, info, perm):
     return entries == _state_grant_entries((mode >> 6) & 0o7, reader, perm)
 
 
-def _grant_state_reader(path, perm, *, directory, reader):
-    """Give the state reader exactly `perm` on one entry this process owns.
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
-    Returns True when granted, None when there is nothing to grant, False when refused or failed.
-    The ACL is set through a descriptor opened without following symlinks and replaces the whole
-    access ACL with owner + reader, so group and other end with nothing whatever they had."""
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+def _grant_open_entry(descriptor, perm, *, directory, reader):
+    """Give the state reader exactly `perm` on an open entry this process owns.
+
+    Returns True when granted, False when refused; raises OSError when the grant cannot be read or
+    set. The new ACL replaces the whole access ACL with owner + reader, so group and other end with
+    nothing whatever they had, and a failed setxattr leaves the entry as it was."""
+    info = os.fstat(descriptor)
     if directory:
-        flags |= os.O_DIRECTORY
+        kind_ok = stat.S_ISDIR(info.st_mode)
+    else:
+        # A second link could be another file's name, e.g. auth.json.
+        kind_ok = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+    if not kind_ok or info.st_uid != os.geteuid():
+        return False
+    # A default ACL would pass the grant on to every new file below it.
+    if directory and _acl_entries(descriptor, _ACL_DEFAULT_XATTR) != ():
+        return False
+    wanted = _state_grant_entries((stat.S_IMODE(info.st_mode) >> 6) & 0o7, reader, perm)
+    if _acl_entries(descriptor) != wanted:
+        encoded = struct.pack("<I", _ACL_XATTR_VERSION) + b"".join(
+            struct.pack("<HHI", *entry) for entry in wanted
+        )
+        os.setxattr(descriptor, _ACL_ACCESS_XATTR, encoded)
+    return True
+
+
+def _grant_state_reader(name, perm, *, directory, reader, dir_fd):
+    """Grant on `name` in the directory `dir_fd`, never through a symlink.
+
+    Returns True when granted, None when there is nothing to grant, False when refused or failed."""
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS if directory else _FILE_OPEN_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
         return None
     except OSError:
         return False
     try:
-        info = os.fstat(descriptor)
-        if directory:
-            kind_ok = stat.S_ISDIR(info.st_mode)
-        else:
-            # A second link could be another file's name, e.g. auth.json.
-            kind_ok = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-        if not kind_ok or info.st_uid != os.geteuid():
-            return False
-        # A default ACL would pass the grant on to every new file below it.
-        if directory and _acl_entries(descriptor, _ACL_DEFAULT_XATTR) != ():
-            return False
-        wanted = _state_grant_entries((stat.S_IMODE(info.st_mode) >> 6) & 0o7, reader, perm)
-        if _acl_entries(descriptor) != wanted:
-            encoded = struct.pack("<I", _ACL_XATTR_VERSION) + b"".join(
-                struct.pack("<HHI", *entry) for entry in wanted
-            )
-            os.setxattr(descriptor, _ACL_ACCESS_XATTR, encoded)
-        return True
+        return _grant_open_entry(descriptor, perm, directory=directory, reader=reader)
     except OSError:
         return False
     finally:
@@ -414,25 +422,44 @@ def grant_state_read(runtime_home):
         return []
     failed = []
     parent = runtime_home.parent
+    # Each entry is reached from the descriptor of the one above, all opened without following a
+    # symlink: a run home swapped for a symlink must not carry the file grants to where it points.
     try:
-        parent_info = parent.lstat()
+        parent_fd = os.open(parent, _DIRECTORY_OPEN_FLAGS)
     except OSError:
-        parent_info = None
-    # The shared parent is touched only while it is this worker's own private directory: replacing
-    # its ACL must not take away access someone set on purpose.
-    if (
-        parent_info is not None
-        and stat.S_ISDIR(parent_info.st_mode)
-        and parent_info.st_uid == os.geteuid()
-        and _private_or_state_grant(parent, parent_info, ACL_LIST)
-    ):
-        if _grant_state_reader(parent, ACL_LIST, directory=True, reader=reader) is False:
-            failed.append(str(parent))
-    if _grant_state_reader(runtime_home, ACL_TRAVERSE, directory=True, reader=reader) is False:
-        failed.append(str(runtime_home))
-    for name in STATE_READ_FILES:
-        if _grant_state_reader(runtime_home / name, ACL_READ, directory=False, reader=reader) is False:
-            failed.append(str(runtime_home / name))
+        return [str(runtime_home)]
+    try:
+        parent_info = os.fstat(parent_fd)
+        # The shared parent is touched only while it is this worker's own private directory:
+        # replacing its ACL must not take away access someone set on purpose.
+        if parent_info.st_uid == os.geteuid() and _private_or_state_grant(parent_fd, parent_info, ACL_LIST):
+            try:
+                if not _grant_open_entry(parent_fd, ACL_LIST, directory=True, reader=reader):
+                    failed.append(str(parent))
+            except OSError:
+                failed.append(str(parent))
+        try:
+            home_fd = os.open(runtime_home.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return failed
+        except OSError:
+            return [*failed, str(runtime_home)]
+    finally:
+        os.close(parent_fd)
+    try:
+        try:
+            home_granted = _grant_open_entry(home_fd, ACL_TRAVERSE, directory=True, reader=reader)
+        except OSError:
+            home_granted = False
+        # The files are useless to the reader without the home, and a home that fails its checks
+        # is not trusted to hold them.
+        if not home_granted:
+            return [*failed, str(runtime_home)]
+        for name in STATE_READ_FILES:
+            if _grant_state_reader(name, ACL_READ, directory=False, reader=reader, dir_fd=home_fd) is False:
+                failed.append(str(runtime_home / name))
+    finally:
+        os.close(home_fd)
     return failed
 
 

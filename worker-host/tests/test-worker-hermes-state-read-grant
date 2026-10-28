@@ -192,6 +192,23 @@ with tempfile.TemporaryDirectory() as scratch:
     (home / "state.db-shm").unlink()
     (home / "state.db-wal").unlink()
 
+    # A run home swapped for a symlink grants nothing behind it, not even under the state names.
+    elsewhere = scratch / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    target_db = sqlite3.connect(elsewhere / "state.db")
+    native_schema(target_db)
+    for name in adapter.STATE_READ_FILES:
+        os.chmod(elsewhere / name, 0o600)
+    linked = root / "4a1c2b3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+    os.symlink(elsewhere, linked)
+    if str(linked) not in adapter.grant_state_read(linked):
+        raise SystemExit("a symlinked run home was not reported")
+    require_private(elsewhere)
+    for name in adapter.STATE_READ_FILES:
+        require_private(elsewhere / name)
+    target_db.close()
+    linked.unlink()
+
     # check_directory still refuses any other group or other access.
     for mode, reason in ((0o770, "group rwx"), (0o707, "other rwx"), (0o750, "group r-x"), (0o711, "other --x")):
         os.chmod(home, mode)
