@@ -347,14 +347,15 @@ def _state_grant_entries(owner_perm, reader_uid, perm):
     ]
 
 
-def _private_or_state_grant(target, info, perm):
+def _private_or_state_grant(target, info, perm, reader=None):
     """Owner-only, or owner plus exactly the state reader's `perm` and nothing for group or other.
 
     With an ACL the group mode bits are the ACL mask, so the grant shows up as group bits."""
     mode = stat.S_IMODE(info.st_mode)
     if not mode & 0o077:
         return True
-    reader = _state_reader_uid()
+    if reader is None:
+        reader = _state_reader_uid()
     if reader is None or mode & 0o077 != perm << 3:
         return False
     try:
@@ -442,14 +443,12 @@ def _grant_state_reader(name, perm, *, directory, reader, dir_fd):
         os.close(descriptor)
 
 
-def grant_state_read(runtime_home):
-    """Let the state reader list the run homes, enter this one and read state.db*; nothing else.
+def grant_state_read(runtime_home, reader):
+    """Let the state reader (uid `reader`) list the run homes, enter this one and read state.db*;
+    nothing else.
 
     Returns the names that could not be granted. A failure leaves the entry as it was (one
     setxattr either lands or not), so it never leaves broader access behind."""
-    reader = _state_reader_uid()
-    if reader is None:
-        return []
     failed = []
     parent = runtime_home.parent
     # Each entry is reached from the descriptor of the one above, all opened without following a
@@ -462,7 +461,7 @@ def grant_state_read(runtime_home):
         parent_info = os.fstat(parent_fd)
         # The shared parent is touched only while it is this worker's own private directory:
         # replacing its ACL must not take away access someone set on purpose.
-        if parent_info.st_uid == os.geteuid() and _private_or_state_grant(parent_fd, parent_info, ACL_LIST):
+        if parent_info.st_uid == os.geteuid() and _private_or_state_grant(parent_fd, parent_info, ACL_LIST, reader):
             try:
                 if not _grant_open_entry(parent_fd, ACL_LIST, directory=True, reader=reader):
                     failed.append(str(parent))
@@ -499,16 +498,20 @@ class StateReadGrant:
 
     def __init__(self, runtime_home):
         self.runtime_home = runtime_home
+        # Looked up once: the refresh runs every second for the whole run.
+        self.reader = _state_reader_uid()
         self.next_refresh = 0.0
         self.reported = False
 
     def refresh(self, *, force=False):
+        if self.reader is None:
+            return
         now = time.monotonic()
         if not force and now < self.next_refresh:
             return
         self.next_refresh = now + STATE_GRANT_REFRESH_SECONDS
         try:
-            failed = grant_state_read(self.runtime_home)
+            failed = grant_state_read(self.runtime_home, self.reader)
         except Exception:  # the grant is optional; nothing in it may end a run
             failed = [str(self.runtime_home)]
         if failed and not self.reported:

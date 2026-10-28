@@ -32,12 +32,16 @@ loader.exec_module(adapter)
 
 READER = os.environ.get("STATE_READ_TEST_USER", "nobody")
 try:
-    pwd.getpwnam(READER)
+    READER_UID = pwd.getpwnam(READER).pw_uid
 except KeyError:
     raise SystemExit(f"grant user {READER} does not exist; set STATE_READ_TEST_USER")
 adapter.STATE_READER_NAME = READER
 # Workers run with UMask=0077.
 os.umask(0o077)
+
+
+def grant_state_read(home):
+    return adapter.grant_state_read(home, READER_UID)
 
 
 def acl(path):
@@ -163,7 +167,7 @@ def other_owner_case():
         database.close()
         os.chown(home / "state.db", 1, 1)
         os.chmod(home / "state.db", 0o600)
-        if str(home / "state.db") not in adapter.grant_state_read(home):
+        if str(home / "state.db") not in grant_state_read(home):
             raise SystemExit("a state.db owned by another uid was not reported")
         require_private(home / "state.db")
         require_granted(home, "--x", owner="rwx")
@@ -171,7 +175,7 @@ def other_owner_case():
         subprocess.run(["setfacl", "-b", str(home)], check=True)
         os.chown(home, 1, 1)
         os.chown(home / "state.db", 0, 0)
-        if str(home) not in adapter.grant_state_read(home):
+        if str(home) not in grant_state_read(home):
             raise SystemExit("a run home owned by another uid was not reported")
         require_private(home)
         require_private(home / "state.db")
@@ -274,6 +278,19 @@ with tempfile.TemporaryDirectory() as scratch:
         raise SystemExit("an unforced refresh ran inside the refresh interval")
     grant.refresh(force=True)
 
+    # The grant user is looked up once per run, not at every refresh.
+    lookups = []
+    real_getpwnam = adapter.pwd.getpwnam
+    adapter.pwd.getpwnam = lambda name: lookups.append(name) or real_getpwnam(name)
+    try:
+        counted = adapter.StateReadGrant(home)
+        for _ in range(3):
+            counted.refresh(force=True)
+    finally:
+        adapter.pwd.getpwnam = real_getpwnam
+    if lookups != [READER]:
+        raise SystemExit(f"the grant user was looked up {len(lookups)} times for one run, not once")
+
     # The adapter's own resume checks accept the granted home and database.
     adapter.prepare_runtime_home(home, fresh=False, access="write")
     adapter._native_state_connection(home).close()
@@ -283,14 +300,14 @@ with tempfile.TemporaryDirectory() as scratch:
     for name in ("state.db-wal", "state.db-shm"):
         (home / name).unlink(missing_ok=True)
     os.symlink("auth.json", home / "state.db-shm")
-    if str(home / "state.db-shm") not in adapter.grant_state_read(home):
+    if str(home / "state.db-shm") not in grant_state_read(home):
         raise SystemExit("a state.db-shm symlink to auth.json was not reported")
     require_private(home / "auth.json")
     (home / "state.db-shm").unlink()
 
     # A second link to auth.json under a state name is refused.
     os.link(home / "auth.json", home / "state.db-wal")
-    if str(home / "state.db-wal") not in adapter.grant_state_read(home):
+    if str(home / "state.db-wal") not in grant_state_read(home):
         raise SystemExit("a state.db-wal hard link to auth.json was not reported")
     require_private(home / "auth.json")
     (home / "state.db-wal").unlink()
@@ -301,7 +318,7 @@ with tempfile.TemporaryDirectory() as scratch:
         if (home / name).exists():
             os.rename(home / name, aside)
         os.rename(home / "auth.json", home / name)
-        if str(home / name) not in adapter.grant_state_read(home):
+        if str(home / name) not in grant_state_read(home):
             raise SystemExit(f"auth.json renamed to {name} was not reported")
         require_private(home / name)
         os.rename(home / name, home / "auth.json")
@@ -312,13 +329,13 @@ with tempfile.TemporaryDirectory() as scratch:
     # yet filled in is left for the next refresh without a report.
     for name in ("state.db-wal", "state.db-shm"):
         (home / name).write_bytes(b"")
-    if adapter.grant_state_read(home):
+    if grant_state_read(home):
         raise SystemExit("an empty -wal or -shm was refused")
     for name in ("state.db-wal", "state.db-shm"):
         require_granted(home / name, "r--")
     (home / "state.db-shm").unlink()
     (home / "state.db-shm").write_bytes(bytes(32768))
-    if adapter.grant_state_read(home):
+    if grant_state_read(home):
         raise SystemExit("a zero-filled -shm was reported")
     require_private(home / "state.db-shm")
     for name in ("state.db-wal", "state.db-shm"):
@@ -333,7 +350,7 @@ with tempfile.TemporaryDirectory() as scratch:
         os.chmod(elsewhere / name, 0o600)
     linked = root / "4a1c2b3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
     os.symlink(elsewhere, linked)
-    if str(linked) not in adapter.grant_state_read(linked):
+    if str(linked) not in grant_state_read(linked):
         raise SystemExit("a symlinked run home was not reported")
     require_private(elsewhere)
     for name in adapter.STATE_READ_FILES:
@@ -356,7 +373,7 @@ with tempfile.TemporaryDirectory() as scratch:
     adapter.check_directory(home, fresh=False)
     subprocess.run(["setfacl", "-d", "-m", f"u:{READER}:r--", str(home)], check=True)
     refused(home, "a resume home with a default ACL")
-    if str(home) not in adapter.grant_state_read(home):
+    if str(home) not in grant_state_read(home):
         raise SystemExit("a home with a default ACL was granted without a report")
     subprocess.run(["setfacl", "-k", str(home)], check=True)
     adapter.check_directory(home, fresh=False)
@@ -397,7 +414,7 @@ with tempfile.TemporaryDirectory() as scratch:
     before = acl(foreign)
     foreign_home = foreign / "7c8d9e0f-1a2b-4c3d-9e4f-5a6b7c8d9e0f"
     adapter.prepare_runtime_home(foreign_home, fresh=True, access="write")
-    failed = adapter.grant_state_read(foreign_home)
+    failed = grant_state_read(foreign_home)
     if failed:
         raise SystemExit(f"a parent with a foreign grant was reported: {failed}")
     if acl(foreign) != before:
