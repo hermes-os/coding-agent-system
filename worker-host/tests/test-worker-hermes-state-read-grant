@@ -9,6 +9,8 @@ second user shows that the ACL, not ownership, carries the access.
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
+import contextlib
+import io
 import json
 import os
 import pwd
@@ -16,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 
 
 WORKER_HOST = Path(__file__).resolve().parents[1]
@@ -81,6 +84,99 @@ def refused(home, reason):
     raise SystemExit(f"{reason}: the resume home was accepted")
 
 
+# A stand-in for the pinned Hermes: it opens state.db in WAL mode and keeps it open, chmods the
+# database files 0600 and its home 0700 as Hermes does, waits for the adapter's once-a-second
+# refresh to restore the grant (a little over a second) and records whether it saw it, then resets
+# the modes again and exits without closing, so -wal and -shm stay and only the refresh after exit
+# can grant them again.
+FAKE_HERMES = """
+import os, sqlite3, sys, time
+home = os.environ["HERMES_HOME"]
+paths = [os.path.join(home, name) for name in ("state.db", "state.db-wal", "state.db-shm")]
+os.chmod(home, 0o700)
+db = sqlite3.connect(paths[0])
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)")
+db.execute("INSERT INTO sessions (id) VALUES ('20261028_130000_abcdef')")
+db.commit()
+
+def secure():
+    for path in paths:
+        os.chmod(path, 0o600)
+    os.chmod(home, 0o700)
+
+def granted():
+    # With an ACL the group bits are its mask: r-- on the files, --x on the home.
+    return (all(os.stat(path).st_mode & 0o070 == 0o040 for path in paths)
+            and os.stat(home).st_mode & 0o070 == 0o010)
+
+secure()
+deadline = time.monotonic() + 2.5
+while not granted() and time.monotonic() < deadline:
+    time.sleep(0.02)
+with open(sys.argv[1], "w") as report:
+    report.write("granted" if granted() else "missing")
+secure()
+os.write(2, b"session_id: 20261028_130000_abcdef\\n")
+os.write(1, b"done\\n")
+os._exit(0)
+"""
+
+
+def run_adapter_main(runtime_home, fake, report):
+    """Run the adapter's main() for one fresh write run against the fake Hermes."""
+    original_runtime, original_stdin = adapter.resolve_hermes_runtime, sys.stdin
+    original_env = {name: os.environ.get(name) for name in ("AGENT_WORKER_MANAGED", "AGENT_ACCESS_MODE")}
+    # The fake reads the report path as its first argument; the adapter appends its own after it.
+    adapter.resolve_hermes_runtime = lambda: (sys.executable, "-I", str(fake), str(report))
+    sys.stdin = types.SimpleNamespace(buffer=io.BytesIO(b"read the state grant\n"))
+    os.environ.update(AGENT_WORKER_MANAGED="1", AGENT_ACCESS_MODE="write")
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            returncode = adapter.main([
+                "--provider", "openrouter", "--model", "test/model", "--effort", "low", "--access", "write",
+                "--runtime-home", str(runtime_home),
+                "--broker-session-id", "0f6c1e9a-2b3d-4c5e-8f70-112233445566", "--fresh-session",
+            ])
+    finally:
+        adapter.resolve_hermes_runtime, sys.stdin = original_runtime, original_stdin
+        for name, value in original_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    events = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+    return returncode, events
+
+
+def other_owner_case():
+    """As root (real, or mapped in a user namespace): a state file or run home owned by another uid
+    is never granted, though root could set the ACL."""
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch) / ".hermes-worker"
+        root.mkdir(mode=0o700)
+        home = root / "6e5d4c3b-2a19-4807-9f6e-5d4c3b2a1908"
+        home.mkdir(mode=0o700)
+        database = sqlite3.connect(home / "state.db")
+        native_schema(database)
+        database.close()
+        os.chown(home / "state.db", 1, 1)
+        os.chmod(home / "state.db", 0o600)
+        if str(home / "state.db") not in adapter.grant_state_read(home):
+            raise SystemExit("a state.db owned by another uid was not reported")
+        require_private(home / "state.db")
+        require_granted(home, "--x", owner="rwx")
+
+        subprocess.run(["setfacl", "-b", str(home)], check=True)
+        os.chown(home, 1, 1)
+        os.chown(home / "state.db", 0, 0)
+        if str(home) not in adapter.grant_state_read(home):
+            raise SystemExit("a run home owned by another uid was not reported")
+        require_private(home)
+        require_private(home / "state.db")
+
+
 def native_schema(connection):
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute(
@@ -91,6 +187,10 @@ def native_schema(connection):
     connection.execute("CREATE TABLE IF NOT EXISTS messages (session_id TEXT, timestamp REAL)")
     connection.commit()
 
+
+if sys.argv[1:] == ["--other-owner"]:
+    other_owner_case()
+    raise SystemExit(0)
 
 with tempfile.TemporaryDirectory() as scratch:
     scratch = Path(scratch)
@@ -241,5 +341,47 @@ with tempfile.TemporaryDirectory() as scratch:
             raise SystemExit(f"an open state.db was refused with {exc.code}")
     else:
         raise SystemExit("an other-readable state.db was accepted at resume")
+
+    # A whole run through main(): the grant holds while Hermes runs and after it exits.
+    fake = scratch / "fake-hermes.py"
+    fake.write_text(FAKE_HERMES)
+    report = scratch / "fake-hermes.report"
+    run_home = root / "1b2c3d4e-5f60-4718-8a9b-0c1d2e3f4a5b"
+    returncode, events = run_adapter_main(run_home, fake, report)
+    if returncode != 0 or events[-1].get("event") != "final":
+        raise SystemExit(f"the fake run did not finish: {returncode} {events}")
+    if any(event.get("event") == "warning" for event in events):
+        raise SystemExit(f"a clean run reported a grant failure: {events}")
+    if report.read_text() != "granted":
+        raise SystemExit("while Hermes ran, its chmod 0600 was not undone by the adapter's refresh")
+    require_granted(root, "r-x", owner="rwx")
+    require_granted(run_home, "--x", owner="rwx")
+    for name in adapter.STATE_READ_FILES:
+        require_granted(run_home / name, "r--")
+    for name in ("auth.json", "config.yaml"):
+        require_private(run_home / name)
+
+    # A parent someone else gave access to is left exactly as it is, and that is no failure.
+    foreign = scratch / "foreign-parent"
+    foreign.mkdir(mode=0o700)
+    subprocess.run(["setfacl", "-m", "u:daemon:r-x", str(foreign)], check=True)
+    before = acl(foreign)
+    foreign_home = foreign / "7c8d9e0f-1a2b-4c3d-9e4f-5a6b7c8d9e0f"
+    adapter.prepare_runtime_home(foreign_home, fresh=True, access="write")
+    failed = adapter.grant_state_read(foreign_home)
+    if failed:
+        raise SystemExit(f"a parent with a foreign grant was reported: {failed}")
+    if acl(foreign) != before:
+        raise SystemExit(f"the parent's foreign grant was replaced: {sorted(before)} -> {sorted(acl(foreign))}")
+    require_granted(foreign_home, "--x", owner="rwx")
+
+if os.geteuid() == 0:
+    other_owner_case()
+elif subprocess.run(["unshare", "--map-auto", "--map-root-user", "true"], capture_output=True).returncode == 0:
+    # Root mapped in a user namespace can set an ACL on a file it does not own, as real root can.
+    subprocess.run(["unshare", "--map-auto", "--map-root-user", sys.executable, "-B", __file__, "--other-owner"],
+                   check=True)
+else:
+    print("SKIP other-owner case: needs root or an unprivileged user namespace with /etc/subuid ranges")
 
 print(f"{READER} reads state.db, -wal and -shm and traverses to them; auth.json, config.yaml and new files stay private")
