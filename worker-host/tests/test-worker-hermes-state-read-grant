@@ -178,18 +178,21 @@ with tempfile.TemporaryDirectory() as scratch:
     adapter.prepare_runtime_home(home, fresh=False, access="write")
     adapter._native_state_connection(home).close()
 
-    # A planted symlink or second link under a state name is never granted.
+    # A planted symlink under a state name is never followed.
     writer.close()
     for name in ("state.db-wal", "state.db-shm"):
         (home / name).unlink(missing_ok=True)
     os.symlink("auth.json", home / "state.db-shm")
-    os.link(home / "auth.json", home / "state.db-wal")
-    refusing = adapter.StateReadGrant(home)
-    refusing.refresh(force=True)
-    if not refusing.reported:
-        raise SystemExit("a planted symlink or hard link was not reported")
+    if str(home / "state.db-shm") not in adapter.grant_state_read(home):
+        raise SystemExit("a state.db-shm symlink to auth.json was not reported")
     require_private(home / "auth.json")
     (home / "state.db-shm").unlink()
+
+    # A second link to auth.json under a state name is refused.
+    os.link(home / "auth.json", home / "state.db-wal")
+    if str(home / "state.db-wal") not in adapter.grant_state_read(home):
+        raise SystemExit("a state.db-wal hard link to auth.json was not reported")
+    require_private(home / "auth.json")
     (home / "state.db-wal").unlink()
 
     # A run home swapped for a symlink grants nothing behind it, not even under the state names.
