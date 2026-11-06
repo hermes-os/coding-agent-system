@@ -255,3 +255,8 @@ How found: Red Acre runs on sim 2026-10-27: 2f34ad2a (check-scripts fix2), e2eeb
 - Where: `worker-host/bin/model-usage-watch-v20260930.py` (`decide`, `read_usage`), output `model-routing-live.json`.
 - What happens: on 2026-10-28 06:20 the watcher wrote `phase: hold-anthropic-closed` with `session_used: 100.0` (reset 16:10 UTC) and `week_used: 0.0`. Hermes reports that the session is not full. Every role reads HOLD, so a coordinator that follows the routing file launches nothing.
 - Found: Foreman read the routing file before relaunching the Red Acre lanes after the weekly reset, 2026-10-28.
+
+## validate.sh fails 10 dispatch tests when TMPDIR is inside a git work tree
+- Where: `tests/test_dispatch.py` (fixtures from `tempfile`), run by `./validate.sh`.
+- What happens: Foreman's sessions set `TMPDIR` to `~/.hermes/profiles/foreman/cache/scratch`, inside the tracked foreman profile. The "non-repository" fixtures then resolve to that profile's git root, and 8 tests fail and 2 error (`fixture unexpectedly belongs to /home/hermes/.hermes/profiles/foreman`, `Git repository marker ... does not match resolved root`). With `TMPDIR=/tmp` all 34 pass.
+- Found: `./validate.sh` from a Foreman session after beff3e3, 2026-11-06.
