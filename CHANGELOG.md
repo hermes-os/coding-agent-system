@@ -4,6 +4,7 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- `worker-pane.sh` knows the new `pixel-lighter` repo, so its run tabs open in a `pixel-lighter` herdr workspace instead of the catch-all `workers` one.
 - The host owner (`hermes`) can read each Hermes worker run's `state.db`,
   `state.db-wal` and `state.db-shm`, so a read-only viewer such as shoulder can
   show what a run is doing. The adapter grants exactly these POSIX ACLs and

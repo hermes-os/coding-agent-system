@@ -16,7 +16,7 @@ label=${2:-${run:0:8}}
 viewer=$(dirname "$(readlink -f "$0")")/watch-worker.py
 root=/home/hermes/Projects/hermes-os
 # ashwren-legacy comes before ashwren so the longer name wins.
-repos="ashwren-legacy ashwren coding-agent-system coding-agent-vm-setup hearth hermes-apple-bridge imessage-sidecar inkwell kestrel linq-sidecar marquee marvin-legal-management nomad red-acre rpo-wellness tape-machine"
+repos="ashwren-legacy ashwren coding-agent-system coding-agent-vm-setup hearth hermes-apple-bridge imessage-sidecar inkwell kestrel linq-sidecar marquee marvin-legal-management nomad pixel-lighter red-acre rpo-wellness tape-machine"
 
 meta=/var/lib/agent-worker/.local/state/agent-workers/runs/$run/metadata.json
 host=${WORKER_HOST:-}
