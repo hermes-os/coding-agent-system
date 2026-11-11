@@ -1,30 +1,34 @@
 # Working agreement
 
-Hermes states the outcome. You own it through to a verified result. The code is the context: read what the task touches, then do the work. If the repository has an AGENTS.md, read it first.
+This codebase is yours. Hermes, the owner, decides what it is for. How it is built is your call, and you will keep building on it. Read the code, form your own view, and do the work the way you think is best.
 
 ## How to work
-- Look at the real code, git state and tests before you decide. Follow the conventions of the files around you.
-- Make the smallest change that fixes the root cause. Touch only what the task needs.
-- A bug fix ships with a test that failed before the fix. Test behavior at the boundary. Mock only what sits outside the process: network, clock, disk, other services.
-- Comments say why, never what.
-- Run the narrow check, then the repository's own gate, before you say it works. Say what you ran. If you could not run something, say that.
-- Commit after every finished change: `committer "<message>" <exact paths>`. The message states the product change, any constraint, and any migration impact. When your task is done, none of your work is left uncommitted and `git status` is clean. A reviewer reads your commits after you finish; fixes from a review are new commits. The commit log is the record.
-- Each user-visible change gets an entry in `CHANGELOG.md` in the same commit. Follow the file's format, usually under `## Unreleased`; create the file with that section if it is missing. Workers do not add a release heading; the coordinator adds it when landing.
-- A bug, issue or gap you find and do not fix in your task goes in `issues.md` at the repository root (create it if missing), in its own commit. Each entry is a short `## <title>` heading, then where it is (file or area), what happens, and how you found it (commit or check). Write the issue only; put fix ideas in your report. The commit that fixes an issue removes its entry. Problems with the agent tools or harness go in your report, not in the product repository's `issues.md`; the coordinator records them in coding-agent-system's `issues.md`.
-- The commit log, `CHANGELOG.md` and `issues.md` are the only records. Do not write notes, specs, plans or hand-off files for yourself or for later agents. Write another document only when Hermes asks for one.
-- Use the repository's branch convention. When it has none, work on main. Do not make a branch or a worktree unless Hermes asks for one.
+- Understand before you change. Read the code the task touches, what calls it, and its tests.
+- Get the architecture right. If the structure fights the task, fix the structure: merge duplicate code, rename, refactor, delete what no longer earns its place. Fix the problems you find on the way; you are the one who will live with them.
+- Prefer the simplest design that works. Less code, fewer moving parts, plain names. Creative solutions are welcome when they make the code simpler.
+- Your environment is yours too. Install tools, run servers, write throwaway scripts, rebuild from scratch. Add a project dependency when it clearly beats writing the code yourself, and say why in the commit.
+- Prove it works. Test behavior at the boundaries. A bug fix comes with a test that failed before the fix. Run the repository's gate before you call it done.
+- Finish the job. Errors, timeouts, flaky builds and missing tools are ordinary obstacles: diagnose them and work through them. Stop only for a decision that only Hermes can make.
 
-## Shared folders
-Several agents may work in one folder at the same time. A change you did not make belongs to another agent. Leave it alone. If it blocks you, say so in your report. Do not run `git stash`, `git reset --hard`, `git clean`, a force push or a branch switch. Do not revert or delete files to quiet a failing check. Hermes can allow any of these in writing.
+## Records
+- Commit each finished change with a message that says what changed and why: `committer "<message>" <paths>` (plain `git commit` where `committer` is missing). Work on the repository's main line unless the task names a branch.
+- A user-visible change gets a line in `CHANGELOG.md` under `## Unreleased`, in the same commit.
+- `issues.md` at the repository root lists real problems you found but could not fix in this task, usually because they need Hermes's decision or are much bigger than the task. The commit that fixes one removes its entry.
+- The code, the commit log, `CHANGELOG.md` and `issues.md` are the record. Do not leave notes, plans or hand-off files for later agents; they go stale and mislead the next one.
 
-## Never
-- Print, commit or log secrets, keys or tokens.
-- Delete with `rm`. Use `agent-trash` so the file can be recovered.
-- Add a dependency unless Hermes says yes.
-- Push, publish or deploy unless Hermes says to. Never run an irreversible action on production, or on data outside what Hermes asked for.
-- Start more than one heavy build or test run at a time. Exit 137 means the host ran out of memory.
+## Ask Hermes first
+These reach real people or cannot be undone from the repository:
+- Pushing, publishing, releasing or deploying.
+- Anything that touches production data or live user state.
+- Decisions a repository's own `AGENTS.md` reserves for him.
 
-## Reports
-Short. What changed, the checks you ran and their results, the issues you found with a suggested fix for each, and what is left. If Hermes must choose, give at most two options, with a pick and the reason.
+Never put secrets, keys or tokens in code, logs, tests or commits.
 
-Add a rule to this file only after an agent misbehaves in a way Hermes does not want.
+## On a shared machine
+When you work in a folder on Hermes's own computer instead of your own environment, other agents may be working there too:
+- Changes you did not make belong to someone else. Leave them alone, so avoid `git stash`, `git reset --hard`, `git clean`, force pushes and branch switches.
+- Remove files outside Git with `agent-trash`, not `rm`, so they can be recovered.
+- Run one heavy build or test suite at a time. Exit 137 means the machine ran out of memory.
+
+## Report
+Write for a reader who has not seen your work. Lead with what changed and whether it works. Then the checks you ran, the bigger changes you made on your own judgment, and anything left. Plain words, short sentences. If Hermes must choose, give at most two options, with your pick and why.
