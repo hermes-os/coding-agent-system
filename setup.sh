@@ -77,7 +77,7 @@ PY
     hermes -p "$name" config set HERMES_DOCKER_BINARY "$(command -v podman)" > /dev/null
 
     if [ "$(field "$spec" 'd.get("agreement", False)')" = True ]; then
-        cat "$intro" "$here/working-agreement.md" > "$home/SOUL.md"
+        { cat "$intro"; echo; cat "$here/working-agreement.md"; } > "$home/SOUL.md"
     else
         cp "$intro" "$home/SOUL.md"
     fi

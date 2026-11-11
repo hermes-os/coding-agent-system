@@ -1,0 +1,28 @@
+{
+  "description": "Reviewer. Judges a worker's finished kanban card from inside a workbench container that sees the repositories read-only.",
+  "agreement": true,
+  "skills": ["sdlc-review"],
+  "config": {
+    "model.provider": "openai-codex",
+    "model.default": "gpt-5.6-terra",
+    "fallback_providers": [],
+    "agent.reasoning_effort": "high",
+    "memory.memory_enabled": false,
+    "memory.user_profile_enabled": false,
+    "approvals.mode": "off",
+    "toolsets": ["terminal", "file", "code_execution", "web", "vision", "skills", "todo", "kanban"],
+    "terminal.backend": "docker",
+    "terminal.docker_image": "localhost/workbench:latest",
+    "terminal.docker_mount_cwd_to_workspace": true,
+    "terminal.docker_volumes": [
+      "/home/hermes/workbench:/home/hermes/workbench:ro",
+      "/home/hermes/.cache/workbench:/cache"
+    ],
+    "terminal.container_persistent": false,
+    "terminal.docker_persist_across_processes": false,
+    "terminal.container_cpu": 2,
+    "terminal.container_memory": 7168,
+    "terminal.container_disk": 0,
+    "terminal.timeout": 900
+  }
+}
