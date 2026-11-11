@@ -1804,10 +1804,14 @@ def internal_run(run_id: str, packet_file: Path) -> int:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait()
             return_code = 143
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
+            # Helpers shared with the client stop with SystemExit("repo-worker: ...").
+            # Here that is a failed run: without this the supervisor exits and the
+            # record stays "running" with no process behind it.
+            reason = str(exc) if isinstance(exc, SystemExit) else f"{type(exc).__name__}: {exc}"
             with log_path.open("a", encoding="utf-8") as log:
                 secure_runtime_file(log_path)
-                log.write(f"repo-worker supervisor error: {type(exc).__name__}: {exc}\n")
+                log.write(f"repo-worker supervisor error: {reason}\n")
             return_code = 125
 
         final_text: str | None = None

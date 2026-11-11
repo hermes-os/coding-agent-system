@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""A run whose provider is not installed ends as failed, with the reason."""
+
+from __future__ import annotations
+
+from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+from unittest.mock import patch
+import uuid
+
+
+# Resolved, so a symlinked client copy of this test still tests the repository files.
+WORKER_HOST = Path(__file__).resolve().parents[1]
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo = root / "repo"
+        empty_bin = root / "bin"
+        for folder in (repo, empty_bin, root / "prompts"):
+            folder.mkdir()
+        # The runner reads these when it loads, so they are set first.
+        os.environ["AGENT_WORKER_STATE_DIR"] = str(root / "state")
+        os.environ["AGENT_WORKER_PROMPT_DIR"] = str(root / "prompts")
+        os.environ.pop("AGENT_WORKER_MANAGED", None)
+        core = SourceFileLoader(
+            "repo_worker_run_ends_gate", str(WORKER_HOST / "libexec" / "agent-worker-runner")
+        ).load_module()
+
+        run_id = str(uuid.uuid4())
+        run_root = core.RUNS_DIR / run_id
+        run_root.mkdir(parents=True)
+        prompt = core.PROMPT_DIR / f"{run_id}.prompt"
+        prompt.write_text("Reply with the word ok.\n", encoding="utf-8")
+        metadata = {
+            "schemaVersion": 4,
+            "runId": run_id,
+            "runtimeRunId": run_id,
+            "agent": "codex",
+            "model": "gpt-5.6-luna",
+            "effort": "max",
+            "role": "worker",
+            "mode": "task",
+            "access": "write",
+            "repo": str(repo),
+            "cwd": str(repo),
+            "workerRepo": str(repo),
+            "workerCwd": str(repo),
+            "status": "queued",
+            "createdAt": core.utc_now(),
+            "updatedAt": core.utc_now(),
+            "sessionId": None,
+            "resumeSession": False,
+            "unit": f"agent-worker-{run_id.replace('-', '')}.service",
+            "logPath": str(run_root / "stream.log"),
+            "outputPath": str(run_root / "final.txt"),
+        }
+        (run_root / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        # The privacy probe checks the real host and has nothing to do with this
+        # case, so it passes here. PATH holds no codex, as on a host without it.
+        probe_ok = subprocess.CompletedProcess(args=[], returncode=0)
+        with patch.object(core.subprocess, "run", return_value=probe_ok), patch.dict(
+            os.environ, {"PATH": str(empty_bin)}
+        ):
+            try:
+                return_code = core.internal_run(run_id, prompt)
+            except SystemExit as exc:
+                raise AssertionError(
+                    f"the supervisor exited and left the run {core.load_metadata(run_id)['status']!r}: {exc}"
+                ) from exc
+
+        saved = core.load_metadata(run_id)
+        assert return_code == 125, return_code
+        assert saved["status"] == "failed", saved["status"]
+        assert saved["status"] in core.TERMINAL_STATES
+        # The reason reaches the person who asks for the status.
+        detail = core.status_payload(saved, 900).get("failureDetail", "")
+        assert "required executable not found: codex" in detail, detail
+
+    print("worker run ends OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
