@@ -1,4 +1,4 @@
-# The workbench: one image for every worker and author run.
+# The workbench: one image for every worker, reviewer and author run.
 #
 # Hermes runs the agent on the host and sends its shell, file and code tools
 # into a container made from this image (terminal.backend: docker, on rootless
@@ -44,7 +44,7 @@ RUN pacman-key --init && pacman-key --populate archlinux \
 COPY --chown=$WORKER_UID:$WORKER_UID --chmod=755 bin/ /usr/local/bin/
 
 # Hermes mounts the profile's skills and attachments under /root/.hermes, on a
-# /root it makes with this folder's mode. The worker has to be able to enter it.
+# /root it makes with this folder's mode. The agent has to be able to enter it.
 RUN chmod 755 /root
 
 # Build caches live under /cache. A run mounts a shared host folder there, so a

@@ -1,5 +1,5 @@
 #!/bin/sh
-# pacman for a worker who is not root. The worker owns the system files in this
+# pacman for an agent who is not root. The agent owns the system files in this
 # image, so the only thing pacman lacks is the name "root". fakeroot supplies it.
 [ "$(id -u)" = 0 ] && exec /usr/bin/pacman "$@"
 exec fakeroot -- /usr/bin/pacman "$@"

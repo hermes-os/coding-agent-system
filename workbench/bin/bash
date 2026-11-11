@@ -4,8 +4,11 @@
 #
 # Hermes starts the container with the power to read and write any file
 # whatever its permissions (CAP_DAC_OVERRIDE, CAP_CHOWN, CAP_FOWNER), and podman
-# hands that power to the worker's user. The host user has no such power, so a
+# hands that power to the agent's user. The host user has no such power, so a
 # test that expects "permission denied" would fail here and pass there. This
 # drops it before the real bash starts. Nothing in the image needs it: the
-# worker owns the system files (see the Containerfile).
-exec setpriv --inh-caps=-all --ambient-caps=-all /usr/bin/bash "$@"
+# agent owns the system files (see the Containerfile).
+#
+# Both commands are named by full path: a test that starts bash with a PATH
+# holding only its own tools still gets a shell, as it does on the host.
+exec /usr/bin/setpriv --inh-caps=-all --ambient-caps=-all /usr/bin/bash "$@"
