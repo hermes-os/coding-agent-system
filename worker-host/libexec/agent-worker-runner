@@ -917,45 +917,6 @@ def assert_capacity() -> None:
 
 FAILURE_DETAIL_SCAN_BYTES = 65536
 
-# Provider availability, not task failure: a launch that dies because the
-# provider is dry relaunches on the next configured agent. Task failures
-# never match — a wrong answer on one provider is not fixed by another.
-LAUNCH_GRACE_SECONDS = 60
-LAUNCH_POLL_SECONDS = 3
-AVAILABILITY_CLASSES = (
-    (
-        "usage-limit",
-        re.compile(
-            r"usage limit|out of credits|purchase more credits|credit balance"
-            r"|quota (?:exceeded|exhausted)|billing",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "rate-limit",
-        re.compile(r"rate limit|\b429\b|overloaded", re.IGNORECASE),
-    ),
-    (
-        "auth",
-        re.compile(
-            r"failed to authenticate|oauth|\b401\b|unauthorized"
-            r"|invalid api key|(?:session|token) expired"
-            r"|organization has disabled claude subscription access",
-            re.IGNORECASE,
-        ),
-    ),
-)
-
-
-def availability_class(detail: str | None) -> str | None:
-    if not detail:
-        return None
-    for name, pattern in AVAILABILITY_CLASSES:
-        if pattern.search(detail):
-            return name
-    return None
-
-
 def model_policy() -> dict[str, object]:
     if MANAGED_RUNTIME:
         path = Path(
@@ -984,22 +945,6 @@ def model_policy() -> dict[str, object]:
     ):
         raise SystemExit("repo-worker: worker default is invalid")
     return value
-
-
-def fallback_agent_order() -> tuple[str, ...]:
-    policy = model_policy()
-    providers = []
-    for alias in policy["order"]:
-        raw = policy["models"].get(alias)
-        worker = raw.get("worker") if isinstance(raw, dict) else None
-        provider = worker.get("agent") if isinstance(worker, dict) else None
-        if provider not in {"codex", "claude", "kimi", "hermes"}:
-            raise SystemExit("repo-worker: model policy order is invalid")
-        if provider not in providers:
-            providers.append(provider)
-    if not {"codex", "claude", "kimi"}.issubset(providers):
-        raise SystemExit("repo-worker: model policy omits a worker provider")
-    return tuple(providers)
 
 
 def resolve_worker_selection(
@@ -1068,104 +1013,6 @@ def resolve_worker_selection(
     resolved_model = str(worker["model"])
     resolved_effort = str(effort or worker["effort"])
     return resolved_agent, resolved_model, resolved_effort
-
-
-def apply_launch_fallback(args, summary, *, submit, read_status):
-    """Relaunch an unassigned availability-killed task on the next agent.
-
-    Watches the fresh run for LAUNCH_GRACE_SECONDS; a terminal failure whose
-    detail matches an availability class relaunches the same packet once per
-    remaining provider in the shared model order, recording each substitution in
-    fallbackFrom. The privileged broker is unchanged — the retry is entirely
-    caller-side."""
-    if args.agent == "hermes" or args.model is not None:
-        return summary
-    tried = [str(summary.get("agent"))]
-    events: list[dict[str, object]] = []
-    current = summary
-    while True:
-        run_id = str(current.get("runId"))
-        deadline = time.monotonic() + LAUNCH_GRACE_SECONDS
-        payload: dict[str, object] | None = None
-        while time.monotonic() < deadline:
-            payload = read_status(run_id)
-            if str(payload.get("status")) in TERMINAL_STATES:
-                break
-            time.sleep(LAUNCH_POLL_SECONDS)
-        if payload is None or str(payload.get("status")) not in TERMINAL_STATES:
-            if events:
-                current = dict(current)
-                current["fallbackFrom"] = events
-            return current
-        if str(payload.get("status")) != "failed":
-            if events:
-                payload["fallbackFrom"] = events
-            return payload
-    # a failed run: availability decides whether another agent gets the packet
-        detail = payload.get("failureDetail")
-        detail_text = str(detail) if isinstance(detail, str) else None
-        matched = availability_class(detail_text)
-        if matched is None:
-            if events:
-                payload["fallbackFrom"] = events
-            return payload
-        # Availability cannot override an explicit assignment or native session.
-        if args.model is not None or args.resume_run is not None or summary.get("resumeSession"):
-            return payload
-        events.append(
-            {
-                "agent": tried[-1],
-                "runId": run_id,
-                "class": matched,
-                "detail": (detail_text or "")[:200],
-            }
-        )
-        replacement = next(
-            (name for name in fallback_agent_order() if name not in tried),
-            None,
-        )
-        if replacement is None:
-            payload["fallbackFrom"] = events
-            payload["fallbackExhausted"] = True
-            return payload
-        tried.append(replacement)
-        next_args = argparse.Namespace(**vars(args))
-        next_args.agent = replacement
-        # Availability failures are provider-wide. A model selected for the
-        # failed provider must not leak into the replacement provider; its
-        # first route in the shared order becomes the replacement default.
-        next_args.model = None
-        next_args.effort = None
-        next_args.resume_run = None
-        try:
-            current = submit(next_args)
-        except SystemExit as exc:
-            if next_args.mode == "project" and "project session" in str(exc):
-                # The project session is pinned to the dry agent; the
-                # substitute runs the same packet as a bounded task instead
-                # of rebinding the repository's durable session.
-                next_args.mode = "task"
-                if next_args.access is None:
-                    next_args.access = str(payload.get("access") or "read")
-                current = submit(next_args)
-            else:
-                events.append(
-                    {
-                        "agent": replacement,
-                        "runId": None,
-                        "class": "launch-rejected",
-                        "detail": str(exc)[:200],
-                    }
-                )
-                replacement = next(
-                    (n for n in fallback_agent_order() if n not in tried),
-                    None,
-                )
-                if replacement is None:
-                    raise
-                tried.append(replacement)
-                next_args.agent = replacement
-                current = submit(next_args)
 
 
 def failure_detail(log_path: Path) -> str | None:
@@ -2163,18 +2010,9 @@ def launch(args: argparse.Namespace) -> int:
         return 0
 
     assert_capacity()
+    # One run per launch. A provider that is out of quota or signed out fails
+    # the run with its own error; nothing relaunches the task on another model.
     summary = launch_service(metadata, packet)
-
-    def submit(next_args: argparse.Namespace) -> dict[str, object]:
-        next_metadata, next_packet = prepare_launch(next_args)
-        return launch_service(next_metadata, next_packet)
-
-    def read_status(run_id: str) -> dict[str, object]:
-        return status_payload(load_metadata(run_id), args.stale_after)
-
-    summary = apply_launch_fallback(
-        args, summary, submit=submit, read_status=read_status
-    )
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
     return 0
 

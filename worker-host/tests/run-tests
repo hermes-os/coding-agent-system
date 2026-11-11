@@ -25,8 +25,7 @@ user_tests=(
   test-worker-hermes-resume-runtime
   test-worker-hermes-runtime-home
   test-worker-hermes-state-read-grant
-  test-worker-provider-fallback
-  test-worker-explicit-routing
+  test-worker-model-policy
   test-worker-codex-auth-sync
   test-install-check
   test-install-apply
