@@ -14,14 +14,21 @@
 # usage: chain-workers.sh <wait-run-id> "<repo>|<model>|<effort>|<read|write>|<packet-file>" ...
 #   packet-file is relative to $PACKETS (default /home/hermes/Projects/cal-task-packets)
 # Env: REPO_WORKER_MAX_ACTIVE (passed through; set only when Hermes raised it).
-W=/home/hermes/.hermes/profiles/cal/workspace
+#      CHAIN_WORKSPACE (the folder holding scripts/repo-worker; tests point it at a scratch tree).
+W=${CHAIN_WORKSPACE:-/home/hermes/.hermes/profiles/cal/workspace}
 # readlink -f: the client path is a symlink into worker-host/bin, where its siblings sit.
 BIN=$(dirname "$(readlink -f "$0")")
 WAIT=$BIN/wait-for-workers.sh
+PANE=$BIN/worker-pane.sh
+# A copy of this file taken out of the repository has no siblings beside it: use the installed ones.
+[ -x "$WAIT" ] || WAIT=/home/hermes/.hermes/profiles/cal/scripts/wait-for-workers.sh
+[ -x "$PANE" ] || PANE=/home/hermes/.hermes/profiles/foreman/scripts/worker-pane.sh
+[ -x "$WAIT" ] || { echo "FAILED: no wait-for-workers.sh; nothing launched"; exit 1; }
 PACKETS=${PACKETS:-/home/hermes/Projects/cal-task-packets}
 cd "$W" || exit 1
 prev=$1; shift
-"$WAIT" "$prev"
+# A failed wait must not launch at once: that skips the queue.
+"$WAIT" "$prev" || { echo "FAILED: wait on $prev exited $?; nothing launched"; exit 1; }
 for spec in "$@"; do
   IFS='|' read -r repo model effort access packet <<<"$spec"
   for attempt in 1 2 3 4 5 6 7 8; do
@@ -35,7 +42,7 @@ for spec in "$@"; do
     echo "LAUNCHED $packet (attempt $attempt) -> ${id:-FAILED: $(echo "$out" | tail -1)}"
     [ -z "$id" ] && exit 1
     # Every run gets a watch pane, chained ones too (Hermes watches all runs).
-    env -u WORKER_HOST "$BIN/worker-pane.sh" "$id" "${packet%.md}" || echo "PANE FAILED for $id"
+    env -u WORKER_HOST "$PANE" "$id" "${packet%.md}" || echo "PANE FAILED for $id"
     res=$("$WAIT" "$id"); echo "$res"
     echo "$res" | grep -q "status=failed" || break
     sleep $((attempt * 90))

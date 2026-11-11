@@ -70,6 +70,9 @@ SONNET_BUILD = route("claude-sonnet-5-5", "high")
 SONNET_NITS = route("claude-sonnet-5-5", "medium")
 OPUS_TOUGH = route("claude-opus-5.5", "medium")
 OPUS_REVIEW = route("claude-opus-5.5", "high")
+# Owner order 2026-11-04 (to Foreman): all guide authoring runs Opus 5.5 high (his pick for
+# Frankenstein and Ivan on 2026-10-29, now every book).
+OPUS_AUTHOR = route("claude-opus-5.5", "high")
 HOLD = None
 KINDS = (
     "implementation", "tough_implementation", "guide_authoring",
@@ -85,10 +88,29 @@ def decide(anthropic):
     return "owner-plan", {
         "implementation": SONNET_BUILD,
         "tough_implementation": OPUS_TOUGH,
-        "guide_authoring": SONNET,
+        "guide_authoring": OPUS_AUTHOR,
         "professor_review": OPUS_REVIEW,
         "code_review": OPUS_REVIEW,
         "nit_cleanup": SONNET_NITS,
+    }
+
+
+def anthropic_state(windows):
+    """Anthropic windows -> the routing state. The week window is required: without it the state is unknown
+    (a hold). Since 2026-10-31 the usage API sends `five_hour: null` while no 5-hour session is running (seen
+    with the week at 0%, and still null right after a real call), so a missing session window counts as 0%
+    used, not as unknown; otherwise the watch held every lane for days on an idle account (fixed 2026-11-04)."""
+    by = {w.label.lower(): w for w in windows}
+    session, week = by.get("current session"), by.get("current week")
+    if week is None:
+        return {"open": None}
+    session_used = session.used_percent if session is not None else 0.0
+    return {
+        "open": session_used < CLOSED_AT and week.used_percent < CLOSED_AT,
+        "session_used": session_used,
+        "session_reset": session.reset_at if session is not None else None,
+        "week_used": week.used_percent,
+        "week_reset": week.reset_at,
     }
 
 
@@ -103,18 +125,7 @@ def read_usage():
 
     anth_snap, anth_windows = windows("anthropic")
     oai_snap, oai_windows = windows("openai-codex")
-    anthropic = {"open": None}
-    if anth_snap is not None:
-        by = {w.label.lower(): w for w in anth_windows}
-        session, week = by.get("current session"), by.get("current week")
-        if session is not None and week is not None:
-            anthropic = {
-                "open": session.used_percent < CLOSED_AT and week.used_percent < CLOSED_AT,
-                "session_used": session.used_percent,
-                "session_reset": session.reset_at,
-                "week_used": week.used_percent,
-                "week_reset": week.reset_at,
-            }
+    anthropic = anthropic_state(anth_windows) if anth_snap is not None else {"open": None}
     openai = {"open": None}
     if oai_snap is not None and oai_windows:
         worst = max(oai_windows, key=lambda w: w.used_percent)

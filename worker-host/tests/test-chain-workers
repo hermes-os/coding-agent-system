@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""chain-workers.sh starts the next run only after the run ahead of it was really waited for."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "chain-workers.sh"
+
+
+def executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/usr/bin/env bash\n" + body)
+    path.chmod(0o755)
+
+
+def run_chain(wait_exit: int) -> tuple[subprocess.CompletedProcess[str], int]:
+    """Run the chain in a scratch tree with stub tools; return the result and the number of launches."""
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        launches = root / "launches"
+        executable(root / "bin" / "chain-workers.sh", SCRIPT.read_text().split("\n", 1)[1])
+        executable(root / "bin" / "wait-for-workers.sh", f"echo status=completed\nexit {wait_exit}\n")
+        executable(root / "bin" / "worker-pane.sh", "exit 0\n")
+        executable(
+            root / "workspace" / "scripts" / "repo-worker",
+            f"echo launched >> '{launches}'\necho '{{\"runId\": \"run-2\"}}'\n",
+        )
+        (root / "packets").mkdir()
+        (root / "packets" / "next.md").write_text("task\n")
+        result = subprocess.run(
+            ["bash", str(root / "bin" / "chain-workers.sh"), "run-1", "repo|model|high|read|next.md"],
+            env={**os.environ, "CHAIN_WORKSPACE": str(root / "workspace"), "PACKETS": str(root / "packets")},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        count = len(launches.read_text().splitlines()) if launches.exists() else 0
+        return result, count
+
+
+def main() -> int:
+    # A wait that fails says nothing about the run ahead: launching now would skip the queue.
+    result, launched = run_chain(wait_exit=3)
+    assert launched == 0, f"launched {launched} run(s) after a failed wait:\n{result.stdout}"
+    assert result.returncode == 1, result
+    assert "nothing launched" in result.stdout, result.stdout
+
+    result, launched = run_chain(wait_exit=0)
+    assert launched == 1, f"expected one launch after a good wait, saw {launched}:\n{result.stdout}{result.stderr}"
+    assert result.returncode == 0, result
+    assert "LAUNCHED next.md (attempt 1) -> run-2" in result.stdout, result.stdout
+    print("Validated chain-workers queueing.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
