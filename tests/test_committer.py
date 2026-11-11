@@ -67,6 +67,31 @@ class CommitterTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("repository-wide path is not allowed", result.stderr)
 
+    def test_during_a_merge_it_says_how_to_finish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = self.make_repo(Path(temp))
+            main = git(repo, "branch", "--show-current").stdout.strip()
+            git(repo, "checkout", "-qb", "side")
+            (repo / "target.txt").write_text("side\n", encoding="utf-8")
+            git(repo, "commit", "-qam", "side")
+            git(repo, "checkout", "-q", main)
+            (repo / "target.txt").write_text("main\n", encoding="utf-8")
+            git(repo, "commit", "-qam", "main")
+            git(repo, "merge", "side", check=False)
+            (repo / "target.txt").write_text("both\n", encoding="utf-8")
+            git(repo, "add", "target.txt")
+
+            result = subprocess.run(
+                [str(COMMITTER), "merge side", "target.txt"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("finish it with `git commit`", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
