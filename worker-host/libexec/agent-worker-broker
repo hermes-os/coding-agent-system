@@ -774,6 +774,68 @@ def validate_launch(request: dict[str, object]) -> tuple[dict[str, object], str]
     return metadata, packet
 
 
+# A host has only the providers someone installed and signed in. systemd refuses
+# to start a unit when a ReadWritePaths entry does not exist, unless the entry
+# starts with "-". Without that, removing one provider stops every worker.
+PROVIDER_HOMES = (".codex", ".claude", ".kimi")
+
+
+def sandbox_write_paths(access: str, worker_repo: Path) -> list[str]:
+    """The paths a worker may write, as ReadWritePaths entries."""
+    paths = [
+        str(WORKER_HOME / ".cache"),
+        str(WORKER_HOME / ".config"),
+        str(STATE_ROOT),
+        str(WORKER_HOME / ".state"),
+        *(f"-{WORKER_HOME / name}" for name in PROVIDER_HOMES),
+        str(WORKER_HERMES_HOME),
+        str(HERMES_RUNTIME_ROOT),
+        str(TRUST_ROOT),
+        str(SCRATCH_ROOT),
+        "/run/agent-worker",
+    ]
+    if access == "write":
+        paths.append(str(worker_repo))
+    return paths
+
+
+SYSTEMD_RUN = "systemd-run"
+
+
+def start_worker_unit(unit: str, description: str, settings: list[str]) -> tuple[int, str]:
+    """Start a worker unit. Return (0, "") or (exit code, why it did not start).
+
+    Type=exec makes systemd-run wait until the worker process exists, so it
+    exits non-zero when the sandbox cannot be set up. With --no-block it exited
+    0 for a sandbox that failed, and the run stayed "queued" with no error.
+    """
+    result = subprocess.run(
+        [
+            SYSTEMD_RUN,
+            "--unit",
+            unit,
+            "--collect",
+            "--quiet",
+            "--property",
+            "Type=exec",
+            "--description",
+            description,
+            *settings,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if not result.returncode:
+        return 0, ""
+    reason = (
+        result.stderr.strip()
+        or result.stdout.strip()
+        or f"the worker sandbox did not start; see: journalctl -u {unit}"
+    )
+    return result.returncode, reason[:1000]
+
+
 def launch(request: dict[str, object]) -> dict[str, object]:
     metadata, packet = validate_launch(request)
     repo = Path(str(metadata["repo"]))
@@ -835,32 +897,8 @@ def launch(request: dict[str, object]) -> dict[str, object]:
         if access == "read"
         else f"BindPaths={repo}:{worker_repo}"
     )
-    writable_paths = [
-        WORKER_HOME / ".cache",
-        WORKER_HOME / ".config",
-        STATE_ROOT,
-        WORKER_HOME / ".state",
-        WORKER_HOME / ".codex",
-        WORKER_HOME / ".claude",
-        WORKER_HOME / ".kimi",
-        WORKER_HERMES_HOME,
-        HERMES_RUNTIME_ROOT,
-        TRUST_ROOT,
-        SCRATCH_ROOT,
-        Path("/run/agent-worker"),
-    ]
-    if access == "write":
-        writable_paths.append(worker_repo)
-    read_write = "ReadWritePaths=" + " ".join(str(path) for path in writable_paths)
-    command = [
-        "systemd-run",
-        "--unit",
-        unit,
-        "--collect",
-        "--no-block",
-        "--quiet",
-        "--description",
-        f"Repository worker {run_id} ({metadata['agent']})",
+    read_write = "ReadWritePaths=" + " ".join(sandbox_write_paths(access, worker_repo))
+    settings = [
         "--uid",
         "root",
         "--gid",
@@ -924,13 +962,15 @@ def launch(request: dict[str, object]) -> dict[str, object]:
         "--packet-file",
         str(prompt_path),
     ]
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
-    if result.returncode:
+    return_code, launch_error = start_worker_unit(
+        unit, f"Repository worker {run_id} ({metadata['agent']})", settings
+    )
+    if return_code:
         prompt_path.unlink(missing_ok=True)
         metadata["status"] = "failed"
-        metadata["returnCode"] = result.returncode
+        metadata["returnCode"] = return_code
         metadata["completedAt"] = utc_now()
-        metadata["launchError"] = (result.stderr.strip() or result.stdout.strip())[:1000]
+        metadata["launchError"] = launch_error
         atomic_metadata(run_root / "metadata.json", metadata)
         raise RequestError(f"failed to start worker service: {metadata['launchError']}")
     append_event(

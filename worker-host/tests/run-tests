@@ -26,6 +26,7 @@ user_tests=(
   test-worker-hermes-runtime-home
   test-worker-hermes-state-read-grant
   test-worker-model-policy
+  test-worker-sandbox-paths
   test-model-usage-watch
   test-chain-workers
   test-worker-codex-auth-sync

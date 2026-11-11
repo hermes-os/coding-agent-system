@@ -4,6 +4,8 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- A host that has lost one provider still runs the others. The worker sandbox listed the Codex, Claude and Kimi home folders as required paths, so after Codex was removed from the main host on 2026-11-07 no worker of any provider started. Those three folders are now optional; a run of a provider that is not there fails with that provider's own error.
+- A worker sandbox that cannot start is a failed launch with a reason. The broker started the unit with `--no-block`, `systemd-run` exited 0, and the run stayed `queued` with no error. The broker now waits until the worker process exists.
 - `defaults.json` `order` names one default route for each runtime (Hermes, Codex, Kimi, Claude). The five extra entries only fed the removed relaunch chain; every default is unchanged.
 - `chain-workers.sh` launches nothing when the wait on the run ahead of it fails, or when it cannot find `wait-for-workers.sh`. A failed wait used to launch the next run at once, which skipped the queue.
 - Usage watch: the usage API sends no 5-hour window while no session runs. That now counts as 0% used; it used to count as unknown, which held every lane on an idle account. Guide authoring routes to Opus 5.5 at high.
