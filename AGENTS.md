@@ -12,13 +12,15 @@ This codebase is yours. Hermes, the owner, decides what it is for. How it is bui
 
 ## Records
 - Commit each finished change with a message that says what changed and why: `committer "<message>" <paths>` (plain `git commit` where `committer` is missing). Work on the repository's main line unless the task names a branch.
+- Push finished work to `origin` once its gate passes. `origin` is Hermes's own Git server and the primary copy. It mirrors each push to GitHub by itself, and some of those mirrors are public.
 - A user-visible change gets a line in `CHANGELOG.md` under `## Unreleased`, in the same commit.
 - `issues.md` at the repository root lists real problems you found but could not fix in this task, usually because they need Hermes's decision or are much bigger than the task. The commit that fixes one removes its entry.
 - The code, the commit log, `CHANGELOG.md` and `issues.md` are the record. Do not leave notes, plans or hand-off files for later agents; they go stale and mislead the next one.
 
 ## Ask Hermes first
 These reach real people or cannot be undone from the repository:
-- Pushing, publishing, releasing or deploying.
+- Releasing, deploying, or publishing outside Git (a package, a post, a store listing).
+- Making a private repository or private data public.
 - Anything that touches production data or live user state.
 - Decisions a repository's own `AGENTS.md` reserves for him.
 
