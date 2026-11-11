@@ -3,13 +3,8 @@
   "thinkingDefault": "max",
   "order": [
     "sonnet-5.5",
-    "opus-5.5",
     "luna",
-    "luna-reserve",
-    "opus-5",
     "kimi-k3",
-    "hermes-astra",
-    "spark",
     "fable-5"
   ],
   "workerDefault": "sonnet-5.5",

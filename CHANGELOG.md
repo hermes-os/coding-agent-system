@@ -4,6 +4,7 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- `defaults.json` `order` names one default route for each runtime (Hermes, Codex, Kimi, Claude). The five extra entries only fed the removed relaunch chain; every default is unchanged.
 - `chain-workers.sh` launches nothing when the wait on the run ahead of it fails, or when it cannot find `wait-for-workers.sh`. A failed wait used to launch the next run at once, which skipped the queue.
 - Usage watch: the usage API sends no 5-hour window while no session runs. That now counts as 0% used; it used to count as unknown, which held every lane on an idle account. Guide authoring routes to Opus 5.5 at high.
 - `repo-worker` launches one run per task. It no longer relaunches a task on the next provider when the first is out of quota, rate limited or signed out; one failed Claude launch used to become runs on Hermes, Codex and Kimi. The run now fails with the provider's own error. `order` in `defaults.json` only picks the default route for each runtime.
