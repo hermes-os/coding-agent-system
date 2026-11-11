@@ -10,6 +10,18 @@
 # test the same way inside and outside.
 FROM docker.io/library/archlinux:base-devel
 
+# The agent is the host user inside the container (uid 1000 on Hermes's hosts),
+# not root: tests, Chromium and Postgres then behave as they do on the host, and
+# several of them refuse to run as root at all. The system files are handed to
+# that user in the same layer that installs them, so the agent can still
+# install packages (bin/pacman) and owns its whole environment.
+#
+# A profile asks for that user with terminal.docker_run_as_host_user and
+# --userns=keep-id. It also passes --cap-add SYS_CHROOT: Chromium's own sandbox
+# calls chroot, and podman lets that call through only in a container that
+# lists the capability. The shell still holds no capability (bin/bash).
+ARG WORKER_UID=1000
+
 RUN pacman-key --init && pacman-key --populate archlinux \
  && pacman -Syu --noconfirm --needed \
       git git-lfs ripgrep fd jq sqlite curl wget unzip zip which less file \
@@ -19,12 +31,27 @@ RUN pacman-key --init && pacman-key --populate archlinux \
       dotnet-sdk-9.0 aspnet-runtime-9.0 aspnet-targeting-pack-9.0 \
       rust go cmake ninja \
       chromium ttf-dejavu ttf-liberation \
+      postgresql \
  && pacman -Scc --noconfirm \
- && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+ && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/* \
+ && git config --system safe.directory '*' \
+ && git config --system init.defaultBranch main \
+ && mkdir -p /cache /home/worker && chmod 1777 /cache \
+ && chown -R -h "$WORKER_UID:$WORKER_UID" /usr /etc /var /opt /srv /root /home
+
+# bash drops the file powers Hermes starts the container with, pacman installs
+# without root, throwaway-postgres starts a database for tests.
+COPY --chown=$WORKER_UID:$WORKER_UID --chmod=755 bin/ /usr/local/bin/
+
+# Hermes mounts the profile's skills and attachments under /root/.hermes, on a
+# /root it makes with this folder's mode. The worker has to be able to enter it.
+RUN chmod 755 /root
 
 # Build caches live under /cache. A run mounts a shared host folder there, so a
-# package is downloaded once per host, not once per run.
+# package is downloaded once per host, not once per run. Hermes mounts an empty
+# memory-backed /home over the image's; podman copies /home/worker into it.
 ENV LANG=C.UTF-8 \
+    HOME=/home/worker \
     DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
@@ -38,9 +65,5 @@ ENV LANG=C.UTF-8 \
     GOPATH=/cache/go \
     GOCACHE=/cache/go-build \
     CHROME_BIN=/usr/bin/chromium
-
-RUN mkdir -p /cache && chmod 1777 /cache \
- && git config --system safe.directory '*' \
- && git config --system init.defaultBranch main
 
 WORKDIR /workspace

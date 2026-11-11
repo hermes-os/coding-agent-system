@@ -1,0 +1,11 @@
+#!/bin/sh
+# Every shell Hermes opens here starts through this file, because Hermes runs
+# `bash` by name and /usr/local/bin comes first on PATH.
+#
+# Hermes starts the container with the power to read and write any file
+# whatever its permissions (CAP_DAC_OVERRIDE, CAP_CHOWN, CAP_FOWNER), and podman
+# hands that power to the worker's user. The host user has no such power, so a
+# test that expects "permission denied" would fail here and pass there. This
+# drops it before the real bash starts. Nothing in the image needs it: the
+# worker owns the system files (see the Containerfile).
+exec setpriv --inh-caps=-all --ambient-caps=-all /usr/bin/bash "$@"

@@ -13,7 +13,10 @@
     "toolsets": ["terminal", "file", "code_execution", "web", "vision", "skills", "todo", "kanban"],
     "terminal.backend": "docker",
     "terminal.docker_image": "localhost/workbench:latest",
-    "terminal.docker_mount_cwd_to_workspace": true,
+    "terminal.docker_mount_cwd_to_workspace": false,
+    "terminal.cwd": "/workspace",
+    "terminal.docker_run_as_host_user": true,
+    "terminal.docker_extra_args": ["--userns=keep-id", "--cap-add", "SYS_CHROOT"],
     "terminal.docker_volumes": [
       "/home/hermes/workbench:/home/hermes/workbench:ro",
       "/home/hermes/.cache/workbench:/cache"

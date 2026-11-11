@@ -1,0 +1,24 @@
+#!/bin/sh
+# throwaway-postgres [port] — start a Postgres server for this task's tests.
+#
+# It listens on 127.0.0.1 only, its one user is the superuser `postgres` with no
+# password, and its data goes when the container does. Durability is off, which
+# makes a test suite that creates and drops databases much faster. Running it
+# again prints the same connection strings.
+set -eu
+
+port=${1:-5432}
+data=/var/lib/postgres/throwaway-$port
+
+if [ ! -s "$data/PG_VERSION" ]; then
+    initdb --pgdata "$data" --username postgres --auth trust --encoding UTF8 --no-sync > /dev/null
+fi
+if ! pg_ctl --pgdata "$data" status > /dev/null 2>&1; then
+    pg_ctl --pgdata "$data" --log "$data/server.log" --wait --silent start --options "\
+        -p $port -c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp \
+        -c fsync=off -c synchronous_commit=off -c full_page_writes=off"
+fi
+
+echo "Postgres is up on 127.0.0.1:$port. User postgres, no password. Log: $data/server.log"
+echo "  URL:   postgresql://postgres@127.0.0.1:$port/postgres"
+echo "  .NET:  Host=127.0.0.1;Port=$port;Username=postgres;Database=postgres"
