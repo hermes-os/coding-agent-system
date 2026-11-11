@@ -4,6 +4,8 @@ This file records user-visible changes to the portable coding-agent system.
 
 ## Unreleased
 
+- Workers run in the Hermes harness. A worker is the Hermes profile `worker`, started by a kanban card, with its shell and file tools inside a rootless podman container built from `workbench/Containerfile` (.NET 9, Python with pytest and uv, Node, Rust, Go, CMake, Chromium). It works in a git worktree of a clean clone under `~/workbench`, commits on the card's own branch, and has no keys, so it cannot push. `./setup.sh worker` builds the image and sets up the profile from `profiles/worker/`. The working agreement moved from `AGENTS.md` to `working-agreement.md`; `./setup.sh links` links it as `~/AGENTS.md` and `~/.claude/CLAUDE.md`.
+
 - A host that has lost one provider still runs the others. The worker sandbox listed the Codex, Claude and Kimi home folders as required paths, so after Codex was removed from the main host on 2026-11-07 no worker of any provider started. Those three folders are now optional; a run of a provider that is not there fails with that provider's own error.
 - A worker sandbox that cannot start is a failed launch with a reason. The broker started the unit with `--no-block`, `systemd-run` exited 0, and the run stayed `queued` with no error. The broker now waits until the worker process exists.
 - A run whose provider is not installed ends as `failed` and its status says why (`required executable not found: codex`). The supervisor used to exit and leave the record `running` with no process behind it.

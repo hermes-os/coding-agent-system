@@ -1,0 +1,46 @@
+# The workbench: one image for every worker and author run.
+#
+# Hermes runs the agent on the host and sends its shell, file and code tools
+# into a container made from this image (terminal.backend: docker, on rootless
+# podman). The image holds the toolchains Hermes's repositories build with, so a
+# run never waits on a missing tool. It holds no keys, no tokens and no personal
+# data: the model's credentials stay with the Hermes process on the host.
+#
+# Arch, to match the hosts: the same .NET, Python and Node versions build and
+# test the same way inside and outside.
+FROM docker.io/library/archlinux:base-devel
+
+RUN pacman-key --init && pacman-key --populate archlinux \
+ && pacman -Syu --noconfirm --needed \
+      git git-lfs ripgrep fd jq sqlite curl wget unzip zip which less file \
+      procps-ng tree rsync patch diffutils man-db \
+      python python-pip python-pytest uv \
+      nodejs npm \
+      dotnet-sdk-9.0 aspnet-runtime-9.0 aspnet-targeting-pack-9.0 \
+      rust go cmake ninja \
+      chromium ttf-dejavu ttf-liberation \
+ && pacman -Scc --noconfirm \
+ && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+
+# Build caches live under /cache. A run mounts a shared host folder there, so a
+# package is downloaded once per host, not once per run.
+ENV LANG=C.UTF-8 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    DOTNET_USE_POLLING_FILE_WATCHER=1 \
+    DOTNET_hostBuilder__reloadConfigOnChange=false \
+    NUGET_PACKAGES=/cache/nuget \
+    npm_config_cache=/cache/npm \
+    PIP_CACHE_DIR=/cache/pip \
+    UV_CACHE_DIR=/cache/uv \
+    CARGO_HOME=/cache/cargo \
+    GOPATH=/cache/go \
+    GOCACHE=/cache/go-build \
+    CHROME_BIN=/usr/bin/chromium
+
+RUN mkdir -p /cache && chmod 1777 /cache \
+ && git config --system safe.directory '*' \
+ && git config --system init.defaultBranch main
+
+WORKDIR /workspace
