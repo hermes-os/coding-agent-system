@@ -51,7 +51,6 @@ Say what portion of a large queue was not expanded. A triage request selects
 and explains work; it does not authorize comments, closes, merges, or other
 GitHub writes unless the user also asks to act.
 
-When autonomous execution is authorized, process one item at a time through
-implementation, focused proof, independent review, exact-head CI/delivery, and
-a clean checkout before choosing the next item. Use `portfolio` for a sustained
-or multi-repository queue.
+When Hermes also asks you to act, take one item at a time through
+implementation, proof, review and delivery, and leave a clean checkout before
+choosing the next.

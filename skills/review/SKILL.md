@@ -1,50 +1,41 @@
 ---
 name: review
-description: "Independently review a committed change range and return VERDICT: APPROVE or CHANGES."
+description: "Review a committed change range and give one verdict: approve, or the defects that remain."
 ---
 
 # Review
 
-Review happens after the worker commits. A fresh, read-only reviewer judges the
-commit range and the relevant source, never a success summary. The reviewer
-does not edit, commit, push, or deploy.
+Judge the result, not the route. A review reads the commits and the code they
+touch, never a summary of them. The reviewer changes nothing.
 
-## Input
+## What to judge
 
-The review order names:
+1. Does it do what was asked? Read the request, then `git log -p <base>..<head>`.
+2. Is it the simplest design that works? Would you be glad to keep building on
+   this code?
+3. Is it proven? Run the tests that matter and the repository's gate. Check
+   that a bug fix has a test that would have failed before it.
+4. Is it safe? Look for regressions, broken contracts, data loss, and secrets
+   in code, logs, tests or commits.
+5. Are the records true? A user-visible change has its `CHANGELOG.md` line in
+   the same commit; a problem left open is in `issues.md`; a fix removed its
+   entry.
 
-- the base and head commits (`git log <base>..<head>`, `git diff <base> <head>`);
-- what the change does, in two lines, and the owner boundary;
-- the defect classes to hunt;
-- gates that already fail on the base, as known and not to be raised;
-- on a re-review, the findings from earlier rounds, to check first.
+Check each finding against the source before you raise it. Leave out taste,
+speculative edge cases, and rewrites that fix no concrete risk in this range.
+Pair the review with `behavior-validator` when the behavior a user sees needs
+its own proof.
 
-## Contract
+## Verdict
 
-1. Inspect correctness, regressions, security and privacy, data behavior,
-   broken contracts, unnecessary complexity, and missing tests.
-2. Check that each user-visible change has its `CHANGELOG.md` entry in the same
-   commit, that unfixed issues the workers found are in `issues.md`, and that a
-   fixing commit removed its issue entry.
-3. Verify each finding against source, tests, types, and current primary
-   documentation when external behavior matters.
-4. Reject speculative edge cases and rewrites that do not fix a concrete risk
-   introduced by the range.
-5. Grade findings `BLOCKER` (must fix before push), `FIX` (should fix now) or
-   `NIT` (small), each with file, line and exact fix, and mark a finding that would double the
-   surface, alter a public contract, or cross an owner boundary as a scope break.
-6. Stop at `APPROVE`. Do not run redundant reviews for a nicer verdict.
+Give one, first:
 
-On `CHANGES`, a fresh worker fixes the findings in new commits and a fresh
-reviewer reads the whole range again. Repeated repair failures call for better
-diagnosis or a different bounded approach, not parking based on a review count.
-Do not waive material findings. Pair this review with `behavior-validator` when
-user-visible behavior needs independent proof.
+- **Approve** when the work meets the request. Say what you checked.
+- **Changes** when a real defect remains. Name each one, where it is, why it
+  matters, and the smallest fix, most serious first, so the author can fix it
+  without asking.
+- **Hermes decides** when the open question is his: the question, at most two
+  options, and your pick.
 
-## Output
-
-- First line: `VERDICT: APPROVE` or `VERDICT: CHANGES`.
-- Findings ordered by severity, with file and line references, impact,
-  evidence, and the smallest correction.
-- Then open questions, checks run, and residual risk.
-- Say clearly when no actionable findings remain.
+Then the checks you ran and any risk that remains. Stop at approve; a second
+review for a nicer verdict adds nothing.

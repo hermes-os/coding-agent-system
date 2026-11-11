@@ -1,208 +1,118 @@
-# Coding Agent System
+# coding-agent-system
 
-A portable, model-neutral engineering system for Codex, Claude Code, Kimi CLI, Cursor,
-and other coding-agent hosts. The coordinator skills (`worker-first`, `review`,
-`land`) assume workers run on the Hermes harness through `repo-worker`, whose
-host copy lives in `worker-host/`. It keeps policy terse, loads workflows as skills,
-dispatches skill-owned hooks, reconstructs work from repository evidence, and
-uses deterministic checks for the parts that should not depend on judgment.
+How Hermes's agents work: one agreement, one launcher, one environment.
 
-## Ownership
+Every coding worker and reviewer is a profile of the Hermes agent harness. A
+task is a card on Hermes's kanban board. The worker that takes it gets a
+container of its own and a branch of its own, and owns the codebase while it
+works. This repository holds everything that makes that true on a host.
 
-This repository owns the portable layer:
+| Path | What it is |
+| --- | --- |
+| `working-agreement.md` | The agreement every agent reads, in every repository. |
+| `profiles/<name>/` | A Hermes profile: `intro.md` opens its prompt, `profile.json` is its configuration. |
+| `workbench/Containerfile` | The image a profile's shell, file and code tools run in. |
+| `setup.sh` | Puts all of this on a host. |
+| `bin/` | Commands for work in any repository: `committer`, `agent-trash`, `agent-session-recover`. |
+| `skills/` | Skills for Claude Code and Codex sessions in any repository. |
 
-- `AGENTS.md`: canonical global engineering policy.
-- `skills/`: assignable job contracts and their scripts, references, and hooks.
-- `hooks/dispatch.py`: one host adapter for global and repository skill hooks.
-- `bin/`: small deterministic helpers for continuity, delivery, review, and
-  repository hygiene.
-- `system.json`: the exact managed skill, command, binary, and hook catalog.
-- `install.sh` and `configure-hosts.py`: idempotent shared installation plus a
-  caller-selected host integration.
-- `host/local/`: the local-machine invocation defaults for `claude`, `codex`,
-  and `kimi`; these are not part of the shared binary catalog.
-- `tests/` and `validate.sh`: portable enforcement.
+## How a task flows
 
-Product facts and workflows remain in each product repository. VM credentials,
-VM launch behavior, and cloud bootstrap belong in
-`hermes-os/coding-agent-vm-setup`, which pins this repository at an exact Git
-revision and supplies its own host integration.
+1. **A card.** An agent, or Hermes himself, writes the task: the outcome, why
+   it matters, and what done means. It goes on the board assigned to `worker`,
+   with a worktree workspace on the repository's clean clone:
 
-## Install
+   ```bash
+   hermes kanban create "<title>" --body-file task.md \
+     --assignee worker --workspace worktree:$HOME/workbench/<repo>
+   ```
 
-```bash
-git clone https://github.com/hermes-os/coding-agent-system ~/coding-agent-system
-~/coding-agent-system/install.sh
-agent-system-doctor
-```
+   Inside the harness the same thing is `kanban_create` with assignee `worker`,
+   workspace kind `worktree` and workspace path `/home/hermes/workbench/<repo>`.
 
-The installer wires the canonical policy and skills into `~/.agents`, Codex,
-Claude Code, Kimi CLI, and Cursor while preserving unrelated host
-configuration. Kimi receives the policy through a generated default-agent
-extension because it does not load a home-level `AGENTS.md` for repository
-work. That extension disables Kimi's inherited subagents so repository work
-stays inside its assigned worker boundary. Native `Stop` and shell-only
-`PreToolUse` hooks dispatch through the same skill-owned hook catalog, and a
-prompt guard rejects any resumed session whose persisted system prompt lacks
-the current policy digest. Policy updates therefore require a fresh Kimi
-session; unchanged managed sessions remain resumable.
+2. **A worker.** The board's dispatcher, which runs inside the Hermes gateway,
+   starts `hermes -p worker chat -q "work kanban task <id>"`. Kanban makes a git
+   worktree at `~/workbench/<repo>/.worktrees/<task-id>` on branch
+   `wt/<task-id>`.
 
-The managed Kimi launcher covers noninteractive `--print` and `--quiet` work,
-including explicit policy-current session IDs. It rejects interactive picker,
-continue, wire/ACP, caller agent, config, and skill-directory overrides because
-those paths can restore or create an unverified system prompt in Kimi CLI
-1.47.0. The `acp`, `term`, and `web` subcommands are rejected for the same
-reason. Administrative Kimi subcommands pass through unchanged.
+3. **A workbench.** The agent runs on the host, but its shell, file and code
+   tools run in a rootless podman container made from `localhost/workbench:latest`
+   for this one task. The container sees `~/workbench` and a shared package
+   cache. It has no keys, no tokens, no SSH, no `~/.hermes` and none of
+   Hermes's own working copies, so the worker cannot push or reach an account.
+   Inside, the worker can install, build and rebuild whatever the task needs.
 
-The shared system does not author model assignments. A provider-required,
-operator-selected default may remain in local provider configuration as host
-state. Persistent agent memory is disabled.
+4. **A review.** The worker commits on its branch and hands the card to the
+   `reviewer` profile. The dispatcher starts the reviewer in its own container,
+   with `~/workbench` mounted read-only. The reviewer reads the branch, runs
+   what matters, and gives one verdict: it approves and the card is done, it
+   sends the card back to the worker with each defect named, or it blocks the
+   card with a question for Hermes.
 
-The default install selects `host/local`, which pins Claude Remote Control for
-every interactive session and enforces one access contract across providers.
-Agent invocations default to `AGENT_ACCESS_MODE=write`: Codex bypasses approval
-and sandbox prompts, Claude uses `bypassPermissions`, and Kimi uses `--yolo`.
-`AGENT_ACCESS_MODE=read` is the explicit exception for read-only inspection and
-review; it disables those bypasses. Orchestrators must pair read mode with an
-external read-only filesystem boundary. Administrative provider commands pass
-through unchanged.
+5. **A merge.** The agent that made the card reads the diff once the card is
+   done, merges the branch and pushes to `origin`, Hermes's own Git server.
 
-Integrations such as the VM setup call
-`install.sh --host-integration /path/to/integration`; the shared catalog never
-owns those launchers. Claude and Codex launchers are the base integration
-contract; a host may declare Kimi support by also supplying an executable
-`bin/agent-kimi`.
+Each profile runs on the one model its `profile.json` names. There is no
+fallback chain: a run that cannot reach its model fails with the provider's
+own error.
 
-Global skill hooks remain available from any working directory. Repository
-skill hooks are discovered only after Git resolves the working directory to a
-repository root, so a home directory, scratch directory, or cross-repository
-launcher cannot accidentally reinterpret its `.agents` tree as project policy.
-A directory with a broken or inaccessible `.git` marker still fails closed;
-inside a valid repository, all repository hook validation remains strict. Start
-the agent in the target repository when that repository's local hooks should
-apply.
+## Set up a host
 
-Use `install.sh --coordination-repo /path/to/git-root` when a host integration
-should keep cross-host lease refs in a different repository. The chosen path is
-recorded locally in `~/.agents/config.json`; it is host state, not project
-memory.
-
-Enrolled hosts can exchange constrained, exact-SHA PR work with
-`agent-forge-handoff`. Local `forgePeer.localPeer`, repository, and
-trusted-author settings define its authorization surface; handoffs never grant
-mutation, commands, merge, or deploy authority. See the portfolio skill before
-enabling a host-specific watcher. Peer enrollment comes only from the canonical
-host config (or a root-pinned nonstandard install), never a CLI or environment
-override. A bounded organization discovery call overscans recent constant-label
-candidates and revalidates every returned packet without interpreting PR bodies
-as instructions. Canonical peer enrollment is read through one bounded,
-no-follow descriptor and fails closed if the file or path changes during the
-read.
-
-To replace an older cataloged but unmanifested installation, pass its clean
-tracked source explicitly:
+A host needs the Hermes agent with its gateway running, rootless `podman`,
+`git` and `python3`, and SSH access to the Git server for the clones.
 
 ```bash
-./install.sh --migrate-from-system-root /path/to/old/system
+git clone git@git.imhermes.dev:hermes/coding-agent-system.git ~/Projects/hermes-os/coding-agent-system
+cd ~/Projects/hermes-os/coding-agent-system
+
+./setup.sh links          # the working agreement as ~/AGENTS.md and ~/.claude/CLAUDE.md
+./setup.sh tools          # bin/ into ~/.local/bin; skills/ into ~/.agents/skills and ~/.claude/skills
+./setup.sh worker         # build the image, then write the profile
+./setup.sh reviewer
+./setup.sh repo <name>    # the workers' clean clone ~/workbench/<name>, made or fast-forwarded
 ```
 
-Migration uses the old source's own `system.json`, retires exact legacy-only
-paths, and accepts only destinations that still match that source tree. An
-altered, untracked, or unrelated path fails the whole preflight without
-changing host configuration.
+Every command can be run again. `./setup.sh <profile>` brings the profile back
+to exactly what this repository says: its settings, its `SOUL.md`, and its
+skills. `links` and `tools` make links into this checkout, so a `git pull`
+here updates the agreement, the commands and the skills on the host; `tools`
+also removes the link of a command or skill that was deleted here. Profiles and
+the image are copies, so run `./setup.sh <profile>` again after a pull that
+changes `profiles/` or `workbench/`.
 
-## Repository Contract
+`setup.sh` does not sign a profile in. Each profile needs its model provider's
+sign-in on the host, held by the Hermes process and never by the container.
 
-Product repositories keep one root `AGENTS.md` beginning with:
+Workers see a repository as it is on the Git server. Push what a task depends
+on, then run `./setup.sh repo <name>` before making the card.
 
-```text
-READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing).
-```
+## Add a profile
 
-`CLAUDE.md` is a symlink to `AGENTS.md`. Product-specific skills live under
-`.agents/skills`. The records are the commit log, `CHANGELOG.md` (an entry for
-each user-visible change, under `## Unreleased`), and a root `issues.md` that
-lists known issues no commit has fixed yet. Agents write no plan, spec, or
-hand-off files unless the owner asks for one.
+Make `profiles/<name>/` with two files, then run `./setup.sh <name>`:
 
-Run the deterministic repository check before delivery:
+- `intro.md`: who the agent is, what its workbench is, and how it hands work
+  back. It opens the profile's `SOUL.md`.
+- `profile.json`:
+  - `description`: one line, shown in Hermes's profile list.
+  - `agreement`: `true` puts `working-agreement.md` after the intro.
+  - `skills`: names of skills bundled with Hermes, copied into the profile.
+  - `config`: Hermes settings as `hermes config set` takes them, such as the
+    model, the toolsets, and the container's image, volumes and limits.
+
+The tests set up every folder under `profiles/`, so a new profile is covered
+when it is added.
+
+## Develop
 
 ```bash
-agent-repo-check --repo "$PWD" --strict
+python3 -m unittest discover -s tests
 ```
 
-It validates instruction wiring, local skills and hooks, document metadata,
-active-plan shape, and tracked high-risk clutter. Project tests and delivery
-commands still come from the repository's own guide.
-
-After the global-system revision is published, wire a repository to that exact
-revision with:
-
-```bash
-agent-repo-adopt --repo "$PWD"
-```
-
-This creates only the `CLAUDE.md` pointer when missing and a managed GitHub
-Actions workflow pinned to the full global-system commit SHA. It refuses to
-overwrite an unrelated workflow or repository guide. Re-run with `--check` to
-detect a stale pin without changing files.
-
-## Worker host
-
-`worker-host/` is the source of the live worker system on Hermes's Linux host,
-laid out by install target: `libexec/` (runner, broker, Hermes adapter and
-configs, Codex auth sync, coordination probe) for `/usr/local/libexec`, `etc/`
-for `/etc` (model policy, sudoers rule), `systemd/` for `/etc/systemd/system`,
-`bin/` for the client tools in the Cal and Foreman profiles, and `tests/`,
-which `validate.sh` runs. The two root-only tests (`test-worker-broker-policy`,
-`test-worker-permission-policy`) run only with `WORKER_HOST_ROOT_TESTS=1`
-(as root or through `sudo -n`); `validate.sh` does not set it, so they are
-skipped by default: `WORKER_HOST_ROOT_TESTS=1 worker-host/tests/run-tests`.
-
-```bash
-worker-host/install.sh --check   # read-only; prints DRIFT lines, exits 1 on drift
-worker-host/install.sh --apply   # installs from the repo; refuses while a run is active
-```
-
-`--apply` backs up each replaced file under
-`/var/backups/agent-worker/<timestamp>/`, installs with the target's current
-owner and mode, replaces the client paths with symlinks into `worker-host/`
-(except the five `bin/` tools in the Cal and Foreman profile `scripts/`
-directories, which become regular file copies: the Hermes cron scheduler
-blocks a script whose symlink resolves outside that directory, and `--check`
-reports a symlink there as drift), runs `systemctl daemon-reload` only when a
-unit changed, and restarts only the broker service (never its socket). It also
-refuses while
-`~/.hermes/profiles/cal/state/HOLD-FOR-REBOOT` exists, and while `worker-host/`
-has uncommitted changes or untracked files: it installs committed content only.
-The Cal workspace copies of `agent-hermes-worker` and
-`agent-worker-coordination-probe` (`~/.hermes/profiles/cal/workspace/scripts/`)
-are older than the installed ones; `--apply` replaces them with symlinks to the
-`worker-host/` copies, which match the installed versions.
-
-Before it installs a unit or the broker, `--apply` records the systemd steps it
-still owes (`daemon-reload`, `try-restart agent-worker-broker.service`) in
-`/var/backups/agent-worker/pending`. If a run starts during the apply, the broker
-is installed but not restarted: it prints the exact `sudo systemctl ...` command
-to run when idle and exits 3. If it stops between a unit install and
-`daemon-reload`, it prints that command too. `--check` lists recorded steps as
-`PENDING` lines (exit 1), and the next `--apply` runs them instead of reporting
-nothing to apply. Exit status: 0 done or no drift, 1 drift or refused, 2 usage,
-3 installed with a systemd step still pending.
-
-## Validation
-
-```bash
-./validate.sh
-./install.sh
-agent-system-doctor --repo "$PWD"
-```
-
-The source catalog is intentionally small. Add a shared skill only when it is a
-reusable job with a distinct output contract; keep product workflows local.
+`AGENTS.md` says what an agent working here must know.
 
 ## Attribution
 
-The architecture follows Peter Steinberger's public `agent-scripts` work. See
-`STEIPETE_AGENT_SCRIPTS_LICENSE` and `OPENCLAW_AGENT_SKILLS_LICENSE` for adapted
-components and their licenses. New repository code is MIT licensed.
+Parts of `bin/` and `skills/` are adapted from Peter Steinberger's
+`agent-scripts` work. `STEIPETE_AGENT_SCRIPTS_LICENSE` and
+`OPENCLAW_AGENT_SKILLS_LICENSE` carry the licenses of the adapted material.
+Everything else is MIT licensed under `LICENSE`.

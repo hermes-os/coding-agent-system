@@ -1,4 +1,5 @@
 import json
+import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
@@ -9,11 +10,12 @@ import unittest
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]
-RECOVER = SYSTEM_ROOT / "skills" / "pickup" / "scripts" / "agent-session-recover.py"
+RECOVER = SYSTEM_ROOT / "bin" / "agent-session-recover"
 
 
 def load_recovery_module():
-    spec = importlib.util.spec_from_file_location("agent_session_recover_fixture", RECOVER)
+    loader = importlib.machinery.SourceFileLoader("agent_session_recover_fixture", str(RECOVER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module

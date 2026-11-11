@@ -5,7 +5,8 @@ description: "Prepare, publish, and verify a repository-native software release.
 
 # Release
 
-A release request authorizes the repository's documented release sequence.
+A release reaches real people, so it starts with Hermes asking for it. His
+request authorizes the repository's documented release sequence.
 Discover the project's real process instead of assuming a package manager,
 hosting provider, version scheme, or artifact format.
 

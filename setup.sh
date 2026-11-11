@@ -4,6 +4,7 @@
 #   ./setup.sh <profile>     build the image and set up a run profile from profiles/<profile>/
 #   ./setup.sh repo <name>   make, or bring up to date, the workers' clean clone ~/workbench/<name>
 #   ./setup.sh links         link the working agreement as ~/AGENTS.md and ~/.claude/CLAUDE.md
+#   ./setup.sh tools         link bin/ into ~/.local/bin, and skills/ into ~/.agents/skills and ~/.claude/skills
 #
 # A profile is described by profiles/<name>/: intro.md opens its SOUL.md and
 # profile.json holds its description, skills and config. With "agreement": true
@@ -15,7 +16,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 forge=${WORKBENCH_FORGE:-git@git.imhermes.dev:hermes}
 
 usage() {
-    echo "usage: $0 <profile> | repo <name> | links" >&2
+    echo "usage: $0 <profile> | repo <name> | links | tools" >&2
     echo "profiles: $(ls "$here/profiles" | tr '\n' ' ')" >&2
     exit 2
 }
@@ -30,6 +31,36 @@ link_rules() {
     ln -sfn "$here/working-agreement.md" "$HOME/AGENTS.md"
     ln -sfn "$here/working-agreement.md" "$HOME/.claude/CLAUDE.md"
     echo "linked ~/AGENTS.md and ~/.claude/CLAUDE.md to $here/working-agreement.md"
+}
+
+# The commands and skills for work in any repository, for Hermes and for the
+# agents on this host. They are links, so pulling this repository updates them.
+# A link left behind by a tool or skill that was deleted here is removed. A
+# file that is not a link belongs to someone else and stops the run.
+link_into() {
+    local dest="$1/$(basename "$2")"
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+        echo "setup: $dest exists and is not a link; move it away and run again" >&2
+        exit 1
+    fi
+    ln -sfn "$2" "$dest"
+}
+
+link_tools() {
+    local bin="$HOME/.local/bin" dir src
+    for dir in "$bin" "$HOME/.agents/skills" "$HOME/.claude/skills"; do
+        mkdir -p "$dir"
+        find "$dir" -maxdepth 1 -type l -lname "$here/*" ! -exec test -e {} \; -delete
+    done
+    for src in "$here"/bin/*; do
+        if [ -f "$src" ]; then link_into "$bin" "$src"; fi
+    done
+    for src in "$here"/skills/*/; do
+        link_into "$HOME/.agents/skills" "${src%/}"
+        link_into "$HOME/.claude/skills" "${src%/}"
+    done
+    echo "linked $(ls "$here/skills" | tr '\n' ' ')into ~/.agents/skills and ~/.claude/skills"
+    echo "linked $(find "$here/bin" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')into ~/.local/bin"
 }
 
 # Workers never see Hermes's own working copies. They get a clean clone from
@@ -96,6 +127,7 @@ PY
 case "${1:-}" in
     "" | -h | --help) usage ;;
     links) link_rules ;;
+    tools) link_tools ;;
     repo) [ -n "${2:-}" ] || usage; workbench_repo "$2" ;;
     *) setup_profile "$1" ;;
 esac

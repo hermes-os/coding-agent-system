@@ -1,4 +1,0 @@
-interface:
-  display_name: "Maintain Skills"
-  short_description: "Audit skill validity duplicates and context cost"
-  default_prompt: "Use $maintain-skills to audit and improve the active skill catalog."

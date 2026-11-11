@@ -1,6 +1,6 @@
 # Behavior Validator Report Schema
 
-Use this JSON shape when the orchestrator needs machine-readable behavior validation output.
+Use this JSON shape when a caller needs machine-readable behavior validation output.
 
 ```json
 {

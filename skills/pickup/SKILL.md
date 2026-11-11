@@ -8,7 +8,7 @@ description: "Reconstruct unfinished work in a fresh session from repository evi
 A fresh session finishes the work; a crashed session is not resumed.
 Rehydrate only the context needed to act:
 
-1. Read global and repository instructions plus relevant scoped rules.
+1. Read the repository's `AGENTS.md`.
 2. Read a supplied handoff.
 3. Run `git status -sb`, inspect local commits, `issues.md`, and the
    `CHANGELOG.md` `## Unreleased` section, and identify branch/review state.

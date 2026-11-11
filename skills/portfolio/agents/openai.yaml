@@ -1,4 +1,0 @@
-interface:
-  display_name: "Project Portfolio"
-  short_description: "Inventory and coordinate work across repositories"
-  default_prompt: "Use $portfolio to reconstruct and coordinate the active repository portfolio."

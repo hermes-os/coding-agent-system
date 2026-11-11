@@ -6,14 +6,14 @@ description: "Source-blind user behavior validation against a prewritten contrac
 # Behavior Validator
 
 Validate observable behavior without inspecting source. Use this as the
-black-box companion to the code-aware `review` role. The reviewer judges the
-change bundle; this role judges the running product, CLI, API, or generated
+black-box companion to the code-aware `review` skill. A review judges the
+commits; this role judges the running product, CLI, API, or generated
 artifact against a behavior contract.
 
 ## Contract
 
 - Read the behavior contract first. If none exists, write a short one from the user request before testing. See `references/contract-template.md`.
-- Stay source-blind. Do not inspect source files, diffs, tests, git history, implementation notes, build internals, or review bundles.
+- Stay source-blind. Do not inspect source files, diffs, tests, git history, implementation notes, or build internals.
 - Interact only through user-visible or operator-visible surfaces: browser, CLI, API, generated files, public logs, screenshots, accessibility trees, or documented runtime output.
 - Treat implementation-looking evidence as contamination. If source access is required to continue, stop and report `blocked_source_required`.
 - Report findings against contract clauses and observable steps, not code locations.
@@ -40,7 +40,7 @@ Launch or connect to the target from the contract. Keep only the contract, allow
 4. Run anti-cheat probes: vary fixture data, refresh/retry, test empty and invalid inputs, verify persistence, inspect generated output, and confirm buttons/commands perform real work rather than only displaying success text.
 5. Capture evidence as compact redacted notes, screenshots, terminal excerpts, response summaries, file summaries, or accessibility observations. Omit credentials, tokens, cookies, private user data, and unrelated log content.
 6. Emit a structured report. Use `references/report-schema.md` when a machine-readable report is useful.
-7. If the orchestrator fixes a finding, rerun only the affected contract clauses plus any nearby regression probes.
+7. When a finding has been fixed, rerun only the affected contract clauses plus any nearby regression probes.
 
 ## Finding Rules
 
