@@ -2,19 +2,9 @@
 
 Real problems with the agent machine that are found and not yet fixed, wherever their code lives. The commit that fixes one removes its entry.
 
-## Hosts still carry the retired worker machine
-- Where: the system-level pieces on `imac`: the `agent-worker` account and the files it owns in Hermes's checkouts, the `agent-worker-broker` socket and units, `/etc/agent-worker`, `/var/lib/agent-worker`, `/opt/agent-worker-hermes`, `/usr/local/libexec/agent-worker-*` and a sudoers file. `air` and `sim` have not been checked for either the system-level or the user-level pieces.
-- What happens: nothing in this repository installs or uses them any more, and the user-level install on `imac` (hooks, links, shell line) is removed. The broker still answers on its socket. Removing the rest needs root and Hermes's go-ahead.
-- Found: removing the old machine from this repository, 2026-11-11.
-
 ## The workbench image has no committer
 - Where: `workbench/Containerfile`; the working agreement tells every agent to commit with `committer`.
 - What happens: a worker's container sees none of `bin/`, so workers always fall back to plain `git commit`, and a gate line that names a command from `bin/` cannot run there.
-- Found: removing the old machine from this repository, 2026-11-11.
-
-## coding-agent-vm-setup installs the retired machine
-- Where: `hermes-os/coding-agent-vm-setup`, which pins this repository as the submodule `agent-system/`, calls `agent-system/bin/agent-repo-check` in its `validate.sh`, and ships its own `agent-claude` and `agent-codex` launchers.
-- What happens: it keeps working only while its pin stays on a commit before the old machine was removed. Hermes decides whether it is retired or rebuilt on `setup.sh`.
 - Found: removing the old machine from this repository, 2026-11-11.
 
 ## The books skill's hooks in ashwren-legacy no longer run
