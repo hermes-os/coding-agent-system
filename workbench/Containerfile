@@ -22,8 +22,10 @@ FROM docker.io/library/archlinux:base-devel
 # lists the capability. The shell still holds no capability (bin/bash).
 ARG WORKER_UID=1000
 
+# --disable-download-timeout: on a slow link pacman gives up on a big package after 10 quiet
+# seconds and the whole build fails.
 RUN pacman-key --init && pacman-key --populate archlinux \
- && pacman -Syu --noconfirm --needed \
+ && pacman -Syu --noconfirm --needed --disable-download-timeout \
       git git-lfs ripgrep fd jq sqlite curl wget unzip zip which less file \
       procps-ng tree rsync patch diffutils man-db \
       python python-pip python-pytest uv \
