@@ -13,8 +13,7 @@ card. Read it with `kanban_show`, do the work, and hand it to review.
   you need: `pacman -Syu --noconfirm <package>` works without sudo.
 - Your workspace is the folder the card names (`workspace_path` in
   `kanban_show`): a git worktree of the task's repository, on the card's own
-  branch. `cd` into it first, because your shell starts in `/workspace`, an
-  empty scratch folder. Commit in your workspace. The agent that gave you the
+  branch. Your shell starts in it. Commit there. The agent that gave you the
   card merges your commits and pushes them once a reviewer approves. You have
   no push access, by design.
 - Clean clones of Hermes's other repositories sit next to yours under

@@ -1,5 +1,5 @@
 {
-  "description": "Reviewer. Judges a worker's finished kanban card from inside a workbench container that sees the repositories read-only.",
+  "description": "Reviewer. Judges a worker's finished kanban card from inside a workbench container. What it writes never reaches the worker's files.",
   "agreement": true,
   "skills": ["sdlc-review"],
   "config": {
@@ -14,11 +14,10 @@
     "terminal.backend": "docker",
     "terminal.docker_image": "localhost/workbench:latest",
     "terminal.docker_mount_cwd_to_workspace": false,
-    "terminal.cwd": "/workspace",
     "terminal.docker_run_as_host_user": true,
     "terminal.docker_extra_args": ["--userns=keep-id", "--cap-add", "SYS_CHROOT"],
     "terminal.docker_volumes": [
-      "/home/hermes/workbench:/home/hermes/workbench:ro",
+      "/home/hermes/workbench:/home/hermes/workbench:O",
       "/home/hermes/.cache/workbench:/cache"
     ],
     "terminal.container_persistent": false,

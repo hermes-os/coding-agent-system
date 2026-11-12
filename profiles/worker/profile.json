@@ -14,7 +14,6 @@
     "terminal.backend": "docker",
     "terminal.docker_image": "localhost/workbench:latest",
     "terminal.docker_mount_cwd_to_workspace": false,
-    "terminal.cwd": "/workspace",
     "terminal.docker_volumes": [
       "/home/hermes/workbench:/home/hermes/workbench",
       "/home/hermes/.cache/workbench:/cache"

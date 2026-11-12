@@ -43,11 +43,12 @@ works. This repository holds everything that makes that true on a host.
    Inside, the worker can install, build and rebuild whatever the task needs.
 
 4. **A review.** The worker commits on its branch and hands the card to the
-   `reviewer` profile. The dispatcher starts the reviewer in its own container,
-   with `~/workbench` mounted read-only. The reviewer reads the branch, runs
-   what matters, and gives one verdict: it approves and the card is done, it
-   sends the card back to the worker with each defect named, or it blocks the
-   card with a question for Hermes.
+   `reviewer` profile. The dispatcher starts the reviewer in its own container.
+   It sees `~/workbench` through a layer of its own, so it builds and tests the
+   branch in place and nothing it writes reaches the worker's files. The
+   reviewer reads the branch, runs what matters, and gives one verdict: it
+   approves and the card is done, it sends the card back to the worker with
+   each defect named, or it blocks the card with a question for Hermes.
 
 5. **A merge.** The agent that made the card reads the diff once the card is
    done, merges the branch and pushes to `origin`, Hermes's own Git server.

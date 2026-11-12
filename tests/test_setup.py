@@ -6,6 +6,7 @@ Git is real: `repo` clones from a local folder that plays the Git server.
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -53,9 +54,9 @@ class SetupTest(unittest.TestCase):
         path.write_text(body)
         path.chmod(0o755)
 
-    def setup(self, *args, **env):
+    def setup(self, *args, script=SETUP, **env):
         return subprocess.run(
-            [str(SETUP), *args],
+            [str(script), *args],
             text=True,
             capture_output=True,
             env={
@@ -141,6 +142,23 @@ class ProfileTest(SetupTest):
         self.assertFalse((home / "skills/stray").exists())
         creates = [call for call in self.recorded("hermes") if call[:2] == ["profile", "create"]]
         self.assertEqual(len(creates), 1)
+
+    def test_a_setting_profile_json_no_longer_names_is_taken_out_of_the_profile(self):
+        # A copy of setup.sh beside one made-up profile, so its profile.json can change between runs.
+        repo = self.temp / "repo"
+        folder = repo / "profiles/demo"
+        folder.mkdir(parents=True)
+        shutil.copy(SETUP, repo / "setup.sh")
+        (folder / "intro.md").write_text("# Demo\n")
+
+        def set_up_with(config):
+            (folder / "profile.json").write_text(json.dumps({"description": "demo", "config": config}))
+            self.ok("demo", script=repo / "setup.sh")
+            return [call[4] for call in self.recorded("hermes") if call[:4] == ["-p", "demo", "config", "unset"]]
+
+        self.assertEqual(set_up_with({"terminal.backend": "docker", "terminal.cwd": "/workspace"}), [])
+        self.assertEqual(set_up_with({"terminal.backend": "docker"}), ["terminal.cwd"])
+        self.assertEqual(set_up_with({"terminal.backend": "docker"}), ["terminal.cwd"], "taken out once")
 
     def test_a_skill_hermes_does_not_bundle_stops_the_run(self):
         (self.home / ".hermes/hermes-agent/skills/software-development/another").mkdir(parents=True)

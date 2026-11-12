@@ -104,6 +104,17 @@ PY
     done
     echo "applied $(field "$spec" 'len(d["config"])') settings"
 
+    # A setting the last setup applied and profile.json no longer names is taken out again.
+    local applied="$home/.setup-settings" key
+    field "$spec" '"\n".join(sorted(d["config"]))' > "$applied.now"
+    if [ -f "$applied" ]; then
+        for key in $(LC_ALL=C comm -23 "$applied" "$applied.now"); do
+            hermes -p "$name" config unset "$key" > /dev/null
+            echo "removed setting $key"
+        done
+    fi
+    mv "$applied.now" "$applied"
+
     # Hermes takes the docker CLI before podman when both are installed. The workbench runs on podman.
     hermes -p "$name" config set HERMES_DOCKER_BINARY "$(command -v podman)" > /dev/null
 
