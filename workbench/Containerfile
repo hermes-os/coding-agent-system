@@ -6,9 +6,22 @@
 # run never waits on a missing tool. It holds no keys, no tokens and no personal
 # data: the model's credentials stay with the Hermes process on the host.
 #
-# Arch, to match the hosts: the same .NET, Python and Node versions build and
-# test the same way inside and outside.
+# Arch, like the hosts, but every package comes from one dated snapshot of the
+# Arch Linux Archive. The hosts update on different days, and an image built
+# from the live mirrors gets the versions of its build day: on 2026-11-12 one
+# host's image had Chromium 156 and the next one's 157, so a gate that pins its
+# browser ran on the first and was skipped on the second. From the snapshot,
+# every host builds the same image on any day. Whatever an agent installs later
+# (bin/pacman) comes from the same day too, so it fits the libraries already
+# there.
+#
+# Move the date on purpose, in one commit, and move the version pins of the
+# repositories that have them with it (ashwren: .agents/gates/gate_pins.py).
+# `podman image inspect localhost/workbench:latest --format
+# '{{index .Labels "workbench.arch-snapshot"}}'` shows which day a host has.
 FROM docker.io/library/archlinux:base-devel
+ARG ARCH_SNAPSHOT=2026/11/11
+LABEL workbench.arch-snapshot=$ARCH_SNAPSHOT
 
 # The agent is the host user inside the container (uid 1000 on Hermes's hosts),
 # not root: tests, Chromium and Postgres then behave as they do on the host, and
@@ -22,17 +35,22 @@ FROM docker.io/library/archlinux:base-devel
 # lists the capability. The shell still holds no capability (bin/bash).
 ARG WORKER_UID=1000
 
+# -Syyuu: the base image is rebuilt weekly, so it can be newer than the snapshot;
+# the second u lets pacman step those packages back to the snapshot's versions.
 # --disable-download-timeout: on a slow link pacman gives up on a big package after 10 quiet
 # seconds and the whole build fails.
-RUN pacman-key --init && pacman-key --populate archlinux \
- && pacman -Syu --noconfirm --needed --disable-download-timeout \
+# deno and poppler are here because ashwren's browser gates call them
+# (deno runs the checks, pdftoppm reads the print sheets).
+RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_SNAPSHOT" > /etc/pacman.d/mirrorlist \
+ && pacman-key --init && pacman-key --populate archlinux \
+ && pacman -Syyuu --noconfirm --needed --disable-download-timeout \
       git git-lfs ripgrep fd jq sqlite curl wget unzip zip which less file \
       procps-ng tree rsync patch diffutils man-db \
       python python-pip python-pytest uv \
-      nodejs npm \
+      nodejs npm deno \
       dotnet-sdk-9.0 aspnet-runtime-9.0 aspnet-targeting-pack-9.0 \
       rust go cmake ninja \
-      chromium ttf-dejavu ttf-liberation \
+      chromium poppler ttf-dejavu ttf-liberation \
       postgresql \
  && pacman -Scc --noconfirm \
  && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/* \
