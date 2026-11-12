@@ -2,10 +2,11 @@
 
 How Hermes's agents work: one agreement, one launcher, one environment.
 
-Every coding worker and reviewer is a profile of the Hermes agent harness. A
-task is a card on Hermes's kanban board. The worker that takes it gets a
-container of its own and a branch of its own, and owns the codebase while it
-works. This repository holds everything that makes that true on a host.
+Every coding worker, reviewer and study-guide author is a profile of the Hermes
+agent harness. A coding task is a card on Hermes's kanban board. The worker
+that takes it gets a container of its own and a branch of its own, and owns
+the codebase while it works. This repository holds everything that makes that
+true on a host.
 
 | Path | What it is |
 | --- | --- |
@@ -57,6 +58,15 @@ Each profile runs on the one model its `profile.json` names. There is no
 fallback chain: a run that cannot reach its model fails with the provider's
 own error.
 
+## Study-guide authors
+
+An Ashwren study guide is written in rounds on the host `sim`. Ashwren's
+`tools/run-guide.sh` starts each round as `hermes -p author --oneshot` and
+names the guide's work directory as the container's one volume, at
+`/workspace`. The round sees that folder and nothing else of the host, and has
+no network. The profile's settings leave `terminal.docker_volumes` out on
+purpose: a volume set in the profile would replace the one the launch names.
+
 ## Set up a host
 
 A host needs the Hermes agent with its gateway running, rootless `podman`,
@@ -70,6 +80,7 @@ cd ~/Projects/hermes-os/coding-agent-system
 ./setup.sh tools          # bin/ into ~/.local/bin; skills/ into ~/.agents/skills and ~/.claude/skills
 ./setup.sh worker         # build the image, then write the profile
 ./setup.sh reviewer
+./setup.sh author         # on sim, the guide host
 ./setup.sh repo <name>    # the workers' clean clone ~/workbench/<name>, made or fast-forwarded
 ```
 
