@@ -51,3 +51,13 @@ Real problems with the agent machine that are found and not yet fixed, wherever 
 - Where: `delegate_task` in the Hermes harness, background children with `output_schema`.
 - What happens: two host-setup children on 2026-10-27 ended `failed`. One stopped with "session storage was busy (another Hermes process was writing to the state database)". The other had its report rejected as not JSON; the retry turn no longer held the report, so it returned "nothing verified". In both cases the work on the host was done or half done, but no record of it came back.
 - Found: deleg_db83d360 and deleg_4b317e4b (MacBook Pro worker-host setup).
+
+## A slow disk makes the harness remove a worker's container
+- Where: Hermes harness `tools/environments/docker.py:497` (`<podman> version` gets 5 seconds); the iMac, which has 4 cores and one spinning disk (`sda`, ST31000528AS).
+- What happens: when the disk is saturated, `podman version` answers late. The harness reports "Docker daemon is not responding", fails the tool call, and then removes and recreates the container. The worker loses all that lived only inside it (a seeded Postgres, a gate in the background) and does the work again. On 2026-11-12 the disk was 97 to 99% busy at under 1 MB/s (`/proc/pressure/io` `some avg60` 61); two workers lost containers at 12:06, 12:09, 12:20, 12:27, 12:29 and 13:00, and a guide prep run on the `author` profile ended with nothing written. The largest reader seen was the desktop file indexer (`localsearch-3`, set to index all of `$HOME`). Suggested: a longer wait and a retry before the harness calls the daemon dead; keep the indexer out of `~/workbench` and `~/Projects`; an SSD ends the class.
+- Found: ashwren cards t_f58034f1 and t_13f29629, 2026-11-12.
+
+## A rebuilt container starts in a folder that no longer exists
+- Where: Hermes harness `tools/terminal_tool.py` (`_session_cwd`) and `tools/environments/docker.py:1140` (`_run_command(new_name, self.cwd)` passes it to `podman run -w`).
+- What happens: the session remembers its last working directory. When the container is lost (out of memory, or the entry above) the new one is started with `-w <that directory>`. A directory that the agent made inside the old container is not in the new one, so `podman run` exits 126 on every try; an explicit `workdir` on the tool call does not override it. No terminal or file tool works again in that run, and the card blocks. Unblocking starts a new run, which works. Suggested: fall back to the profile's default working directory when the saved one is missing.
+- Found: ashwren card t_13f29629 (saved directory `/var/lib/postgres/dl`, after an exit 137 with its test database on the `/workspace` tmpfs), 2026-11-12.
