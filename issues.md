@@ -3,19 +3,9 @@
 Real problems with the agent machine that are found and not yet fixed, wherever their code lives. The commit that fixes one removes its entry.
 
 ## Hosts still carry the retired worker machine
-- Where: `imac`, `air` and `sim`: the `agent-worker` account, the `agent-worker-broker` socket and units, `/etc/agent-worker`, `/var/lib/agent-worker`, `/opt/agent-worker-hermes`, `/usr/local/libexec/agent-worker-*`, a sudoers file, and links and copies under `~/.agents`, `~/.claude`, `~/.cursor`, `~/.kimi` and `~/.hermes/profiles`.
-- What happens: nothing in this repository installs or uses them any more. Until they are removed, the broker still answers on its socket, and Claude Code, Cursor and Kimi on a host call a hook dispatcher (`~/.agents/hooks/dispatch.py`) that no longer exists.
+- Where: the system-level pieces on `imac`: the `agent-worker` account and the files it owns in Hermes's checkouts, the `agent-worker-broker` socket and units, `/etc/agent-worker`, `/var/lib/agent-worker`, `/opt/agent-worker-hermes`, `/usr/local/libexec/agent-worker-*` and a sudoers file. `air` and `sim` have not been checked for either the system-level or the user-level pieces.
+- What happens: nothing in this repository installs or uses them any more, and the user-level install on `imac` (hooks, links, shell line) is removed. The broker still answers on its socket. Removing the rest needs root and Hermes's go-ahead.
 - Found: removing the old machine from this repository, 2026-11-11.
-
-## Gates in other repositories name commands that are gone
-- Where: `agent-repo-check` in the `AGENTS.md` gate of hearth, inkwell, kestrel, marquee, marquee-history and marvin-legal-management, and in gate documents of nomad and tape-machine; `docs-list` in marquee, marquee-history, kestrel, marvin-legal-management and the `package.json` of ashwren-legacy.
-- What happens: the gate line fails with "command not found". Neither command was ever in the workbench image, so a worker could not run these lines before either.
-- Found: removing the old machine from this repository, 2026-11-11.
-
-## Repository guides point at a file no setup command makes
-- Where: the first line of `AGENTS.md` in 13 repositories, `READ ~/.agents/AGENTS.md BEFORE ANYTHING (skip if missing).`
-- What happens: `./setup.sh links` makes `~/AGENTS.md` and `~/.claude/CLAUDE.md`, not `~/.agents/AGENTS.md`. On a new host the line points at nothing. A worker gets the agreement from its `SOUL.md`; a Codex session started in such a repository gets it from nowhere.
-- Found: removing the old installer, 2026-11-11.
 
 ## The workbench image has no committer
 - Where: `workbench/Containerfile`; the working agreement tells every agent to commit with `committer`.
