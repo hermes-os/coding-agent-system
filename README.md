@@ -54,6 +54,13 @@ true on a host.
 5. **A merge.** The agent that made the card reads the diff once the card is
    done, merges the branch and pushes to `origin`, Hermes's own Git server.
 
+   A card that builds on another card's work waits for that merge, not for the
+   other card's `done`: the board starts a `--parent` child the minute its
+   parent is done, on a worktree cut from a `main` that does not hold the
+   parent's work yet. Park such a card with `hermes kanban schedule <id>
+   "<reason>"` when you make it, and release it with `hermes kanban unblock
+   <id>` after the merge.
+
 Each profile runs on the one model its `profile.json` names. There is no
 fallback chain: a run that cannot reach its model fails with the provider's
 own error.
