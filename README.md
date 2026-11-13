@@ -87,9 +87,16 @@ cd ~/Projects/hermes-os/coding-agent-system
 ./setup.sh tools          # bin/ into ~/.local/bin; skills/ into ~/.agents/skills and ~/.claude/skills
 ./setup.sh worker         # build the image, then write the profile
 ./setup.sh reviewer
-./setup.sh author         # on sim, the guide host
+./setup.sh author         # on each guide host (the iMac, the Air, sim)
 ./setup.sh repo <name>    # the workers' clean clone ~/workbench/<name>, made or fast-forwarded
 ```
+
+The board must not split a card by itself (the owner's decision, 2026-11-12).
+The gateway that starts first runs the board and reads the setting from its
+own profile, so turn it off in every profile that runs a gateway on the
+host: `hermes -p <profile> config set kanban.auto_decompose false`, and
+`-p default` for the root profile (without `-p` the command writes to the
+profile of the session that runs it).
 
 Every command can be run again. `./setup.sh <profile>` brings the profile back
 to exactly what this repository says: its settings, its `SOUL.md`, and its
