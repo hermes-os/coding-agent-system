@@ -95,6 +95,15 @@ public_identity() {
         git config --global user.email 267720388+hermes-os@users.noreply.github.com
 }
 
+# en_us_locale: the en_US.UTF-8 locale of Hermes's hosts, set for Claude's
+# shell, for tests that sort or format text by locale. Call it from
+# after_packages, with locales in apt_packages.
+en_us_locale() {
+    sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen &&
+        locale-gen en_US.UTF-8 &&
+        shell_env 'export LANG=en_US.UTF-8'
+}
+
 # conda_shell <prefix>: activate a conda environment in Claude's shell, so its
 # tools come first on PATH and its own settings (compilers, DOTNET_ROOT) hold.
 conda_shell() {

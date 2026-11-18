@@ -13,9 +13,7 @@ apt_packages=(cmake libgl-dev qt6-base-dev qt6-webengine-dev qt6-declarative-dev
     qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qttest
     qml6-module-qtwebengine locales)
 
-after_packages() {
-    sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen en_US.UTF-8
-}
+after_packages() { en_us_locale; }
 
 notes() {
     cat <<'NOTES'
