@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# github-sync <repo>: bring GitHub's copy of a repository up to date with the
+# Git server, and delete nothing there.
+#
+# The Git server's push mirror runs `git push --mirror`, which deletes every
+# GitHub branch the server lacks, so the branches cloud sessions push to GitHub
+# are gone at the next sync. This pushes the server's branches and tags and
+# deletes no branch. Branches named claude/* belong to the cloud sessions and
+# are never pushed over. When a GitHub branch holds commits the server lacks (a
+# pull request merged on GitHub, a session that pushed to main), they are kept
+# as rescue/<branch>-<commit> before the server's branch replaces it.
+#
+# ./setup.sh github-sync <repo> runs it every two minutes. Turn the server's
+# push mirror for that repository off, or it still deletes the branches.
+#
+# Env: GITHUB_SYNC_FORGE (default git@git.imhermes.dev:hermes),
+#      GITHUB_SYNC_GITHUB (default https://github.com/hermes-os),
+#      GITHUB_SYNC_CACHE (default ~/.cache/github-sync), where the bare copy lives.
+set -euo pipefail
+
+name=${1:?usage: github-sync <repo>}
+forge="${GITHUB_SYNC_FORGE:-git@git.imhermes.dev:hermes}/$name.git"
+github="${GITHUB_SYNC_GITHUB:-https://github.com/hermes-os}/$name.git"
+dir="${GITHUB_SYNC_CACHE:-$HOME/.cache/github-sync}/$name.git"
+
+[ -d "$dir" ] || git init -q --bare "$dir"
+git -C "$dir" fetch -q --prune "$forge" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+git -C "$dir" fetch -q --prune --no-tags "$github" '+refs/heads/*:refs/github/*'
+
+rescue=()
+while read -r ours ref; do
+    branch=${ref#refs/heads/}
+    case $branch in claude/*) continue ;; esac
+    theirs=$(git -C "$dir" rev-parse -q --verify "refs/github/$branch^{commit}") || continue
+    if ! git -C "$dir" merge-base --is-ancestor "$theirs" "$ours"; then
+        rescue+=("$theirs:refs/heads/rescue/$branch-${theirs:0:12}")
+        echo "github-sync: GitHub's $name $branch has commits the Git server lacks; kept as rescue/$branch-${theirs:0:12}" >&2
+    fi
+done < <(git -C "$dir" for-each-ref --format='%(objectname) %(refname)' refs/heads)
+
+git -C "$dir" push -q --atomic "$github" ${rescue[@]+"${rescue[@]}"} \
+    '+refs/heads/*:refs/heads/*' '^refs/heads/claude/*' '+refs/tags/*:refs/tags/*'

@@ -290,5 +290,23 @@ class ToolsTest(SetupTest):
         self.assertEqual((commands / "committer").read_text(), "someone's own script")
 
 
+class GithubSyncTest(SetupTest):
+    def test_github_sync_writes_the_units_and_starts_the_timer(self):
+        self.fake("systemctl", RECORD)
+        result = self.ok("github-sync", "red-acre")
+        units = self.home / ".config/systemd/user"
+        self.assertIn(f"ExecStart={ROOT}/cloud/github-sync %i\n", (units / "github-sync@.service").read_text())
+        self.assertIn("OnUnitActiveSec=2min\n", (units / "github-sync@.timer").read_text())
+        self.assertEqual(
+            self.recorded("systemctl"),
+            [["--user", "daemon-reload"], ["--user", "enable", "--now", "github-sync@red-acre.timer"]],
+        )
+        self.assertIn("push mirror of red-acre", result.stdout)
+
+    def test_github_sync_without_a_repository_prints_usage(self):
+        self.assertEqual(self.setup("github-sync").returncode, 2)
+        self.assertEqual(self.recorded("systemctl"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

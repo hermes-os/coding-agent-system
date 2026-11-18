@@ -16,6 +16,7 @@ true on a host.
 | `setup.sh` | Puts all of this on a host. |
 | `bin/` | Commands for work in any repository: `committer`, `agent-trash`, `agent-session-recover`. |
 | `skills/` | Skills for Claude Code and Codex sessions in any repository. |
+| `cloud/` | The Claude app's cloud environment for Red Acre (`red-acre.sh`, its setup script), and `github-sync`, which keeps a repository's GitHub copy up to date without deleting the branches cloud sessions push. |
 
 ## How a task flows
 
@@ -74,6 +75,40 @@ names the guide's work directory as the container's one volume, at
 no network. The profile's settings leave `terminal.docker_volumes` out on
 purpose: a volume set in the profile would replace the one the launch names.
 
+## Cloud sessions
+
+Hermes can also give Red Acre work to Claude Code in the cloud: in the Claude
+desktop app, Code, a new session on `hermes-os/red-acre` in the cloud
+environment **Red Acre**. The session runs on a VM of Anthropic's, clones the
+repository from GitHub and pushes its work to a `claude/...` branch there. It
+holds no keys and cannot reach the Git server.
+
+The environment, as set in the app:
+
+- **Network access**: Limited, with Allow package managers (the default). The
+  setup script's downloads are on that list.
+- **Setup script**: `cloud/red-acre.sh`, loaded with Choose file. It installs
+  what Red Acre's gate and art need and writes the working agreement, with
+  what is different in the cloud, as the session's `~/.claude/CLAUDE.md`. The
+  app keeps its own copy: load the file again after a change to it or to
+  `working-agreement.md`.
+- **Environment variables**: `BASH_DEFAULT_TIMEOUT_MS=600000`,
+  `BASH_MAX_TIMEOUT_MS=1800000` (Rust builds outlast the 2-minute default) and
+  `JOBS=4` (the VM's cores, for Red Acre's build scripts).
+
+A cloud branch comes home like a worker's: Foreman fetches it from GitHub, a
+worker card checks and finishes it, the reviewer judges it, and Foreman merges
+it on the Git server.
+
+The Git server's push mirror would delete those branches: it runs
+`git push --mirror`, which removes every GitHub branch the server lacks. So a
+repository that takes cloud sessions has no push mirror. Instead,
+`./setup.sh github-sync <name>` on the iMac runs `cloud/github-sync` every two
+minutes: it pushes the server's branches and tags to GitHub and deletes
+nothing there. A branch deleted on the Git server therefore stays on GitHub:
+delete it there too. A Forgejo branch filter does not help: the server pushes
+with `--mirror` even then, and still deletes the other branches.
+
 ## Set up a host
 
 A host needs the Hermes agent with its gateway running, rootless `podman`,
@@ -89,6 +124,7 @@ cd ~/Projects/hermes-os/coding-agent-system
 ./setup.sh reviewer
 ./setup.sh author         # on each guide host (the iMac, the Air, sim)
 ./setup.sh repo <name>    # the workers' clean clone ~/workbench/<name>, made or fast-forwarded
+./setup.sh github-sync <name>  # on the iMac only: GitHub's copy of <name>, for cloud sessions
 ```
 
 The board must not split a card by itself (the owner's decision, 2026-11-12).

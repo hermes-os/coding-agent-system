@@ -42,3 +42,9 @@ The tests run `setup.sh` against a temporary HOME with stand-in `hermes` and
 - **`skills/` is for Claude Code and Codex sessions.** A skill earns its place
   when it helps in any repository. Hermes profiles take Hermes's own bundled
   skills, named in `profile.json`.
+- **The Claude app keeps its own copy of `cloud/red-acre.sh`.** A change to it
+  or to `working-agreement.md` reaches cloud sessions only after the file is
+  loaded again in the environment's settings (README, "Cloud sessions").
+- **A repository with cloud sessions has no push mirror on the Git server.**
+  `github-sync` keeps its GitHub copy; a push mirror added back deletes the
+  sessions' branches at its next sync.

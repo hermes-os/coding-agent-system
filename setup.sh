@@ -5,6 +5,9 @@
 #   ./setup.sh repo <name>   make, or bring up to date, the workers' clean clone ~/workbench/<name>
 #   ./setup.sh links         link the working agreement as ~/AGENTS.md and ~/.claude/CLAUDE.md
 #   ./setup.sh tools         link bin/ into ~/.local/bin, and skills/ into ~/.agents/skills and ~/.claude/skills
+#   ./setup.sh github-sync <name>
+#                            keep GitHub's copy of <name> up to date every two minutes with cloud/github-sync,
+#                            which deletes nothing there (on one host only: the iMac)
 #
 # A profile is described by profiles/<name>/: intro.md opens its SOUL.md and
 # profile.json holds its description, skills and config. With "agreement": true
@@ -16,7 +19,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 forge=${WORKBENCH_FORGE:-git@git.imhermes.dev:hermes}
 
 usage() {
-    echo "usage: $0 <profile> | repo <name> | links | tools" >&2
+    echo "usage: $0 <profile> | repo <name> | links | tools | github-sync <name>" >&2
     echo "profiles: $(ls "$here/profiles" | tr '\n' ' ')" >&2
     exit 2
 }
@@ -74,6 +77,35 @@ workbench_repo() {
     fi
     git -C "$dir" pull -q --ff-only
     echo "$dir is at $(git -C "$dir" log -1 --format='%h %s')"
+}
+
+# GitHub's copy of a repository, kept up to date from the Git server by a user
+# timer. The units call cloud/github-sync in this checkout, so a pull updates it.
+github_sync() {
+    local name=$1 units="$HOME/.config/systemd/user"
+    mkdir -p "$units"
+    cat > "$units/github-sync@.service" <<EOF
+[Unit]
+Description=Bring GitHub's copy of %i up to date with the Git server
+
+[Service]
+Type=oneshot
+ExecStart=$here/cloud/github-sync %i
+EOF
+    cat > "$units/github-sync@.timer" <<EOF
+[Unit]
+Description=Bring GitHub's copy of %i up to date every two minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now "github-sync@$name.timer"
+    echo "github-sync@$name.timer is on. Turn off the Git server's push mirror of $name: it deletes the branches only GitHub has."
 }
 
 build_image() {
@@ -140,5 +172,6 @@ case "${1:-}" in
     links) link_rules ;;
     tools) link_tools ;;
     repo) [ -n "${2:-}" ] || usage; workbench_repo "$2" ;;
+    github-sync) [ -n "${2:-}" ] || usage; github_sync "$2" ;;
     *) setup_profile "$1" ;;
 esac
