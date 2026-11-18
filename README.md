@@ -16,7 +16,7 @@ true on a host.
 | `setup.sh` | Puts all of this on a host. |
 | `bin/` | Commands for work in any repository: `committer`, `agent-trash`, `agent-session-recover`. |
 | `skills/` | Skills for Claude Code and Codex sessions in any repository. |
-| `cloud/` | The Claude app's cloud environment for Red Acre (`red-acre.sh`, its setup script), and `github-sync`, which keeps a repository's GitHub copy up to date without deleting the branches cloud sessions push. |
+| `cloud/` | The Claude app's cloud environments: `common.sh` and a setup script per repository (`<name>.sh`), `app-script`, which prints the loader the app keeps for one, and `github-sync`, which keeps a repository's GitHub copy up to date without deleting the branches cloud sessions push. |
 
 ## How a task flows
 
@@ -77,24 +77,28 @@ purpose: a volume set in the profile would replace the one the launch names.
 
 ## Cloud sessions
 
-Hermes can also give Red Acre work to Claude Code in the cloud: in the Claude
-desktop app, Code, a new session on `hermes-os/red-acre` in the cloud
-environment **Red Acre**. The session runs on a VM of Anthropic's, clones the
-repository from GitHub and pushes its work to a `claude/...` branch there. It
-holds no keys and cannot reach the Git server.
+Hermes can also give work to Claude Code in the cloud: in the Claude desktop
+app, Code, a new session in the cloud environment of the repository. The
+environments are **Red Acre**, **Kestrel**, **Marquee**, **Hearth**, **Nomad**
+and **Ashwren**, each on its `hermes-os/<name>` repository. The session runs on
+a VM of Anthropic's, clones the repository from GitHub and pushes its work to a
+`claude/...` branch there. It holds no keys and cannot reach the Git server.
 
-The environment, as set in the app:
+Each environment, as set in the app:
 
 - **Network access**: Limited, with Allow package managers (the default). The
-  setup script's downloads are on that list.
-- **Setup script**: `cloud/red-acre.sh`, loaded with Choose file. It installs
-  what Red Acre's gate and art need and writes the working agreement, with
-  what is different in the cloud, as the session's `~/.claude/CLAUDE.md`. The
-  app keeps its own copy: load the file again after a change to it or to
-  `working-agreement.md`.
-- **Environment variables**: `BASH_DEFAULT_TIMEOUT_MS=600000`,
-  `BASH_MAX_TIMEOUT_MS=1800000` (Rust builds outlast the 2-minute default) and
-  `JOBS=4` (the VM's cores, for Red Acre's build scripts).
+  setup scripts' downloads are on that list; a test checks their hosts.
+- **Setup script**: the loader `cloud/app-script <name>` prints. It downloads
+  `cloud/common.sh`, `cloud/<name>.sh` and `working-agreement.md` from this
+  repository's GitHub copy and runs `cloud/<name>.sh`, which installs what the
+  repository's gate needs and writes the working agreement, with what is
+  different in the cloud and notes on the repository, as the session's
+  `~/.claude/CLAUDE.md`. A change pushed here reaches an environment when the
+  app next builds its cache, about weekly; to make it build at once, change the
+  date in the loader's text and save.
+- **Environment variables**: `BASH_DEFAULT_TIMEOUT_MS=600000` and
+  `BASH_MAX_TIMEOUT_MS=1800000` (builds outlast the 2-minute default). Red Acre
+  also has `JOBS=4` (the VM's cores, for its build scripts).
 
 A cloud branch comes home like a worker's: Foreman fetches it from GitHub, a
 worker card checks and finishes it, the reviewer judges it, and Foreman merges
